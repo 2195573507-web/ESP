@@ -5,6 +5,7 @@
   "description": "Local Safari-compatible CSI serial debug web tool.",
   "main": "server.js",
   "scripts": {
+    "test": "node --test",
     "start": "node server.js"
   },
   "dependencies": {

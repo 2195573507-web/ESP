@@ -5,9 +5,12 @@
  * @file csi_server_client.h
  * @brief C5 终端 CSI 轻量结果上报接口。
  *
- * Phase B 只允许上传 occupancy/motion_score/variance/rssi/sample_count 摘要；
+ * 只允许上传链路标识和 occupancy/motion_score/mean_amplitude/variance/cv/rssi/quality/sample_count 摘要；
  * 本接口不上传 raw CSI、I/Q 数组、相位序列或完整 Server envelope。
  */
+
+#include <stdbool.h>
+#include <stddef.h>
 
 #include "csi_presence.h"
 #include "esp_err.h"
@@ -18,6 +21,25 @@ extern "C" {
 
 /** @brief 初始化 CSI 上报占位客户端；当前无状态，可重复调用，返回 ESP_OK。 */
 esp_err_t csi_server_client_init(void);
+
+/**
+ * @brief 将一条 CSI presence 摘要序列化为 C5->S3 本地 JSON。
+ *
+ * 调用位置：csi_service 的低优先级周期任务，用同一份 JSON 做日志和 HTTP body。
+ * 输出字段只包含轻量 summary；不会包含 raw CSI、I/Q 数组、子载波矩阵或相位信息。
+ */
+esp_err_t csi_server_client_format_presence_result(const csi_presence_result_t *result,
+                                                   char *json_body,
+                                                   size_t json_body_size);
+
+/**
+ * @brief 用同一份 CSI summary JSON 执行本地日志和/或 HTTP 输出。
+ *
+ * 调用位置：csi_service 周期任务。HTTP 失败只返回错误码，调用方等待下个窗口。
+ */
+esp_err_t csi_server_client_publish_presence_result(const csi_presence_result_t *result,
+                                                    bool log_enabled,
+                                                    bool http_enabled);
 
 /**
  * @brief 上传一条 CSI presence 摘要到 ESPS3 /local/v1/csi/result。

@@ -70,8 +70,10 @@ bool csi_presence_update(csi_presence_state_machine_t *machine,
     }
 
     memset(out_result, 0, sizeof(*out_result));
+    out_result->mean_amplitude = stats->mean_amplitude;
     out_result->variance = stats->variance;
     out_result->cv = stats->cv;
+    out_result->quality = stats->quality;
     out_result->rssi = stats->rssi;
     out_result->sample_count = stats->sample_count;
     out_result->updated_at_ms = stats->updated_at_ms;

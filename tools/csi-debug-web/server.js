@@ -3,8 +3,9 @@
 
 const fs = require('fs');
 const http = require('http');
-const path = require('path');
 const { URL } = require('url');
+const { clampHistoryLimit, createHistoryLimits } = require('./src/historyLimits');
+const { createToolResolver } = require('./src/toolResolver');
 
 let SerialPort = null;
 let serialportLoadError = null;
@@ -18,13 +19,17 @@ try {
 
 const HOST = '127.0.0.1';
 const PORT = parseHttpPort(process.env.PORT, 8787);
-const MAX_HISTORY = 1000;
-const DEFAULT_LIMIT = 200;
+const HISTORY_LIMITS = createHistoryLimits();
+const MAX_HISTORY = HISTORY_LIMITS.maxHistory;
+const DEFAULT_LIMIT = HISTORY_LIMITS.defaultLimit;
 const DEFAULT_BAUD = parseBaud(process.env.CSI_BAUD, 115200);
 const BOOT_SERIAL_PORT = String(process.env.CSI_SERIAL_PORT || '').trim();
 const DEFAULT_DEVICE_ID = String(process.env.CSI_DEVICE_ID || 'c5').trim() || 'c5';
+const toolResolver = createToolResolver();
 const ROOT_DIR = __dirname;
-const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
+const PUBLIC_DIR = toolResolver.joinToolPath(ROOT_DIR, 'public');
+
+console.log(`tool platform detected: ${toolResolver.platform.displayName}`);
 
 const globalHistory = [];
 const deviceHistories = new Map();
@@ -65,9 +70,7 @@ function parseBaud(value, fallback) {
 }
 
 function clampLimit(value, fallback = DEFAULT_LIMIT) {
-  const parsed = Number.parseInt(value || '', 10);
-  const limit = Number.isInteger(parsed) ? parsed : fallback;
-  return Math.max(1, Math.min(MAX_HISTORY, limit));
+  return clampHistoryLimit(value || fallback, HISTORY_LIMITS);
 }
 
 function trimToMax(list, max) {
@@ -379,14 +382,7 @@ function getSerialStatus() {
 }
 
 function normalizeSerialPath(portPath) {
-  const normalized = String(portPath || '').trim();
-  if (!normalized) {
-    return { ok: false, statusCode: 400, error: 'serial port is required' };
-  }
-  if (!normalized.startsWith('/dev/cu.')) {
-    return { ok: false, statusCode: 400, error: 'serial port must match /dev/cu.*' };
-  }
-  return { ok: true, port: normalized };
+  return toolResolver.normalizeSerialPortPath(portPath);
 }
 
 function serialUnavailableResult() {
@@ -396,45 +392,15 @@ function serialUnavailableResult() {
 }
 
 async function listAvailableSerialPorts() {
-  const devNames = await fs.promises.readdir('/dev').catch(() => []);
-  const cuPaths = devNames
-    .filter((name) => name.startsWith('cu.'))
-    .map((name) => `/dev/${name}`)
-    .sort((a, b) => a.localeCompare(b));
-
-  if (!SerialPort) {
-    return cuPaths.map((portPath) => ({
-      path: portPath,
-      manufacturer: '',
-      serialNumber: '',
-      pnpId: '',
-      locationId: '',
-      vendorId: '',
-      productId: '',
-      unavailable_reason: serialState.last_error,
-    }));
-  }
-
-  let serialPortMetadata = [];
   try {
-    serialPortMetadata = await SerialPort.list();
+    return await toolResolver.listSerialPorts({
+      SerialPort,
+      unavailableReason: serialState.last_error,
+    });
   } catch (error) {
     setLastError(`failed to list serial ports: ${error.message}`);
+    return [];
   }
-
-  const metadataByPath = new Map(serialPortMetadata.map((entry) => [entry.path, entry]));
-  return cuPaths.map((portPath) => {
-    const metadata = metadataByPath.get(portPath) || {};
-    return {
-      path: portPath,
-      manufacturer: metadata.manufacturer || '',
-      serialNumber: metadata.serialNumber || '',
-      pnpId: metadata.pnpId || '',
-      locationId: metadata.locationId || '',
-      vendorId: metadata.vendorId || '',
-      productId: metadata.productId || '',
-    };
-  });
 }
 
 function closeSerialPort(port) {
@@ -722,7 +688,7 @@ function jsonToCsv(rows) {
 }
 
 function serveIndex(req, res) {
-  const indexPath = path.join(PUBLIC_DIR, 'index.html');
+  const indexPath = toolResolver.joinToolPath(PUBLIC_DIR, 'index.html');
   fs.readFile(indexPath, (error, body) => {
     if (error) {
       sendText(res, 500, `failed to read index.html: ${error.message}`);

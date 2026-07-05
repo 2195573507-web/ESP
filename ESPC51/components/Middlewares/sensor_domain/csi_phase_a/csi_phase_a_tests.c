@@ -142,20 +142,23 @@ bool csi_result_codec_test(char *summary, size_t summary_size)
     csi_presence_result_t result = {
         .state = CSI_PRESENCE_STATE_OCCUPIED,
         .motion_score = 0.73f,
+        .mean_amplitude = 128.0f,
         .variance = 512.0f,
         .cv = 0.42f,
+        .quality = CSI_SAMPLE_QUALITY_GOOD,
         .rssi = -49,
         .sample_count = 32U,
         .updated_at_ms = 4567U,
     };
     csi_result_codec_summary_t codec_summary;
-    char encoded[192] = {0};
+    char encoded[256] = {0};
 
     bool ok = csi_result_codec_from_presence(&result, &codec_summary);
     int written = csi_result_codec_format_summary(&codec_summary, encoded, sizeof(encoded));
-    ok = ok && (written > 0) && (codec_summary.state_code == 2U) &&
+    ok = ok && (written > 0) && (codec_summary.state_code == 1U) &&
          (codec_summary.motion_score_pct == 73U) &&
          (strstr(encoded, "\"state\":\"occupied\"") != NULL) &&
+         (strstr(encoded, "\"quality\":\"good\"") != NULL) &&
          (strstr(encoded, "\"sample_count\":32") != NULL);
 
     if (summary != NULL && summary_size > 0U) {
@@ -173,7 +176,7 @@ bool csi_phase_a_run_offline_tests(char *summary, size_t summary_size)
 {
     char feature_summary[192] = {0};
     char presence_summary[192] = {0};
-    char codec_summary[240] = {0};
+    char codec_summary[320] = {0};
 
     bool feature_ok = csi_feature_test(feature_summary, sizeof(feature_summary));
     bool presence_ok = csi_presence_test(presence_summary, sizeof(presence_summary));

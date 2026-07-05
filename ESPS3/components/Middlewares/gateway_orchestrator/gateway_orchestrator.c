@@ -22,9 +22,7 @@
 #include "freertos/task.h"
 #include "gateway_config.h"
 #include "gateway_event_reporter.h"
-#if GATEWAY_CONFIG_ENABLE_CSI_TRIGGER
 #include "csi_placeholder_gateway.h"
-#endif
 #include "gateway_wifi.h"
 #include "local_http_server.h"
 #include "offline_policy.h"
@@ -42,6 +40,7 @@ static void gateway_periodic_task(void *arg)
     (void)arg;
     while (1) {
         sensor_aggregator_upload_snapshot();
+        csi_placeholder_gateway_log_latest_diagnostics();
         if (!voice_proxy_should_skip_non_voice_task("gateway periodic task")) {
             smart_home_gateway_poll_once();
         }
@@ -70,11 +69,7 @@ void gateway_orchestrator_start(void)
     ESP_ERROR_CHECK(smart_home_gateway_init());
     ESP_ERROR_CHECK(voice_proxy_init());
     ESP_ERROR_CHECK(wake_prompt_cache_gateway_init());
-#if GATEWAY_CONFIG_ENABLE_CSI_TRIGGER
     csi_placeholder_gateway_init();
-#else
-    ESP_LOGI(TAG, "CSI trigger disabled by GATEWAY_CONFIG_ENABLE_CSI_TRIGGER");
-#endif
 
     ESP_ERROR_CHECK(gateway_wifi_start());
     app_stack_monitor_log(TAG, "gateway_startup_task", "after_gateway_wifi_start");

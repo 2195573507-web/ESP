@@ -9,7 +9,7 @@
  * 1. MAIN_ENABLE_MIC_CHAIN=1 时启动 C5 -> ESPS3 local gateway 半双工语音链路。
  * 2. MAIN_ENABLE_BME_SERVICE=1 时启动 BME690 周期读取/上传服务。
  * 3. MAIN_ENABLE_SPEAKER_SELF_TEST=1 时启动后播放 1 kHz 自检音，不经过 server voice。
- * 4. MAIN_ENABLE_CSI_SERVICE=1 时在 WiFi 稳定后启动 CSI 摘要链路；默认关闭时不改变旧行为。
+ * 4. MAIN_ENABLE_CSI_SERVICE=1 时在 WiFi 稳定后启动 CSI raw 接收和本地摘要输出。
  */
 
 #ifndef MAIN_ENABLE_MIC_CHAIN
@@ -33,13 +33,33 @@
 #endif
 
 #ifndef MAIN_ENABLE_CSI_SERVICE
-/* CSI 运行总开关：默认关闭，关闭时不配置 WiFi CSI、不启动 CSI 任务、不上传结果。 */
-#define MAIN_ENABLE_CSI_SERVICE 0
+/* CSI 运行总开关：置 0 时不配置 WiFi CSI、不启动 CSI 任务。 */
+#define MAIN_ENABLE_CSI_SERVICE 1
+#endif
+
+#ifndef CSI_REPORT_INTERVAL_MS
+/* CSI 摘要输出周期，单位 ms；只输出 occupancy/motion_score 等轻量结果。 */
+#define CSI_REPORT_INTERVAL_MS 1000U
 #endif
 
 #ifndef CSI_SERVICE_REPORT_INTERVAL_MS
-/* CSI 摘要上报周期，单位 ms；只上传 occupancy/motion_score 等轻量结果。 */
-#define CSI_SERVICE_REPORT_INTERVAL_MS 5000U
+/* 保留旧宏名；默认跟随 CSI_REPORT_INTERVAL_MS。 */
+#define CSI_SERVICE_REPORT_INTERVAL_MS CSI_REPORT_INTERVAL_MS
+#endif
+
+#ifndef CSI_OUTPUT_ENABLE_LOG
+/* CSI 摘要本地日志开关；仅打印轻量 summary JSON，不打印 raw CSI。 */
+#define CSI_OUTPUT_ENABLE_LOG 1
+#endif
+
+#ifndef CSI_OUTPUT_ENABLE_HTTP
+/* CSI 摘要 HTTP 上报开关；只 POST 到 ESPS3 /local/v1/csi/result。 */
+#define CSI_OUTPUT_ENABLE_HTTP 1
+#endif
+
+#ifndef CSI_ALGORITHM_VERSION
+/* CSI 阶段 A 摘要算法版本；用于 S3 区分后续算法演进。 */
+#define CSI_ALGORITHM_VERSION "phase_a_v1"
 #endif
 
 #ifndef CSI_SERVICE_WINDOW_SAMPLES
@@ -95,6 +115,14 @@
 
 #if MAIN_ENABLE_CSI_SERVICE != 0 && MAIN_ENABLE_CSI_SERVICE != 1
 #error "MAIN_ENABLE_CSI_SERVICE must be 0 or 1"
+#endif
+
+#if CSI_OUTPUT_ENABLE_LOG != 0 && CSI_OUTPUT_ENABLE_LOG != 1
+#error "CSI_OUTPUT_ENABLE_LOG must be 0 or 1"
+#endif
+
+#if CSI_OUTPUT_ENABLE_HTTP != 0 && CSI_OUTPUT_ENABLE_HTTP != 1
+#error "CSI_OUTPUT_ENABLE_HTTP must be 0 or 1"
 #endif
 
 #if MAIN_SPEAKER_SELF_TEST_DURATION_MS <= 0

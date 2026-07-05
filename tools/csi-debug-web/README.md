@@ -16,7 +16,7 @@ This tool is intentionally scoped to local debugging:
 ## Install
 
 ```sh
-cd /Users/zhiqin/ESP-111/tools/csi-debug-web
+cd path/to/ESP-111/tools/csi-debug-web
 npm install
 ```
 
@@ -27,7 +27,7 @@ npm install
 Start without auto-connecting a serial port:
 
 ```sh
-cd /Users/zhiqin/ESP-111/tools/csi-debug-web
+cd path/to/ESP-111/tools/csi-debug-web
 node server.js
 ```
 
@@ -53,12 +53,20 @@ CSI_SERIAL_PORT=/dev/cu.usbmodemXXXX CSI_BAUD=115200 node server.js
 
 `CSI_SERIAL_PORT` and `CSI_BAUD` are still supported.
 
+Adjust in-memory sample capacity or default chart history:
+
+```sh
+CSI_MAX_HISTORY=5000 CSI_HISTORY_LIMIT=1000 node server.js
+```
+
+`CSI_MAX_HISTORY` defaults to `5000`; `CSI_HISTORY_LIMIT` defaults to `1000`.
+
 ## Verify Without Real Serial Hardware
 
 1. Start the server:
 
    ```sh
-   cd /Users/zhiqin/ESP-111/tools/csi-debug-web
+   cd path/to/ESP-111/tools/csi-debug-web
    node server.js
    ```
 
@@ -82,7 +90,9 @@ CSI_SERIAL_PORT=/dev/cu.usbmodemXXXX CSI_BAUD=115200 node server.js
 
 ## Serial Mode
 
-Inspect macOS serial ports:
+Inspect serial ports.
+
+macOS:
 
 ```sh
 ls /dev/cu.*
@@ -95,10 +105,25 @@ Common ESP USB serial names look like:
 /dev/cu.usbserial-XXXX
 ```
 
+Windows:
+
+```powershell
+[System.IO.Ports.SerialPort]::GetPortNames()
+```
+
+Common Windows ESP USB serial names look like:
+
+```text
+COM3
+COM4
+```
+
 In the page:
 
 1. Click `刷新端口`.
-2. Click a listed `/dev/cu.*` port, or type it manually.
+2. Click a listed port, or type it manually.
+   - macOS accepts `/dev/cu.*`.
+   - Windows accepts `COM` ports such as `COM3`.
 3. Select `baudRate` such as `115200`.
 4. Click `连接`.
 5. Click `断开` to release the port.
@@ -110,6 +135,34 @@ If `serialport` is missing, the page shows:
 ```
 
 Run `npm install` in this directory and restart the server to enable serial mode.
+
+## Tool Platform Resolver
+
+External tool operations must go through `src/toolResolver.js` instead of calling platform commands directly from business logic.
+
+The resolver detects:
+
+- Darwin / macOS as `macOS`
+- win32 / Windows as `Windows`
+- other platforms as an explicit safe fallback
+
+It centralizes path joins, shell command construction, file/directory selection, opening folders, opening applications, local tool execution, tool existence checks, and serial port path rules. Startup logs include:
+
+```text
+tool platform detected: macOS
+```
+
+or:
+
+```text
+tool platform detected: Windows
+```
+
+Run resolver self-checks:
+
+```sh
+npm test
+```
 
 ## Supported Log Lines
 
@@ -253,7 +306,7 @@ device_id=c5
 limit=200
 ```
 
-`limit` defaults to `200` and is capped at `1000`.
+`limit` defaults to `1000` and is capped at `5000` unless `CSI_MAX_HISTORY` is set.
 
 ### DELETE /api/csi/history
 
@@ -277,8 +330,8 @@ Backwards-compatible manual sample insertion endpoint.
 - Missing `serialport` does not prevent startup.
 - `POST /api/csi/mock` updates Latest, Curves, and Raw JSON.
 - Pasting a `csi summary` line and clicking `解析这一行` updates the page.
-- History sample limit can switch between `50`, `100`, `200`, and `500`.
+- History sample limit can switch between `200`, `500`, `1000`, `2000`, and `5000`.
 - `DELETE /api/csi/history` clears Latest, Curves, Raw JSON, and device list.
 - JSON and CSV export endpoints return current in-memory history.
-- Serial mode remains local and uses `/dev/cu.*`.
+- Serial mode remains local and uses platform-specific serial rules.
 - No firmware, ESP-server, Dashboard, or database files are touched.

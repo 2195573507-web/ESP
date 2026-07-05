@@ -19,8 +19,10 @@ typedef struct {
     uint8_t schema_version;
     uint8_t state_code;
     uint8_t motion_score_pct;
+    float mean_amplitude;
     float variance;
     float cv;
+    uint8_t quality_code;
     int8_t rssi;
     uint16_t sample_count;
     uint64_t updated_at_ms;

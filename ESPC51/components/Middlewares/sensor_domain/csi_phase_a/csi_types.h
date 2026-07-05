@@ -64,8 +64,10 @@ typedef struct {
 typedef struct {
     csi_presence_state_t state;
     float motion_score;
+    float mean_amplitude;
     float variance;
     float cv;
+    csi_sample_quality_t quality;
     int8_t rssi;
     uint16_t sample_count;
     uint64_t updated_at_ms;

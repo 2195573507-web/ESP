@@ -137,10 +137,10 @@ void gateway_config_log_boot_profile(void)
         ESP_LOGW(TAG, "STA credentials are empty; SoftAP/local HTTP will start, server uplink remains offline");
     }
     ESP_LOGI(TAG,
-             "CSI trigger enabled=%d result_ingest=%d interval_ms=%u udp_port=%u target C51=%s",
+             "CSI trigger enabled=%d result_ingest=%d interval_ms=%u udp_port=%u target=%s",
              s_config.csi_trigger_enabled ? 1 : 0,
              s_config.csi_result_ingest_enabled ? 1 : 0,
              (unsigned int)s_config.csi_trigger_interval_ms,
              (unsigned int)s_config.csi_trigger_udp_port,
-             s_config.csi_trigger_target_device_id);
+             s_config.csi_trigger_target_device_id[0] != '\0' ? s_config.csi_trigger_target_device_id : "all");
 }

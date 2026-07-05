@@ -571,10 +571,11 @@
             <span class="charts-header">
               <span class="subtle">样本数</span>
               <select id="historyLimit">
-                <option value="50">50</option>
-                <option value="100">100</option>
-                <option value="200" selected>200</option>
+                <option value="200">200</option>
                 <option value="500">500</option>
+                <option value="1000" selected>1000</option>
+                <option value="2000">2000</option>
+                <option value="5000">5000</option>
               </select>
             </span>
           </h2>
@@ -624,6 +625,8 @@
 	    var REFRESH_INTERVAL_MIN_MS = 100;
 	    var REFRESH_INTERVAL_MAX_MS = 5000;
 	    var REFRESH_INTERVAL_HISTORY_SIZE = 12;
+	    var HISTORY_LIMIT_DEFAULT = 1000;
+	    var CHART_MAX_DISPLAY_POINTS = 520;
 	    var SERIAL_STATUS_REFRESH_INTERVAL_MS = 1000;
 	    var SERIAL_PORTS_REFRESH_INTERVAL_MS = 5000;
 
@@ -634,7 +637,7 @@
 	      history: [],
 	      status: {},
 	      ports: [],
-	      historyLimit: 200,
+	      historyLimit: HISTORY_LIMIT_DEFAULT,
 	      refreshInFlight: false,
 	      refreshTimer: 0,
 	      refreshIntervalMs: REFRESH_INTERVAL_DEFAULT_MS,
@@ -1061,7 +1064,7 @@
       }
       rangeTarget.textContent = formatValue(min) + ' .. ' + formatValue(max);
 
-      var displayPoints = smoothDisplayPoints(points);
+      var displayPoints = smoothDisplayPoints(decimateDisplayPoints(points, CHART_MAX_DISPLAY_POINTS));
       var chartPoints = displayPoints.map(function (point) {
         return {
           x: padding + (values.length <= 1 ? usableWidth : (point.index / (values.length - 1)) * usableWidth),
@@ -1091,6 +1094,37 @@
         ctx.arc(point.x, point.y, 2.4, 0, Math.PI * 2);
         ctx.fill();
       });
+    }
+
+    function decimateDisplayPoints(points, maxPoints) {
+      if (points.length <= maxPoints) {
+        return points;
+      }
+
+      var bucketSize = Math.ceil(points.length / maxPoints);
+      var displayPoints = [points[0]];
+      for (var start = 1; start < points.length - 1; start += bucketSize) {
+        var end = Math.min(points.length - 1, start + bucketSize);
+        var minPoint = points[start];
+        var maxPoint = points[start];
+        for (var i = start + 1; i < end; i += 1) {
+          if (points[i].value < minPoint.value) {
+            minPoint = points[i];
+          }
+          if (points[i].value > maxPoint.value) {
+            maxPoint = points[i];
+          }
+        }
+        if (minPoint.index < maxPoint.index) {
+          displayPoints.push(minPoint, maxPoint);
+        } else if (maxPoint.index < minPoint.index) {
+          displayPoints.push(maxPoint, minPoint);
+        } else {
+          displayPoints.push(minPoint);
+        }
+      }
+      displayPoints.push(points[points.length - 1]);
+      return displayPoints;
     }
 
     function smoothDisplayPoints(points) {
@@ -1390,7 +1424,7 @@
     });
 
     el.historyLimit.addEventListener('change', function () {
-      state.historyLimit = Number.parseInt(el.historyLimit.value, 10) || 200;
+      state.historyLimit = Number.parseInt(el.historyLimit.value, 10) || HISTORY_LIMIT_DEFAULT;
       refreshHistory();
     });
 

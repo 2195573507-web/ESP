@@ -19,6 +19,8 @@ extern "C" {
 
 /** @brief 初始化 CSI gateway；只有显式打开 trigger 时才创建触发任务。 */
 void csi_placeholder_gateway_init(void);
+/** @brief 低频打印每条 link_id 的 latest CSI summary 状态；不读取或上传 raw CSI。 */
+void csi_placeholder_gateway_log_latest_diagnostics(void);
 /**
  * @brief 处理一条 CSI result envelope。
  *

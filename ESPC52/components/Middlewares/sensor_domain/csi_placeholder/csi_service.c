@@ -4,7 +4,7 @@
  *
  * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用），在 MAIN_ENABLE_CSI_SERVICE
  * 打开后配置 WiFi CSI callback，并用阶段 A 纯函数生成 occupancy 摘要。callback
- * 只抽取少量子载波振幅并写入固定窗口；HTTP 上传在低优先级任务中执行。
+ * 只抽取少量子载波振幅并写入固定窗口；日志/HTTP 输出都在低优先级任务中执行。
  *
  * 关闭总开关时，init/start 仅记录日志并返回 ESP_OK，不启动任务、不上传结果。
  */
@@ -119,21 +119,39 @@ static esp_err_t csi_service_configure_wifi_csi(void)
     config.dump_ack_en = false;
 #endif
 
-    esp_err_t ret = esp_wifi_set_csi_config(&config);
+    esp_err_t ret = esp_wifi_set_csi_rx_cb(csi_service_rx_cb, NULL);
+    ESP_LOGI(TAG, "esp_wifi_set_csi_rx_cb ret=%d (%s)", (int)ret, esp_err_to_name(ret));
     if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "rx callback set failed: %s", esp_err_to_name(ret));
         return ret;
     }
-    ret = esp_wifi_set_csi_rx_cb(csi_service_rx_cb, NULL);
+
+    ret = esp_wifi_set_csi_config(&config);
+    ESP_LOGI(TAG, "esp_wifi_set_csi_config ret=%d (%s)", (int)ret, esp_err_to_name(ret));
     if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "csi config failed: %s", esp_err_to_name(ret));
         return ret;
     }
-    return esp_wifi_set_csi(true);
+
+    ret = esp_wifi_set_csi(true);
+    ESP_LOGI(TAG, "esp_wifi_set_csi ret=%d (%s)", (int)ret, esp_err_to_name(ret));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "csi enable failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "wifi promiscuous mode unchanged by CSI service");
+    return ESP_OK;
 }
 
 static void csi_service_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "CSI summary task started interval_ms=%u", (unsigned int)CSI_SERVICE_REPORT_INTERVAL_MS);
+    ESP_LOGI(TAG,
+             "CSI summary task started interval_ms=%u log=%d http=%d algorithm=%s",
+             (unsigned int)CSI_SERVICE_REPORT_INTERVAL_MS,
+             CSI_OUTPUT_ENABLE_LOG,
+             CSI_OUTPUT_ENABLE_HTTP,
+             CSI_ALGORITHM_VERSION);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(CSI_SERVICE_REPORT_INTERVAL_MS));
@@ -156,9 +174,11 @@ static void csi_service_task(void *arg)
             continue;
         }
 
-        esp_err_t ret = csi_server_client_upload_presence_result(&result);
+        esp_err_t ret = csi_server_client_publish_presence_result(&result,
+                                                                  CSI_OUTPUT_ENABLE_LOG != 0,
+                                                                  CSI_OUTPUT_ENABLE_HTTP != 0);
         if (ret != ESP_OK) {
-            ESP_LOGD(TAG, "CSI result upload deferred: %s", esp_err_to_name(ret));
+            ESP_LOGD(TAG, "CSI result output deferred: %s", esp_err_to_name(ret));
         }
     }
 }
@@ -183,9 +203,11 @@ esp_err_t csi_service_init(void)
         return ret;
     }
     ESP_LOGI(TAG,
-             "CSI service initialized window=%u selected_subcarriers=%u",
+             "CSI service initialized window=%u selected_subcarriers=%u log=%d http=%d",
              (unsigned int)CSI_SERVICE_WINDOW_SAMPLES,
-             (unsigned int)(sizeof(s_selected_subcarriers) / sizeof(s_selected_subcarriers[0])));
+             (unsigned int)(sizeof(s_selected_subcarriers) / sizeof(s_selected_subcarriers[0])),
+             CSI_OUTPUT_ENABLE_LOG,
+             CSI_OUTPUT_ENABLE_HTTP);
     return ESP_OK;
 }
 
@@ -227,7 +249,7 @@ esp_err_t csi_service_start(void)
             return ESP_ERR_NO_MEM;
         }
     }
-    ESP_LOGI(TAG, "CSI service started: raw CSI stays local, only summary is uploaded");
+    ESP_LOGI(TAG, "CSI service started: raw CSI stays local, only summary outputs are enabled");
     return ESP_OK;
 }
 

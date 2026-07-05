@@ -59,9 +59,18 @@ typedef struct {
     char air_quality_source[24];
     bool has_occupancy;
     char occupancy_state[16];
+    char csi_device_id[32];
+    char csi_peer_id[32];
+    char csi_link_id[32];
+    char csi_rx_device[32];
+    char csi_tx_device[32];
+    char csi_algorithm_version[32];
     double motion_score;
+    double csi_mean_amplitude;
     double csi_variance;
+    double csi_cv;
     int csi_rssi;
+    char csi_quality[16];
     int csi_sample_count;
     int64_t csi_updated_at_ms;
 } sensor_aggregator_device_t;
@@ -135,6 +144,15 @@ static void seed_device(sensor_aggregator_device_t *device, uint8_t local_id)
     strlcpy(device->air_quality_level, "unknown", sizeof(device->air_quality_level));
     strlcpy(device->air_quality_source, "s3_mapped", sizeof(device->air_quality_source));
     strlcpy(device->occupancy_state, "unknown", sizeof(device->occupancy_state));
+    strlcpy(device->csi_device_id, "unknown", sizeof(device->csi_device_id));
+    strlcpy(device->csi_peer_id, "unknown", sizeof(device->csi_peer_id));
+    strlcpy(device->csi_link_id, local_id == ESP111_PROTOCOL_LOCAL_DEVICE_ID_C52 ? "S3_TO_C52" : "S3_TO_C51",
+            sizeof(device->csi_link_id));
+    strlcpy(device->csi_rx_device, local_id == ESP111_PROTOCOL_LOCAL_DEVICE_ID_C52 ? "C52" : "C51",
+            sizeof(device->csi_rx_device));
+    strlcpy(device->csi_tx_device, "S3", sizeof(device->csi_tx_device));
+    strlcpy(device->csi_algorithm_version, "unknown", sizeof(device->csi_algorithm_version));
+    strlcpy(device->csi_quality, "unknown", sizeof(device->csi_quality));
     device->csi_rssi = 0;
 }
 
@@ -339,14 +357,66 @@ static void update_device_from_envelope_locked(const protocol_adapter_envelope_t
         strlcpy(device->occupancy_state,
                 occupancy != NULL ? json_string(occupancy, "state", "unknown") : "unknown",
                 sizeof(device->occupancy_state));
+        strlcpy(device->csi_device_id,
+                json_string(envelope->payload, "device_id", "unknown"),
+                sizeof(device->csi_device_id));
+        strlcpy(device->csi_peer_id,
+                json_string(envelope->payload, "peer_id", "unknown"),
+                sizeof(device->csi_peer_id));
+        strlcpy(device->csi_link_id,
+                json_string(envelope->payload, "link_id", "unknown"),
+                sizeof(device->csi_link_id));
+        strlcpy(device->csi_rx_device,
+                json_string(envelope->payload, "rx_device", "unknown"),
+                sizeof(device->csi_rx_device));
+        strlcpy(device->csi_tx_device,
+                json_string(envelope->payload, "tx_device", "unknown"),
+                sizeof(device->csi_tx_device));
+        strlcpy(device->csi_algorithm_version,
+                json_string(envelope->payload, "algorithm_version", "unknown"),
+                sizeof(device->csi_algorithm_version));
         device->motion_score = json_number(envelope->payload, "motion_score", 0.0);
+        device->csi_mean_amplitude = json_number(envelope->payload, "mean_amplitude", 0.0);
         device->csi_variance = json_number(envelope->payload, "variance", 0.0);
+        device->csi_cv = json_number(envelope->payload, "cv", 0.0);
         device->csi_rssi = json_int(envelope->payload, "rssi", 0);
+        strlcpy(device->csi_quality,
+                json_string(envelope->payload, "quality", "unknown"),
+                sizeof(device->csi_quality));
         device->csi_sample_count = json_int(envelope->payload, "sample_count", 0);
         device->csi_updated_at_ms = (int64_t)json_number(envelope->payload,
-                                                         "updated_at",
-                                                         (double)timestamp_ms);
+                                                         "updated_at_ms",
+                                                         json_number(envelope->payload,
+                                                                     "updated_at",
+                                                                     (double)timestamp_ms));
     }
+}
+
+static void add_csi_diagnostics_json(cJSON *occupancy,
+                                     const sensor_aggregator_device_t *state)
+{
+    cJSON_AddStringToObject(occupancy, "device_id", state->csi_device_id);
+    cJSON_AddStringToObject(occupancy, "peer_id", state->csi_peer_id);
+    cJSON_AddStringToObject(occupancy, "link_id", state->csi_link_id);
+    cJSON_AddStringToObject(occupancy, "rx_device", state->csi_rx_device);
+    cJSON_AddStringToObject(occupancy, "tx_device", state->csi_tx_device);
+    cJSON_AddStringToObject(occupancy, "algorithm_version", state->csi_algorithm_version);
+    cJSON_AddNumberToObject(occupancy, "mean_amplitude", state->csi_mean_amplitude);
+    cJSON_AddNumberToObject(occupancy, "cv", state->csi_cv);
+    cJSON_AddStringToObject(occupancy, "quality", state->csi_quality);
+}
+
+static void add_empty_csi_diagnostics_json(cJSON *occupancy)
+{
+    cJSON_AddStringToObject(occupancy, "device_id", "unknown");
+    cJSON_AddStringToObject(occupancy, "peer_id", "unknown");
+    cJSON_AddStringToObject(occupancy, "link_id", "unknown");
+    cJSON_AddStringToObject(occupancy, "rx_device", "unknown");
+    cJSON_AddStringToObject(occupancy, "tx_device", "unknown");
+    cJSON_AddStringToObject(occupancy, "algorithm_version", "unknown");
+    cJSON_AddNullToObject(occupancy, "mean_amplitude");
+    cJSON_AddNullToObject(occupancy, "cv");
+    cJSON_AddStringToObject(occupancy, "quality", "unknown");
 }
 
 static void add_device_json(cJSON *devices,
@@ -419,12 +489,14 @@ static void add_device_json(cJSON *devices,
         cJSON_AddNumberToObject(occupancy, "rssi", state->csi_rssi);
         cJSON_AddNumberToObject(occupancy, "sample_count", state->csi_sample_count);
         cJSON_AddNumberToObject(occupancy, "updated_at", (double)state->csi_updated_at_ms);
+        add_csi_diagnostics_json(occupancy, state);
     } else {
         cJSON_AddNullToObject(occupancy, "motion_score");
         cJSON_AddNullToObject(occupancy, "variance");
         cJSON_AddNullToObject(occupancy, "rssi");
         cJSON_AddNumberToObject(occupancy, "sample_count", 0);
         cJSON_AddNullToObject(occupancy, "updated_at");
+        add_empty_csi_diagnostics_json(occupancy);
     }
 
     cJSON_AddItemToArray(devices, device);
