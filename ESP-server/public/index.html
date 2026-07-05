@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32C5 Dashboard</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div class="shell">
+        <aside class="sidebar" id="dashboardSidebar">
+            <div class="brand">
+                <div class="brand-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" role="img">
+                        <path d="M8 3h8v2h3v3h2v8h-2v3h-3v2H8v-2H5v-3H3V8h2V5h3V3Zm1.5 4.5v9h5v-9h-5ZM11 9h3v5h-3V9Z"/>
+                    </svg>
+                </div>
+                <span>ESP32C5</span>
+            </div>
+
+            <nav class="nav-list" aria-label="主导航">
+                <a class="nav-item" href="#s3" data-dashboard-page="s3">
+                    <span class="nav-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24"><path d="M4 4h7v7H4V4Zm9 0h7v7h-7V4ZM4 13h7v7H4v-7Zm9 0h7v7h-7v-7Z"/></svg>
+                    </span>
+                    S3
+                </a>
+                <a class="nav-item active" href="#c51" data-dashboard-page="c51">
+                    <span class="nav-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24"><path d="M7 3h10v2h2a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-2v2H7v-2H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h2V3Zm1 4v10h8V7H8Zm2 2h4v2h-4V9Zm0 4h4v2h-4v-2Z"/></svg>
+                    </span>
+                    C51
+                </a>
+                <a class="nav-item" href="#c52" data-dashboard-page="c52">
+                    <span class="nav-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24"><path d="M5 4h14a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1h-5v2h3v2H7v-2h3v-2H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Zm1 2v9h12V6H6Zm3 2h6v2H9V8Z"/></svg>
+                    </span>
+                    C52
+                </a>
+            </nav>
+
+            <div class="device-card device-online-card" aria-label="在线设备表">
+                <div class="device-status">
+                    <span class="status-dot online"></span>
+                    <strong>设备在线</strong>
+                </div>
+                <table class="device-online-table">
+                    <tbody>
+                        <tr>
+                            <th scope="row">设备名称</th>
+                            <td>ESP32C5</td>
+                        </tr>
+                        <tr>
+                            <th scope="row">在线状态</th>
+                            <td><span class="device-online-state"><span class="status-dot online"></span>在线</span></td>
+                        </tr>
+                        <tr>
+                            <th scope="row">最后更新</th>
+                            <td><span data-last-updated>--:--:--</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </aside>
+        <div class="sidebar-overlay" data-sidebar-overlay></div>
+
+        <main class="main">
+            <header class="topbar">
+                <button class="mobile-menu-btn" type="button" data-sidebar-toggle aria-label="打开主导航" aria-expanded="false" aria-controls="dashboardSidebar">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v2H4V6Zm0 5h16v2H4v-2Zm0 5h16v2H4v-2Z"/></svg>
+                </button>
+                <label class="search">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 4a6.5 6.5 0 0 1 5.1 10.5l4.2 4.2-1.4 1.4-4.2-4.2A6.5 6.5 0 1 1 10.5 4Zm0 2a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9Z"/></svg>
+                    <input type="search" placeholder="搜索设备、数据、日志..." aria-label="搜索设备、数据、日志">
+                </label>
+
+                <div class="top-status">
+                    <span class="status-dot online"></span>
+                    <div>
+                        <strong>ESP32C5 在线</strong>
+                        <small>最后更新：<span id="lastUpdated" data-last-updated>--:--:--</span></small>
+                    </div>
+                </div>
+                <button class="icon-button bell" type="button" aria-label="报警通知">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a2.5 2.5 0 0 0 2.5-2h-5A2.5 2.5 0 0 0 12 22Zm7-6V11a7 7 0 0 0-5-6.7V3a2 2 0 1 0-4 0v1.3A7 7 0 0 0 5 11v5l-2 2v1h18v-1l-2-2Z"/></svg>
+                    <span id="alertCount" data-alert-badge>0</span>
+                </button>
+                <button id="themeToggleBtn" class="theme-toggle-btn" type="button">☀️ 白色模式</button>
+                <button class="user-menu" type="button" aria-label="管理员菜单">
+                    <span class="avatar" aria-hidden="true">
+                        <svg viewBox="0 0 24 24"><path d="M12 12a4.4 4.4 0 1 0 0-8.8 4.4 4.4 0 0 0 0 8.8Zm0 2c-4.5 0-8 2.4-8 5.4V21h16v-1.6c0-3-3.5-5.4-8-5.4Z"/></svg>
+                    </span>
+                    <span>管理员</span>
+                    <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9 5 5 5-5 1.4 1.4L12 16.8 5.6 10.4 7 9Z"/></svg>
+                </button>
+            </header>
+
+            <section class="dashboard-page s3-page" data-page="s3" hidden>
+                <div data-s3-dashboard></div>
+            </section>
+
+            <section class="dashboard-page c-device-page" data-c-device-page>
+            <section class="metric-grid" id="dashboard" data-metric-cards>
+                <article class="metric-card" data-metric-card="temperature" style="--accent:#2874ff;--tint:rgba(40, 116, 255, 0.22);--glow:rgba(40, 116, 255, 0.25)">
+                    <div class="metric-top">
+                        <div class="metric-icon" data-metric-icon="temperature"></div>
+                        <div>
+                            <div class="metric-name">温度</div>
+                            <div class="metric-value"><span id="temperatureValue" data-field="temperature">--</span><small>°C</small></div>
+                        </div>
+                        <span class="state-badge state-normal" data-field="temperatureStatus">正常</span>
+                    </div>
+                    <div class="metric-change" data-field="temperatureChange">等待数据</div>
+                    <div class="sparkline" data-sparkline="temperature"></div>
+                </article>
+                <article class="metric-card" data-metric-card="humidity" style="--accent:#10b981;--tint:rgba(16, 185, 129, 0.20);--glow:rgba(16, 185, 129, 0.22)">
+                    <div class="metric-top">
+                        <div class="metric-icon" data-metric-icon="humidity"></div>
+                        <div>
+                            <div class="metric-name">湿度</div>
+                            <div class="metric-value"><span id="humidityValue" data-field="humidity">--</span><small>%</small></div>
+                        </div>
+                        <span class="state-badge state-normal" data-field="humidityStatus">正常</span>
+                    </div>
+                    <div class="metric-change" data-field="humidityChange">等待数据</div>
+                    <div class="sparkline" data-sparkline="humidity"></div>
+                </article>
+                <article class="metric-card" data-metric-card="air" style="--accent:#8a35ea;--tint:rgba(138, 53, 234, 0.22);--glow:rgba(138, 53, 234, 0.24)">
+                    <div class="metric-top">
+                        <div class="metric-icon" data-metric-icon="air"></div>
+                        <div>
+                            <div class="metric-name" id="airQualityLabel">空气质量 (AQI)</div>
+                            <div class="metric-value"><span id="airQualityValue" data-field="airQuality">--</span><small id="airQualityUnit"></small></div>
+                        </div>
+                        <span class="state-badge is-empty" data-field="airStatus"></span>
+                    </div>
+                    <div class="metric-change" data-field="airChange">等待数据</div>
+                    <div class="sparkline" data-sparkline="air"></div>
+                </article>
+                <article class="metric-card" data-metric-card="esp" style="--accent:#f97316;--tint:rgba(249, 115, 22, 0.22);--glow:rgba(249, 115, 22, 0.23)">
+                    <div class="metric-top">
+                        <div class="metric-icon" data-metric-icon="esp"></div>
+                        <div>
+                            <div class="metric-name">ESP 状态</div>
+                            <div class="metric-value"><span id="espStatusValue" data-field="espStatus">--</span></div>
+                        </div>
+                        <span class="state-badge state-normal" data-field="espStatusBadge">正常</span>
+                    </div>
+                    <div class="metric-change" data-field="espLatency">等待数据</div>
+                    <div class="sparkline" data-sparkline="esp"></div>
+                </article>
+            </section>
+
+            <section class="middle-grid">
+                <article class="panel chart-panel" id="chart">
+                    <div class="panel-header">
+                        <h2>数据变化曲线</h2>
+                        <div class="range-selector" data-range-selector>
+                            <button class="range-button" id="chartRangeButton" type="button" aria-haspopup="listbox" aria-expanded="false">
+                                <span data-range-label>最近 24 小时</span>
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9 5 5 5-5 1.4 1.4L12 16.8 5.6 10.4 7 9Z"/></svg>
+                            </button>
+                            <div class="range-menu" data-range-menu role="listbox" aria-label="选择数据曲线时间范围" hidden>
+                                <button type="button" role="option" data-range-hours="12">最近 12 小时</button>
+                                <button type="button" role="option" data-range-hours="24">最近 24 小时</button>
+                                <button type="button" role="option" data-range-hours="36">最近 36 小时</button>
+                                <button type="button" role="option" data-range-hours="48">最近 48 小时</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="legend">
+                        <span><i class="legend-dot blue"></i>温度 (°C)</span>
+                        <span><i class="legend-dot green"></i>湿度 (%)</span>
+                        <span><i class="legend-dot purple"></i>空气质量(AQI)</span>
+                    </div>
+                    <div class="chart-wrap">
+                        <canvas id="mainChart" width="860" height="320" aria-label="温度、湿度、空气质量趋势图"></canvas>
+                    </div>
+                </article>
+
+                <article class="panel alert-panel" id="alertPanel">
+                    <div class="panel-header">
+                        <h2>异常状态报警 <span class="count-pill" data-alert-count>0</span></h2>
+                        <div class="current-state">当前状态：<strong data-current-state>正常</strong></div>
+                    </div>
+                    <div class="alert-summary" data-alert-summary></div>
+                    <div class="latest-alert" data-latest-alert>
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 2 20h20L12 2Zm1 15h-2v-2h2v2Zm0-4h-2V8h2v5Z"/></svg>
+                        <span>最近报警：暂无异常</span>
+                        <svg class="arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6 1.4-1.4 7.4 7.4-7.4 7.4L9 18Z"/></svg>
+                    </div>
+                </article>
+            </section>
+
+            <section class="bottom-grid">
+                <article class="panel logs-panel" id="logs">
+                    <div class="panel-header">
+                        <h2>报警日志 <span class="count-pill" data-alert-log-count>0</span></h2>
+                        <button class="link-button" type="button" data-open-log-modal="alerts">查看更多 <span aria-hidden="true">›</span></button>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>时间</th>
+                                    <th>类型</th>
+                                    <th>内容</th>
+                                    <th>级别</th>
+                                    <th>状态</th>
+                                </tr>
+                            </thead>
+                            <tbody data-alert-logs></tbody>
+                        </table>
+                    </div>
+                </article>
+
+                <article class="panel system-panel">
+                    <div class="panel-header">
+                        <h2>最新日志</h2>
+                        <button class="link-button" type="button" data-open-log-modal="system">查看更多 <span aria-hidden="true">›</span></button>
+                    </div>
+                    <div class="system-log-list" id="latestLogList" data-system-logs></div>
+                </article>
+
+                <article class="panel command-panel" id="command">
+                    <div class="panel-header">
+                        <h2>命令控制</h2>
+                    </div>
+                    <div class="command-grid">
+                        <button type="button" data-command-action="custom" class="command-button wide">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4V5Zm2 2v10h12V7H6Zm2 2 3 3-3 3-1.4-1.4L8.2 12 6.6 10.4 8 9Zm5 4h5v2h-5v-2Z"/></svg>
+                            <span>自定义请求</span>
+                        </button>
+                        <button type="button" data-command-action="fetch-data" class="command-button green">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a7 7 0 0 0-7 7v1H3.5A3.5 3.5 0 0 0 3 18h6v-2H3.5a1.5 1.5 0 0 1 0-3H7v-3a5 5 0 1 1 10 0v3h.5a1.5 1.5 0 0 1 0 3H15v2h2.5A3.5 3.5 0 0 0 19 11v-1a7 7 0 0 0-7-7Zm1 10h3l-4 5-4-5h3V9h2v4Z"/></svg>
+                            <span>获取当前数据</span>
+                        </button>
+                        <button type="button" data-command-action="calibrate" class="command-button purple">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 2h2v4h-2V2Zm0 16h2v4h-2v-4ZM2 11h4v2H2v-2Zm16 0h4v2h-4v-2ZM5.6 4.2l2.8 2.8-1.4 1.4-2.8-2.8 1.4-1.4Zm11.4 11.4 2.8 2.8-1.4 1.4-2.8-2.8 1.4-1.4Zm2.8-10-2.8 2.8-1.4-1.4 2.8-2.8 1.4 1.4ZM8.4 17l-2.8 2.8-1.4-1.4L7 15.6 8.4 17ZM12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z"/></svg>
+                            <span>校准传感器</span>
+                        </button>
+                        <button type="button" data-command-action="reinitialize" class="command-button blue">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h8V3l-3.3 3.3Z"/></svg>
+                            <span>重新初始化设备</span>
+                        </button>
+                        <button type="button" data-command-action="clear-logs" class="command-button red">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4h8l1 2h4v2H3V6h4l1-2Zm-2 6h16l-1 12H7L6 10Zm4 3v6h2v-6h-2Zm4 0v6h2v-6h-2Z"/></svg>
+                            <span>清理日志</span>
+                        </button>
+                    </div>
+                    <div class="operation-log-panel">
+                        <div class="operation-log-header">
+                            <div>
+                                <strong>页面操作记录</strong>
+                                <span>本页面临时日志，刷新后会丢失</span>
+                            </div>
+                            <button class="link-button" type="button" data-open-operation-log>查看更多 <span aria-hidden="true">›</span></button>
+                        </div>
+                        <div class="operation-log-list" data-operation-log-list></div>
+                    </div>
+                </article>
+
+                <article class="panel smart-home-panel" id="smartHome">
+                    <div class="panel-header">
+                        <h2>智能家居控制</h2>
+                    </div>
+                    <p class="smart-home-note" data-smart-home-note>当前服务暂未提供智能家居状态接口。</p>
+                    <div class="smart-home-list" data-smart-home-list aria-label="智能家居设备列表"></div>
+                </article>
+            </section>
+
+            <footer class="footer">© 2024 ESP32C5 Dashboard v1.0.0</footer>
+            </section>
+        </main>
+    </div>
+    <div class="data-source-panel" id="dataSourcePanel" aria-live="polite">
+        <span>Sensor: <strong data-source="sensor">--</strong></span>
+        <span>ASR: <strong data-source="asr">--</strong></span>
+        <span>LLM: <strong data-source="llm">--</strong></span>
+    </div>
+
+    <div class="log-modal-overlay" data-log-modal hidden>
+        <section class="log-modal" role="dialog" aria-modal="true" aria-labelledby="logModalTitle">
+            <header class="log-modal-header">
+                <h2 id="logModalTitle" data-log-modal-title>日志</h2>
+                <button class="log-modal-close" type="button" data-close-log-modal aria-label="关闭日志弹窗">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+                </button>
+            </header>
+            <div class="log-modal-body" data-log-modal-body></div>
+        </section>
+    </div>
+
+    <div class="command-modal-overlay" data-custom-command-modal hidden>
+        <section class="command-modal" role="dialog" aria-modal="true" aria-labelledby="customCommandTitle">
+            <header class="command-modal-header">
+                <h2 id="customCommandTitle">发送自定义请求</h2>
+                <button class="log-modal-close" type="button" data-close-custom-command aria-label="关闭自定义请求弹窗">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+                </button>
+            </header>
+            <form class="custom-command-form" data-custom-command-form>
+                <label for="customCommandInput">请求内容</label>
+                <textarea id="customCommandInput" data-custom-command-input maxlength="500" rows="6" placeholder="输入要发送给服务的请求内容"></textarea>
+                <div class="custom-command-footer">
+                    <span data-custom-command-count>0 / 500</span>
+                    <span class="command-form-error" data-custom-command-error></span>
+                </div>
+                <div class="command-modal-actions">
+                    <button class="secondary-action" type="button" data-close-custom-command>取消</button>
+                    <button class="primary-action" type="submit" data-submit-custom-command>提交</button>
+                </div>
+            </form>
+        </section>
+    </div>
+
+    <div class="command-modal-overlay" data-command-confirm-modal hidden>
+        <section class="command-modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="commandConfirmTitle">
+            <header class="command-modal-header">
+                <h2 id="commandConfirmTitle" data-command-confirm-title>确认操作</h2>
+                <button class="log-modal-close" type="button" data-command-confirm-cancel aria-label="关闭确认弹窗">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+                </button>
+            </header>
+            <p data-command-confirm-message>请确认是否继续。</p>
+            <div class="command-modal-actions">
+                <button class="secondary-action" type="button" data-command-confirm-cancel>取消</button>
+                <button class="primary-action danger-action" type="button" data-command-confirm-submit>确认</button>
+            </div>
+        </section>
+    </div>
+
+    <div class="command-modal-overlay" data-smart-home-confirm-modal hidden>
+        <section class="command-modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="smartHomeConfirmTitle">
+            <header class="command-modal-header">
+                <h2 id="smartHomeConfirmTitle" data-smart-home-confirm-title>确认操作</h2>
+                <button class="log-modal-close" type="button" data-smart-home-confirm-cancel aria-label="关闭智能家居确认弹窗">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+                </button>
+            </header>
+            <p data-smart-home-confirm-message>请确认是否继续。</p>
+            <div class="command-modal-actions">
+                <button class="secondary-action" type="button" data-smart-home-confirm-cancel>取消</button>
+                <button class="primary-action" type="button" data-smart-home-confirm-submit>确认</button>
+            </div>
+        </section>
+    </div>
+
+    <script src="/pages/s3.js" defer></script>
+    <script src="/app.js" defer></script>
+</body>
+</html>

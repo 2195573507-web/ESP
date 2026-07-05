@@ -1,0 +1,89 @@
+# macOS and editor noise
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+*~
+*.swp
+*.swo
+*.bak
+*.bak.*
+*.tmp
+
+# Codex/local planning state
+.codex-skills/
+.git.codex-hold/
+
+# Logs and runtime state
+*.log
+server.log
+logs/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Node dependencies and debug output
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# ESP-IDF build outputs
+build/
+**/build/
+*.o
+*.a
+*.out
+*.exe
+*.bin
+*.elf
+*.map
+flasher_args.json
+sdkconfig
+sdkconfig.old
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+
+# ESP-IDF downloaded/generated dependencies
+managed_components/
+**/managed_components/
+components/.idf/
+**/components/.idf/
+.espressif/
+
+# Python local artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+venv/
+.venv/
+env/
+
+# Language server and IDE caches
+.clangd
+.clangd/
+.ccls-cache/
+.vscode/
+.idea/
+*.user
+*.workspace
+*.suo
+*.sln.docstates

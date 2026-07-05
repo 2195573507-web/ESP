@@ -1,0 +1,13 @@
+{
+  "name": "csi-debug-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Safari-compatible CSI serial debug web tool.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "serialport": "^13.0.0"
+  }
+}
