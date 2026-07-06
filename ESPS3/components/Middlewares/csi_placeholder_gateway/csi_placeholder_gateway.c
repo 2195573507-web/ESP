@@ -1,11 +1,10 @@
 /**
  * @file csi_placeholder_gateway.c
- * @brief S3 网关 CSI 轻量结果接收边界。
+ * @brief S3 CSI feature ingress and fusion boundary.
  *
- * 本文件属于 ESPS3 网关，保留 /local/v1/csi/result 的 occupancy 摘要入口。
- * 默认构建只接收 C5 已计算好的 occupancy 摘要并上报 csi.motion，不解析 raw CSI；
- * trigger 必须显式打开后才向在线 C5 发送 UDP 小包。
- * 它不解析 raw CSI、不训练模型，也不把 CSI 失败当成整机离线。
+ * C5 terminals upload low-dimensional feature frames. This module rejects raw CSI
+ * semantics, updates the S3 fusion state machine, and forwards only canonical
+ * S3-owned facts to ESP-server.
  */
 
 #include "csi_placeholder_gateway.h"
@@ -16,6 +15,7 @@
 
 #include "cJSON.h"
 #include "child_registry.h"
+#include "csi_fusion.h"
 #include "esp111_protocol_common.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -27,7 +27,7 @@
 #include "lwip/sockets.h"
 #include "sensor_aggregator.h"
 
-static const char *TAG = "csi_placeholder";
+static const char *TAG = "csi_feature_gateway";
 
 #ifndef CSI_LATEST_DIAGNOSTIC_LOG_INTERVAL_MS
 #define CSI_LATEST_DIAGNOSTIC_LOG_INTERVAL_MS 10000U
@@ -41,15 +41,12 @@ typedef struct {
     bool valid;
     char link_id[32];
     char device_id[32];
-    char state[16];
-    float motion_score;
-    float mean_amplitude;
+    float frame_energy;
     float variance;
-    float cv;
+    float quality;
     int rssi;
-    char quality[16];
-    int sample_count;
-    uint64_t updated_at_ms;
+    uint32_t frame_seq;
+    uint64_t timestamp_ms;
     uint64_t received_at_ms;
 } csi_link_latest_t;
 
@@ -83,10 +80,22 @@ static int json_int(cJSON *root, const char *key, int fallback)
     return cJSON_IsNumber(value) ? value->valueint : fallback;
 }
 
-static cJSON *json_object(cJSON *root, const char *key)
+static uint32_t json_u32(cJSON *root, const char *key, uint32_t fallback)
 {
     cJSON *value = cJSON_GetObjectItemCaseSensitive(root, key);
-    return cJSON_IsObject(value) ? value : NULL;
+    if (!cJSON_IsNumber(value) || value->valuedouble < 0.0) {
+        return fallback;
+    }
+    return (uint32_t)value->valuedouble;
+}
+
+static bool has_forbidden_raw_field(cJSON *payload)
+{
+    return cJSON_GetObjectItemCaseSensitive(payload, "raw_csi") != NULL ||
+           cJSON_GetObjectItemCaseSensitive(payload, "subcarrier_data") != NULL ||
+           cJSON_GetObjectItemCaseSensitive(payload, "selected_subcarriers") != NULL ||
+           cJSON_GetObjectItemCaseSensitive(payload, "iq") != NULL ||
+           cJSON_GetObjectItemCaseSensitive(payload, "phase") != NULL;
 }
 
 static csi_link_latest_t *find_latest_slot_locked(const char *link_id)
@@ -94,7 +103,6 @@ static csi_link_latest_t *find_latest_slot_locked(const char *link_id)
     if (link_id == NULL || link_id[0] == '\0') {
         return NULL;
     }
-
     for (size_t i = 0; i < sizeof(s_latest_links) / sizeof(s_latest_links[0]); ++i) {
         if (strcmp(s_latest_links[i].link_id, link_id) == 0) {
             return &s_latest_links[i];
@@ -108,65 +116,70 @@ static size_t latest_link_count(void)
     return sizeof(s_latest_links) / sizeof(s_latest_links[0]);
 }
 
-static void update_latest_result(const protocol_adapter_envelope_t *envelope)
+static esp_err_t feature_from_envelope(const protocol_adapter_envelope_t *envelope,
+                                       csi_fusion_feature_t *feature)
 {
-    if (envelope == NULL || envelope->payload == NULL) {
+    if (envelope == NULL || envelope->payload == NULL || feature == NULL ||
+        has_forbidden_raw_field(envelope->payload)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(feature, 0, sizeof(*feature));
+    strlcpy(feature->device_id,
+            json_string(envelope->payload, "device_id", envelope->device_id),
+            sizeof(feature->device_id));
+    strlcpy(feature->link_id,
+            json_string(envelope->payload, "link_id", "unknown"),
+            sizeof(feature->link_id));
+    feature->frame_energy = (float)json_number(envelope->payload, "frame_energy", -1.0);
+    feature->variance = (float)json_number(envelope->payload, "variance", -1.0);
+    feature->quality = (float)json_number(envelope->payload, "quality", -1.0);
+    feature->rssi = json_int(envelope->payload, "rssi", 0);
+    feature->frame_seq = json_u32(envelope->payload, "frame_seq", 0U);
+    feature->timestamp_ms = (uint64_t)json_number(envelope->payload,
+                                                  "timestamp",
+                                                  json_number(envelope->payload,
+                                                              "updated_at_ms",
+                                                              (double)now_ms()));
+
+    if (feature->link_id[0] == '\0' || strcmp(feature->link_id, "unknown") == 0 ||
+        feature->frame_energy < 0.0f || feature->variance < 0.0f ||
+        feature->quality < 0.0f || feature->quality > 1.0f ||
+        cJSON_GetObjectItemCaseSensitive(envelope->payload, "frame_seq") == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
+
+static void update_latest_feature(const csi_fusion_feature_t *feature,
+                                  const protocol_adapter_envelope_t *envelope)
+{
+    if (feature == NULL || envelope == NULL || envelope->payload == NULL) {
         return;
     }
 
-    cJSON *occupancy = json_object(envelope->payload, "occupancy");
-    const char *link_id = json_string(envelope->payload, "link_id", "unknown");
-    const char *device_id = json_string(envelope->payload, "device_id", envelope->device_id);
-    const char *state = occupancy != NULL ? json_string(occupancy, "state", "unknown") : "unknown";
-    double motion_score = json_number(envelope->payload, "motion_score", 0.0);
-    double mean_amplitude = json_number(envelope->payload, "mean_amplitude", 0.0);
-    double variance = json_number(envelope->payload, "variance", 0.0);
-    double cv = json_number(envelope->payload, "cv", 0.0);
-    int rssi = json_int(envelope->payload, "rssi", 0);
-    const char *quality = json_string(envelope->payload, "quality", "unknown");
-    int sample_count = json_int(envelope->payload, "sample_count", 0);
-    uint64_t updated_at_ms = (uint64_t)json_number(envelope->payload, "updated_at_ms",
-                                                   json_number(envelope->payload,
-                                                               "updated_at",
-                                                               0.0));
     uint64_t received_at_ms = (uint64_t)now_ms();
 
     if (s_latest_lock != NULL) {
         xSemaphoreTake(s_latest_lock, portMAX_DELAY);
     }
-    csi_link_latest_t *slot = find_latest_slot_locked(link_id);
+    csi_link_latest_t *slot = find_latest_slot_locked(feature->link_id);
     if (slot != NULL) {
         memset(slot, 0, sizeof(*slot));
         slot->valid = true;
-        strlcpy(slot->link_id, link_id, sizeof(slot->link_id));
-        strlcpy(slot->device_id, device_id, sizeof(slot->device_id));
-        strlcpy(slot->state, state, sizeof(slot->state));
-        slot->motion_score = (float)motion_score;
-        slot->mean_amplitude = (float)mean_amplitude;
-        slot->variance = (float)variance;
-        slot->cv = (float)cv;
-        slot->rssi = rssi;
-        strlcpy(slot->quality, quality, sizeof(slot->quality));
-        slot->sample_count = sample_count;
-        slot->updated_at_ms = updated_at_ms;
+        strlcpy(slot->link_id, feature->link_id, sizeof(slot->link_id));
+        strlcpy(slot->device_id, feature->device_id, sizeof(slot->device_id));
+        slot->frame_energy = feature->frame_energy;
+        slot->variance = feature->variance;
+        slot->quality = feature->quality;
+        slot->rssi = feature->rssi;
+        slot->frame_seq = feature->frame_seq;
+        slot->timestamp_ms = feature->timestamp_ms;
         slot->received_at_ms = received_at_ms;
     }
     if (s_latest_lock != NULL) {
         xSemaphoreGive(s_latest_lock);
     }
-
-    ESP_LOGD(TAG,
-             "CSI_RESULT link=%s dev=%s state=%s score=%.2f var=%.2f cv=%.3f rssi=%d quality=%s samples=%d ts=%llu",
-             link_id,
-             device_id,
-             state,
-             motion_score,
-             variance,
-             cv,
-             rssi,
-             quality,
-             sample_count,
-             (unsigned long long)updated_at_ms);
 }
 
 void csi_placeholder_gateway_log_latest_diagnostics(void)
@@ -192,14 +205,14 @@ void csi_placeholder_gateway_log_latest_diagnostics(void)
         const uint64_t age_ms =
             slot->valid && timestamp_ms >= slot->received_at_ms ? timestamp_ms - slot->received_at_ms : 0U;
         ESP_LOGI(TAG,
-                 "CSI_LATEST link_id=%s state=%s motion_score=%.3f quality=%s rssi=%d sample_count=%d updated_at_ms=%llu age_ms=%llu",
+                 "CSI_FEATURE_LATEST link_id=%s energy=%.3f variance=%.5f quality=%.5f rssi=%d frame_seq=%u timestamp_ms=%llu age_ms=%llu",
                  slot->link_id,
-                 slot->valid ? slot->state : "unknown",
-                 slot->valid ? slot->motion_score : 0.0f,
-                 slot->valid ? slot->quality : "unknown",
+                 slot->valid ? slot->frame_energy : 0.0f,
+                 slot->valid ? slot->variance : 0.0f,
+                 slot->valid ? slot->quality : 0.0f,
                  slot->valid ? slot->rssi : 0,
-                 slot->valid ? slot->sample_count : 0,
-                 (unsigned long long)(slot->valid ? slot->updated_at_ms : 0U),
+                 (unsigned int)(slot->valid ? slot->frame_seq : 0U),
+                 (unsigned long long)(slot->valid ? slot->timestamp_ms : 0U),
                  (unsigned long long)age_ms);
     }
 }
@@ -267,8 +280,9 @@ void csi_placeholder_gateway_init(void)
     if (s_latest_lock == NULL) {
         s_latest_lock = xSemaphoreCreateMutex();
     }
+    csi_fusion_init();
     if (!config->csi_trigger_enabled) {
-        ESP_LOGI(TAG, "CSI gateway initialized; trigger disabled");
+        ESP_LOGI(TAG, "CSI feature gateway initialized; trigger disabled");
         return;
     }
 
@@ -294,21 +308,38 @@ esp_err_t csi_placeholder_gateway_handle_result(const protocol_adapter_envelope_
 
     if (!gateway_config_get()->csi_result_ingest_enabled) {
         ESP_LOGD(TAG,
-                 "CSI summary reserved device_id=%s link=%s seq=%u; ingest disabled by GATEWAY_CONFIG_ENABLE_CSI_RESULT_INGEST",
+                 "CSI feature reserved device_id=%s link=%s seq=%u; ingest disabled",
                  envelope->device_id,
                  envelope->payload != NULL ? json_string(envelope->payload, "link_id", "unknown") : "unknown",
                  (unsigned int)envelope->seq);
         return ESP_OK;
     }
 
-    update_latest_result(envelope);
+    csi_fusion_feature_t feature = {0};
+    esp_err_t ret = feature_from_envelope(envelope, &feature);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "CSI feature rejected raw_or_invalid=1 ret=%s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    update_latest_feature(&feature, envelope);
+    csi_fusion_fact_t fact = {0};
+    ret = csi_fusion_update(&feature, &fact);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
     sensor_aggregator_result_t result = {0};
-    esp_err_t ret = sensor_aggregator_handle_envelope(envelope, &result);
+    ret = sensor_aggregator_handle_csi_fact(&fact, &result);
     ESP_LOGD(TAG,
-             "CSI summary accepted device_id=%s link=%s seq=%u forwarded=%d status=%d raw_csi=unsupported",
-             envelope->device_id,
-             envelope->payload != NULL ? json_string(envelope->payload, "link_id", "unknown") : "unknown",
-             (unsigned int)envelope->seq,
+             "CSI feature accepted link=%s energy=%.3f variance=%.5f quality=%.5f seq=%u fused_state=%s fused_score=%.3f forwarded=%d status=%d raw_csi=unsupported",
+             feature.link_id,
+             (double)feature.frame_energy,
+             (double)feature.variance,
+             (double)feature.quality,
+             (unsigned int)feature.frame_seq,
+             csi_fusion_state_to_string(fact.state),
+             (double)fact.motion_score,
              result.forwarded ? 1 : 0,
              result.server_status);
     return ret;

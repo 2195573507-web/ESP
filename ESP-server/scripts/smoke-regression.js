@@ -2451,95 +2451,98 @@ async function run() {
         assert.equal(result.response.status, 200);
         assertDashboardEnvelope(result.body, true);
         assert.equal(result.body.data.devices.length, 1);
-        assert.equal(result.body.data.devices[0].occupancy.state, "unknown");
-        assert.equal(result.body.data.devices[0].occupancy.available, false);
-        assert.equal(result.body.data.devices[0].occupancy.motion_score, null);
+        assert.equal(result.body.data.devices[0].csi.state, "IDLE");
+        assert.equal(result.body.data.devices[0].csi.available, false);
+        assert.equal(result.body.data.csi.available, false);
 
         const csiUpdatedAt = Date.now() - 5;
         const csiMotionEnvelope = {
             schema_version: 1,
-            device_id: bmeDeviceId,
-            device_type: "esp32c5_env_voice_node",
-            firmware_version: "0.1.0-smoke",
+            device_id: "sensair_s3_gateway_01",
+            device_type: "S3",
             request_seq: 201,
             esp_uptime_ms: 988001,
             payload_type: "csi.motion",
             room_id: "living_room",
             payload: {
-                occupancy: {
-                    state: "occupied"
-                },
-                motion_score: 0.73,
+                device_id: "sensair_s3_gateway_01",
+                link_id: "fused",
+                state: "MOTION",
+                frame_energy: 12.75,
                 variance: 0.0182,
                 rssi: -58,
-                sample_count: 96,
-                updated_at: csiUpdatedAt
+                motion_score: 0.73,
+                timestamp: csiUpdatedAt
             }
         };
         result = await request(baseUrl, "POST", "/api/device/v1/ingest", csiMotionEnvelope);
         assert.equal(result.response.status, 202);
         assert.equal(result.body.ok, true);
-        assert.equal(result.body.data.device_id, bmeDeviceId);
+        assert.equal(result.body.data.device_id, "sensair_s3_gateway_01");
         assert.equal(result.body.data.payload_type, "csi.motion");
-        assert.equal(result.body.data.occupancy.state, "occupied");
+        assert.equal(result.body.data.link_id, "fused");
+        assert.equal(result.body.data.state, "MOTION");
+        assert.equal(result.body.data.frame_energy, 12.75);
+        assert.equal(result.body.data.variance, 0.0182);
         assert.equal(result.body.data.motion_score, 0.73);
-        assert.equal(result.body.data.sample_count, 96);
 
         result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
             ...csiMotionEnvelope,
-            device_id: "esp32-c5-csi-002",
             request_seq: 202,
-            room_id: "bedroom",
             payload: {
                 ...csiMotionEnvelope.payload,
-                occupancy: {
-                    state: "vacant"
-                },
-                motion_score: 0.11,
+                state: "HOLD",
+                frame_energy: 5.25,
                 variance: 0.0021,
                 rssi: -62,
-                sample_count: 64,
-                updated_at: csiUpdatedAt + 1
+                motion_score: 0.11,
+                timestamp: csiUpdatedAt + 1
             }
         });
         assert.equal(result.response.status, 202);
         assert.equal(result.body.ok, true);
-        assert.equal(result.body.data.device_id, "esp32-c5-csi-002");
-        assert.equal(result.body.data.occupancy.state, "vacant");
+        assert.equal(result.body.data.device_id, "sensair_s3_gateway_01");
+        assert.equal(result.body.data.state, "HOLD");
 
         sensorRows = await dbAll(dbPath, "SELECT * FROM sensor_records WHERE payload_type='csi.motion'");
         assert.equal(sensorRows.length, 0);
 
+        let csiRows = await dbAll(dbPath, "SELECT * FROM csi_motion_events ORDER BY timestamp ASC, id ASC");
+        assert.equal(csiRows.length, 2);
+        assert.equal(csiRows[0].state, "MOTION");
+        assert.equal(csiRows[0].link_id, "fused");
+        assert.equal(csiRows[0].frame_energy, 12.75);
+        assert.equal(csiRows[1].state, "HOLD");
+        assert.ok(csiRows[0].raw_json.includes("\"csi.motion\""));
+
         result = await request(baseUrl, "GET", `/api/device/v1/modules/status?${new URLSearchParams({
-            device_id: bmeDeviceId
+            device_id: "sensair_s3_gateway_01"
         }).toString()}`);
         const csiModule = result.body.modules.find(module => module.module_type === "csi.motion");
         assert.ok(csiModule);
         assert.equal(csiModule.online, true);
 
         result = await request(baseUrl, "GET", `/api/device/v1/context?${new URLSearchParams({
-            device_id: bmeDeviceId
+            device_id: "sensair_s3_gateway_01"
         }).toString()}`);
         assert.equal(result.response.status, 200);
         assert.equal(result.body.context.modules["csi.motion"].available, true);
 
-        result = await request(baseUrl, "GET", `/api/dashboard/v1/overview?${new URLSearchParams({
-            device_id: bmeDeviceId
-        }).toString()}`);
-        assert.equal(result.response.status, 200);
-        assertDashboardEnvelope(result.body, true);
-        assert.equal(result.body.data.devices.length, 1);
-        assert.equal(result.body.data.devices[0].occupancy.state, "occupied");
-        assert.equal(result.body.data.devices[0].occupancy.available, true);
-        assert.equal(result.body.data.devices[0].occupancy.motion_score, 0.73);
-
         result = await request(baseUrl, "GET", "/api/dashboard/v1/overview");
         assert.equal(result.response.status, 200);
         assertDashboardEnvelope(result.body, true);
-        const csiOne = result.body.data.devices.find(device => device.device_id === bmeDeviceId);
-        const csiTwo = result.body.data.devices.find(device => device.device_id === "esp32-c5-csi-002");
-        assert.equal(csiOne.occupancy.state, "occupied");
-        assert.equal(csiTwo.occupancy.state, "vacant");
+        assert.equal(result.body.data.csi.state, "HOLD");
+        assert.equal(result.body.data.csi.available, true);
+        assert.equal(result.body.data.csi.motion_score, 0.11);
+        assert.equal(result.body.data.csi.frame_energy, 5.25);
+
+        result = await request(baseUrl, "GET", "/api/dashboard/v1/csi/history?limit=5");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body, true);
+        assert.equal(result.body.data.events.length, 2);
+        assert.equal(result.body.data.events[0].state, "MOTION");
+        assert.equal(result.body.data.events[1].state, "HOLD");
+        assert.equal(result.body.data.events[1].motion_score, 0.11);
 
         result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
             ...csiMotionEnvelope,
@@ -2547,13 +2550,37 @@ async function run() {
             payload: {
                 ...csiMotionEnvelope.payload,
                 occupancy: {
-                    state: "moving"
+                    state: "occupied"
                 }
             }
         });
         assert.equal(result.response.status, 400);
         assert.equal(result.body.ok, false);
-        assert.equal(result.body.error.code, "INVALID_CSI_OCCUPANCY_STATE");
+        assert.equal(result.body.error.code, "LEGACY_CSI_MODEL_NOT_ACCEPTED");
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
+            ...csiMotionEnvelope,
+            request_seq: 204,
+            payload: {
+                ...csiMotionEnvelope.payload,
+                raw_csi: [1, 2, 3]
+            }
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.error.code, "RAW_CSI_NOT_ACCEPTED");
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
+            ...csiMotionEnvelope,
+            request_seq: 205,
+            payload: {
+                ...csiMotionEnvelope.payload,
+                state: "occupied"
+            }
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.error.code, "INVALID_CSI_STATE");
 
         result = await request(baseUrl, "GET", `/api/device/v1/sensors/latest?${new URLSearchParams({
             device_id: bmeDeviceId
@@ -2740,6 +2767,17 @@ async function run() {
                 last_error: "",
                 timestamp: Date.now()
             },
+            csi: {
+                device_id: "sensair_s3_gateway_01",
+                link_id: "fused",
+                state: "IDLE",
+                available: true,
+                frame_energy: 3.5,
+                variance: 0.004,
+                rssi: -61,
+                motion_score: 0.21,
+                timestamp: Date.now() + 1000
+            },
             devices: [{
                 device_id: bmeDeviceId,
                 local_id: 1,
@@ -2756,15 +2794,6 @@ async function run() {
                     air_quality_score: 72,
                     air_quality_level: "moderate",
                     air_quality_source: "s3_mapped"
-                },
-                occupancy: {
-                    state: "vacant",
-                    available: true,
-                    motion_score: 0.21,
-                    variance: 0.004,
-                    rssi: -61,
-                    sample_count: 48,
-                    updated_at: Date.now() + 1000
                 },
                 appliances: {
                     air_conditioner: {
@@ -2830,6 +2859,7 @@ async function run() {
             `/api/dashboard/v1/devices/${encodeURIComponent(bmeDeviceId)}/history?limit=5`,
             "/api/dashboard/v1/asr/latest",
             "/api/dashboard/v1/llm/latest",
+            "/api/dashboard/v1/csi/history?limit=5",
             "/api/dashboard/v1/time/status",
             `/api/dashboard/v1/device/status?${dashboardDeviceQuery}`,
             `/api/dashboard/v1/modules/status?${dashboardDeviceQuery}`
@@ -2889,9 +2919,10 @@ async function run() {
         assert.equal(result.body.data.devices[0].device_id, bmeDeviceId);
         assert.equal(result.body.data.devices[0].sensors.gas_resistance, 35164);
         assert.equal(result.body.data.devices[0].sensors.air_quality_score, 72);
-        assert.equal(result.body.data.devices[0].occupancy.state, "vacant");
-        assert.equal(result.body.data.devices[0].occupancy.available, true);
-        assert.equal(result.body.data.devices[0].occupancy.motion_score, 0.21);
+        assert.equal(result.body.data.csi.state, "HOLD");
+        assert.equal(result.body.data.csi.available, true);
+        assert.equal(result.body.data.csi.motion_score, 0.11);
+        assert.equal(result.body.data.csi.frame_energy, 5.25);
         assert.equal(result.body.data.devices[0].appliances.air_conditioner.source, "mock");
         assert.equal(result.body.data.devices[0].appliances.fan.mock, true);
         assert.equal(result.body.data.home_summary.online_device_count, 1);

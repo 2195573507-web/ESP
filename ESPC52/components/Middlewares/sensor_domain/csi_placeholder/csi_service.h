@@ -6,8 +6,8 @@
  * @brief C5 终端 CSI runtime 接口。
  *
  * MAIN_ENABLE_CSI_SERVICE=0 时本模块保持旧行为，不配置 WiFi CSI、不启动任务。
- * MAIN_ENABLE_CSI_SERVICE=1 时启动轻量 CSI callback 和周期摘要输出任务，只输出
- * occupancy/motion_score 等结果，不上传 raw CSI。
+ * MAIN_ENABLE_CSI_SERVICE=1 时启动轻量 CSI callback 和周期 feature 输出任务，只输出
+ * frame_energy/variance/rssi 等特征，不上传 raw CSI，也不在 C5 决策状态。
  */
 
 #include "esp_err.h"

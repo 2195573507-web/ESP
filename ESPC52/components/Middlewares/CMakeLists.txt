@@ -43,8 +43,6 @@ set(sensor_srcs
             sensor_domain/csi_placeholder/csi_server_client.c
             sensor_domain/csi_phase_a/csi_capture.c
             sensor_domain/csi_phase_a/csi_feature.c
-            sensor_domain/csi_phase_a/csi_presence.c
-            sensor_domain/csi_phase_a/csi_result_codec.c
             sensor_domain/csi_phase_a/csi_phase_a_tests.c)
 
 set(system_srcs

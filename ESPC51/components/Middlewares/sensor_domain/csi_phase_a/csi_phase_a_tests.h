@@ -18,9 +18,9 @@ extern "C" {
 
 bool csi_feature_test(char *summary, size_t summary_size);
 
-bool csi_presence_test(char *summary, size_t summary_size);
+bool csi_feature_boundary_test(char *summary, size_t summary_size);
 
-bool csi_result_codec_test(char *summary, size_t summary_size);
+bool csi_feature_payload_test(char *summary, size_t summary_size);
 
 bool csi_phase_a_run_offline_tests(char *summary, size_t summary_size);
 

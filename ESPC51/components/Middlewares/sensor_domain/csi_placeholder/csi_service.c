@@ -1,12 +1,10 @@
 /**
  * @file csi_service.c
- * @brief C5 终端 CSI runtime 服务。
+ * @brief C5 CSI runtime service.
  *
- * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用），在 MAIN_ENABLE_CSI_SERVICE
- * 打开后配置 WiFi CSI callback，并用阶段 A 纯函数生成 occupancy 摘要。callback
- * 只抽取少量子载波振幅并写入固定窗口；日志/HTTP 输出都在低优先级任务中执行。
- *
- * 关闭总开关时，init/start 仅记录日志并返回 ESP_OK，不启动任务、不上传结果。
+ * The runtime performs local calibration and feature extraction, then publishes
+ * only low-dimensional feature frames to ESPS3. C5 does not decide IDLE/MOTION/HOLD
+ * and never uploads raw CSI or subcarrier arrays.
  */
 
 #include "csi_service.h"
@@ -18,7 +16,6 @@
 #include "app_main_config.h"
 #include "csi_capture.h"
 #include "csi_feature.h"
-#include "csi_presence.h"
 #include "csi_server_client.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -33,46 +30,38 @@ static const char *TAG = "csi_service";
 static bool s_csi_started;
 static bool s_csi_paused;
 static bool s_csi_initialized;
+static bool s_latest_feature_valid;
 static TaskHandle_t s_csi_task;
 static csi_feature_config_t s_feature_config;
-static csi_presence_config_t s_presence_config;
-static csi_presence_state_machine_t s_presence_machine;
-static csi_feature_window_t s_window;
-static portMUX_TYPE s_window_lock = portMUX_INITIALIZER_UNLOCKED;
+static csi_feature_processor_t s_processor;
+static csi_feature_result_t s_latest_feature;
+static portMUX_TYPE s_feature_lock = portMUX_INITIALIZER_UNLOCKED;
 
-static const uint8_t s_selected_subcarriers[] = {4U, 8U, 12U, 16U, 20U, 24U, 28U, 32U};
-
-static bool csi_service_build_frame_from_wifi(const wifi_csi_info_t *data,
-                                              csi_frame_sample_t *out_frame)
+static bool build_frame_from_wifi(const wifi_csi_info_t *data,
+                                  csi_frame_sample_t *out_frame)
 {
     if (data == NULL || data->buf == NULL || data->len < 2U || out_frame == NULL) {
         return false;
     }
 
-    const size_t pair_count = (size_t)data->len / 2U;
-    csi_iq_sample_t selected_iq[CSI_PHASE_A_MAX_SELECTED_SUBCARRIERS] = {0};
-    uint8_t local_indices[CSI_PHASE_A_MAX_SELECTED_SUBCARRIERS] = {0};
-    size_t selected_count = 0;
-
-    for (size_t i = 0; i < sizeof(s_selected_subcarriers) && selected_count < sizeof(selected_iq) / sizeof(selected_iq[0]); ++i) {
-        size_t source_pair = s_selected_subcarriers[i];
-        if (data->first_word_invalid) {
-            source_pair += 2U;
-        }
-        if (source_pair >= pair_count) {
-            continue;
-        }
-
-        selected_iq[selected_count].i = data->buf[source_pair * 2U];
-        selected_iq[selected_count].q = data->buf[(source_pair * 2U) + 1U];
-        local_indices[selected_count] = (uint8_t)selected_count;
-        selected_count++;
+    size_t pair_count = (size_t)data->len / 2U;
+    size_t start_pair = data->first_word_invalid ? 2U : 0U;
+    if (pair_count <= start_pair) {
+        return false;
     }
 
-    return csi_capture_build_frame_from_iq(selected_iq,
-                                           selected_count,
-                                           local_indices,
-                                           selected_count,
+    csi_iq_sample_t iq_samples[CSI_PHASE_A_MAX_RAW_SUBCARRIERS] = {0};
+    size_t copied = 0;
+    for (size_t pair = start_pair;
+         pair < pair_count && copied < CSI_PHASE_A_MAX_RAW_SUBCARRIERS;
+         ++pair) {
+        iq_samples[copied].i = data->buf[pair * 2U];
+        iq_samples[copied].q = data->buf[(pair * 2U) + 1U];
+        ++copied;
+    }
+
+    return csi_capture_build_frame_from_iq(iq_samples,
+                                           copied,
                                            data->rx_ctrl.rssi,
                                            (uint64_t)(esp_timer_get_time() / 1000),
                                            out_frame);
@@ -86,16 +75,19 @@ static void csi_service_rx_cb(void *ctx, wifi_csi_info_t *data)
     }
 
     csi_frame_sample_t frame = {0};
-    if (!csi_service_build_frame_from_wifi(data, &frame)) {
-        return;
-    }
-    if (!csi_feature_hampel_filter_frame(&frame, &s_feature_config)) {
+    if (!build_frame_from_wifi(data, &frame)) {
         return;
     }
 
-    portENTER_CRITICAL(&s_window_lock);
-    (void)csi_feature_window_push(&s_window, &frame);
-    portEXIT_CRITICAL(&s_window_lock);
+    csi_feature_result_t feature = {0};
+    bool ready = false;
+    portENTER_CRITICAL(&s_feature_lock);
+    ready = csi_feature_processor_push(&s_processor, &frame, &feature);
+    if (ready) {
+        s_latest_feature = feature;
+        s_latest_feature_valid = true;
+    }
+    portEXIT_CRITICAL(&s_feature_lock);
 }
 
 static esp_err_t csi_service_configure_wifi_csi(void)
@@ -122,21 +114,18 @@ static esp_err_t csi_service_configure_wifi_csi(void)
     esp_err_t ret = esp_wifi_set_csi_rx_cb(csi_service_rx_cb, NULL);
     ESP_LOGI(TAG, "esp_wifi_set_csi_rx_cb ret=%d (%s)", (int)ret, esp_err_to_name(ret));
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "rx callback set failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
     ret = esp_wifi_set_csi_config(&config);
     ESP_LOGI(TAG, "esp_wifi_set_csi_config ret=%d (%s)", (int)ret, esp_err_to_name(ret));
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "csi config failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
     ret = esp_wifi_set_csi(true);
     ESP_LOGI(TAG, "esp_wifi_set_csi ret=%d (%s)", (int)ret, esp_err_to_name(ret));
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "csi enable failed: %s", esp_err_to_name(ret));
         return ret;
     }
     ESP_LOGI(TAG, "wifi promiscuous mode unchanged by CSI service");
@@ -147,7 +136,7 @@ static void csi_service_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG,
-             "CSI summary task started interval_ms=%u log=%d http=%d algorithm=%s",
+             "CSI feature task started interval_ms=%u log=%d http=%d feature_version=%s",
              (unsigned int)CSI_SERVICE_REPORT_INTERVAL_MS,
              CSI_OUTPUT_ENABLE_LOG,
              CSI_OUTPUT_ENABLE_HTTP,
@@ -159,26 +148,28 @@ static void csi_service_task(void *arg)
             continue;
         }
 
-        csi_feature_window_t window_snapshot;
-        portENTER_CRITICAL(&s_window_lock);
-        window_snapshot = s_window;
-        portEXIT_CRITICAL(&s_window_lock);
+        csi_feature_result_t feature = {0};
+        bool has_feature = false;
+        portENTER_CRITICAL(&s_feature_lock);
+        if (s_latest_feature_valid) {
+            feature = s_latest_feature;
+            s_latest_feature_valid = false;
+            has_feature = true;
+        }
+        portEXIT_CRITICAL(&s_feature_lock);
 
-        csi_window_stats_t stats = {0};
-        if (!csi_feature_window_compute_stats(&window_snapshot, &s_feature_config, &stats)) {
+        if (!has_feature) {
+            if (!csi_feature_processor_ready(&s_processor)) {
+                ESP_LOGD(TAG, "CSI calibration in progress");
+            }
             continue;
         }
 
-        csi_presence_result_t result = {0};
-        if (!csi_presence_update(&s_presence_machine, &s_presence_config, &stats, &result)) {
-            continue;
-        }
-
-        esp_err_t ret = csi_server_client_publish_presence_result(&result,
-                                                                  CSI_OUTPUT_ENABLE_LOG != 0,
-                                                                  CSI_OUTPUT_ENABLE_HTTP != 0);
+        esp_err_t ret = csi_server_client_publish_feature_result(&feature,
+                                                                 CSI_OUTPUT_ENABLE_LOG != 0,
+                                                                 CSI_OUTPUT_ENABLE_HTTP != 0);
         if (ret != ESP_OK) {
-            ESP_LOGD(TAG, "CSI result output deferred: %s", esp_err_to_name(ret));
+            ESP_LOGD(TAG, "CSI feature output deferred: %s", esp_err_to_name(ret));
         }
     }
 }
@@ -186,11 +177,8 @@ static void csi_service_task(void *arg)
 esp_err_t csi_service_init(void)
 {
     csi_feature_default_config(&s_feature_config);
-    s_feature_config.min_samples_for_good_quality = CSI_SERVICE_WINDOW_SAMPLES >= 8U ? 8U : CSI_SERVICE_WINDOW_SAMPLES;
-    csi_presence_default_config(&s_presence_config);
-    s_presence_config.min_samples = s_feature_config.min_samples_for_good_quality;
-    csi_presence_state_machine_init(&s_presence_machine);
-    csi_feature_window_init(&s_window, CSI_SERVICE_WINDOW_SAMPLES);
+    csi_feature_processor_init(&s_processor, &s_feature_config);
+    s_latest_feature_valid = false;
     s_csi_initialized = true;
 
     if (!MAIN_ENABLE_CSI_SERVICE) {
@@ -203,9 +191,9 @@ esp_err_t csi_service_init(void)
         return ret;
     }
     ESP_LOGI(TAG,
-             "CSI service initialized window=%u selected_subcarriers=%u log=%d http=%d",
-             (unsigned int)CSI_SERVICE_WINDOW_SAMPLES,
-             (unsigned int)(sizeof(s_selected_subcarriers) / sizeof(s_selected_subcarriers[0])),
+             "CSI service initialized calibration_ms=%u ewma_alpha=%.2f feature_only=1 log=%d http=%d",
+             (unsigned int)s_feature_config.calibration_duration_ms,
+             (double)s_feature_config.ewma_alpha,
              CSI_OUTPUT_ENABLE_LOG,
              CSI_OUTPUT_ENABLE_HTTP);
     return ESP_OK;
@@ -227,6 +215,9 @@ esp_err_t csi_service_start(void)
         return ESP_OK;
     }
 
+    csi_feature_processor_init(&s_processor, &s_feature_config);
+    s_latest_feature_valid = false;
+
     esp_err_t ret = csi_service_configure_wifi_csi();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "WiFi CSI configure failed: %s", esp_err_to_name(ret));
@@ -237,7 +228,7 @@ esp_err_t csi_service_start(void)
     s_csi_paused = false;
     if (s_csi_task == NULL) {
         BaseType_t created = xTaskCreate(csi_service_task,
-                                         "csi_summary",
+                                         "csi_feature",
                                          CSI_SERVICE_TASK_STACK,
                                          NULL,
                                          CSI_SERVICE_TASK_PRIORITY,
@@ -249,7 +240,7 @@ esp_err_t csi_service_start(void)
             return ESP_ERR_NO_MEM;
         }
     }
-    ESP_LOGI(TAG, "CSI service started: raw CSI stays local, only summary outputs are enabled");
+    ESP_LOGI(TAG, "CSI service started: calibration first, feature-only output");
     return ESP_OK;
 }
 

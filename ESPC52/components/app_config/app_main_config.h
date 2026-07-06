@@ -9,7 +9,7 @@
  * 1. MAIN_ENABLE_MIC_CHAIN=1 时启动 C5 -> ESPS3 local gateway 半双工语音链路。
  * 2. MAIN_ENABLE_BME_SERVICE=1 时启动 BME690 周期读取/上传服务。
  * 3. MAIN_ENABLE_SPEAKER_SELF_TEST=1 时启动后播放 1 kHz 自检音，不经过 server voice。
- * 4. MAIN_ENABLE_CSI_SERVICE=1 时在 WiFi 稳定后启动 CSI raw 接收和本地摘要输出。
+ * 4. MAIN_ENABLE_CSI_SERVICE=1 时在 WiFi 稳定后启动 CSI 本地校准和 feature 输出。
  */
 
 #ifndef MAIN_ENABLE_MIC_CHAIN
@@ -38,7 +38,7 @@
 #endif
 
 #ifndef CSI_REPORT_INTERVAL_MS
-/* CSI 摘要输出周期，单位 ms；只输出 occupancy/motion_score 等轻量结果。 */
+/* CSI feature 输出周期，单位 ms；只输出 frame_energy/variance/rssi 等轻量特征。 */
 #define CSI_REPORT_INTERVAL_MS 1000U
 #endif
 
@@ -48,23 +48,18 @@
 #endif
 
 #ifndef CSI_OUTPUT_ENABLE_LOG
-/* CSI 摘要本地日志开关；仅打印轻量 summary JSON，不打印 raw CSI。 */
+/* CSI feature 本地日志开关；仅打印轻量 feature JSON，不打印 raw CSI。 */
 #define CSI_OUTPUT_ENABLE_LOG 1
 #endif
 
 #ifndef CSI_OUTPUT_ENABLE_HTTP
-/* CSI 摘要 HTTP 上报开关；只 POST 到 ESPS3 /local/v1/csi/result。 */
+/* CSI feature HTTP 上报开关；只 POST 到 ESPS3 /local/v1/csi/result。 */
 #define CSI_OUTPUT_ENABLE_HTTP 1
 #endif
 
 #ifndef CSI_ALGORITHM_VERSION
-/* CSI 阶段 A 摘要算法版本；用于 S3 区分后续算法演进。 */
-#define CSI_ALGORITHM_VERSION "phase_a_v1"
-#endif
-
-#ifndef CSI_SERVICE_WINDOW_SAMPLES
-/* CSI 滑动窗口帧数上限，必须不超过 csi_phase_a 的固定数组上限。 */
-#define CSI_SERVICE_WINDOW_SAMPLES 32U
+/* CSI 边缘 feature 算法版本；状态决策只在 S3。 */
+#define CSI_ALGORITHM_VERSION "edge_feature_v2"
 #endif
 
 #ifndef CSI_SERVICE_TASK_STACK
@@ -131,10 +126,6 @@
 
 #if CSI_SERVICE_REPORT_INTERVAL_MS < 1000
 #error "CSI_SERVICE_REPORT_INTERVAL_MS must be at least 1000"
-#endif
-
-#if CSI_SERVICE_WINDOW_SAMPLES < 8 || CSI_SERVICE_WINDOW_SAMPLES > 64
-#error "CSI_SERVICE_WINDOW_SAMPLES must be between 8 and 64"
 #endif
 
 #if CSI_SERVICE_TASK_STACK < 3072

@@ -5,9 +5,10 @@
  * @file csi_placeholder_gateway.h
  * @brief S3 网关 CSI 轻量结果接收和触发接口。
  *
- * 本模块保留 C5 /local/v1/csi/result 的 occupancy 摘要接口。它只接收 summary，
- * 可上报 Server csi.motion；按 child registry 在线状态向 C5 发 UDP 小包触发 WiFi
- * 交互仍由独立 trigger 开关控制。它不解析 raw CSI。
+ * 本模块保留 C5 /local/v1/csi/result 的 feature 接口。它只接收
+ * frame_energy/variance/rssi 等低维特征，并由 S3 融合状态机输出 csi.motion fact。
+ * 按 child registry 在线状态向 C5 发 UDP 小包触发 WiFi 交互仍由独立 trigger 开关控制。
+ * 它不解析 raw CSI。
  */
 
 #include "esp_err.h"
@@ -19,7 +20,7 @@ extern "C" {
 
 /** @brief 初始化 CSI gateway；只有显式打开 trigger 时才创建触发任务。 */
 void csi_placeholder_gateway_init(void);
-/** @brief 低频打印每条 link_id 的 latest CSI summary 状态；不读取或上传 raw CSI。 */
+/** @brief 低频打印每条 link_id 的 latest CSI feature 状态；不读取或上传 raw CSI。 */
 void csi_placeholder_gateway_log_latest_diagnostics(void);
 /**
  * @brief 处理一条 CSI result envelope。

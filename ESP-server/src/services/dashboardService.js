@@ -16,6 +16,9 @@ const {
     makeSnapshotId
 } = require("../db/dashboardSnapshots");
 const {
+    readLatestCsiMotionEvents
+} = require("../db/csiMotion");
+const {
     listEvents,
     recordEvent
 } = require("./eventLogService");
@@ -24,7 +27,7 @@ const DASHBOARD_HISTORY_DEFAULT_LIMIT = 50;
 const DASHBOARD_HISTORY_MAX_LIMIT = 500;
 const DASHBOARD_SNAPSHOT_PAYLOAD_TYPE = "gateway.dashboard_snapshot";
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
-const CSI_OCCUPANCY_STATES = new Set(["unknown", "vacant", "occupied"]);
+const CSI_STATES = new Set(["IDLE", "MOTION", "HOLD"]);
 
 let latestDashboardSnapshot = null;
 const latestCsiMotionByDevice = new Map();
@@ -225,9 +228,9 @@ function normalizeSnapshotSensors(sensors) {
     };
 }
 
-function normalizeOccupancyState(value) {
-    const state = trimText(value, 16).toLowerCase();
-    return CSI_OCCUPANCY_STATES.has(state) ? state : "unknown";
+function normalizeCsiState(value) {
+    const state = trimText(value, 16).toUpperCase();
+    return CSI_STATES.has(state) ? state : "IDLE";
 }
 
 function clampMotionScore(value) {
@@ -239,33 +242,36 @@ function clampMotionScore(value) {
     return Math.min(Math.max(numeric, 0), 1);
 }
 
-function normalizeSnapshotOccupancy(occupancy, serverRecvMs, options = {}) {
-    const source = isPlainObject(occupancy) ? occupancy : {};
-    const hasSource = isPlainObject(occupancy);
+function normalizeSnapshotCsi(csi, serverRecvMs, options = {}) {
+    const source = isPlainObject(csi) ? csi : {};
+    const hasSource = isPlainObject(csi);
     const available = booleanValue(source.available, options.availableDefault ?? hasSource);
-    const state = normalizeOccupancyState(source.state);
+    const state = normalizeCsiState(source.state);
 
     if (!available) {
         return {
-            state: "unknown",
+            device_id: trimText(source.device_id, 128),
+            link_id: trimText(source.link_id || "fused", 64),
+            state: "IDLE",
             available: false,
-            motion_score: null,
+            frame_energy: null,
             variance: null,
             rssi: null,
-            sample_count: 0,
-            updated_at: null
+            motion_score: null,
+            timestamp: null
         };
     }
 
-    const sampleCount = integerOrNull(source.sample_count);
     return {
+        device_id: trimText(source.device_id, 128),
+        link_id: trimText(source.link_id || "fused", 64),
         state,
         available: true,
-        motion_score: clampMotionScore(source.motion_score),
+        frame_energy: numberValueOrNull(source.frame_energy),
         variance: numberValueOrNull(source.variance),
         rssi: integerOrNull(source.rssi),
-        sample_count: sampleCount === null ? 0 : Math.max(0, sampleCount),
-        updated_at: integerOrNull(source.updated_at) || serverRecvMs
+        motion_score: clampMotionScore(source.motion_score),
+        timestamp: integerOrNull(source.timestamp ?? source.updated_at) || serverRecvMs
     };
 }
 
@@ -276,6 +282,9 @@ function normalizeSnapshotDevice(device, serverRecvMs) {
 
     const deviceId = trimText(device.device_id, 128);
     if (!deviceId) {
+        return null;
+    }
+    if (isPlainObject(device.occupancy)) {
         return null;
     }
 
@@ -290,7 +299,9 @@ function normalizeSnapshotDevice(device, serverRecvMs) {
         wifi_rssi: integerOrNull(device.wifi_rssi),
         timestamp: integerOrNull(device.timestamp) || serverRecvMs,
         sensors: normalizeSnapshotSensors(device.sensors),
-        occupancy: normalizeSnapshotOccupancy(device.occupancy, serverRecvMs),
+        csi: normalizeSnapshotCsi(device.csi, serverRecvMs, {
+            availableDefault: false
+        }),
         appliances: normalizeAppliances(device.appliances)
     };
 }
@@ -435,6 +446,14 @@ function normalizeGatewaySnapshot(body, serverRecvMs = Date.now()) {
             error: "schema_version must be 2"
         };
     }
+    if ((Array.isArray(body.devices) ? body.devices : [])
+        .some(device => isPlainObject(device) && isPlainObject(device.occupancy))) {
+        return {
+            ok: false,
+            code: "LEGACY_CSI_MODEL_NOT_ACCEPTED",
+            error: "dashboard snapshot devices must not include legacy occupancy CSI fields"
+        };
+    }
 
     const devices = (Array.isArray(body.devices) ? body.devices : [])
         .map(device => normalizeSnapshotDevice(device, serverRecvMs))
@@ -455,6 +474,9 @@ function normalizeGatewaySnapshot(body, serverRecvMs = Date.now()) {
             gateway: normalizeSnapshotGateway(body.gateway, serverRecvMs),
             devices,
             home_summary: normalizeHomeSummary(body.home_summary, devices),
+            csi: normalizeSnapshotCsi(body.csi, serverRecvMs, {
+                availableDefault: false
+            }),
             history,
             recent_voice_events: recentVoiceEvents,
             recent_commands: recentCommands,
@@ -495,50 +517,17 @@ function stripMockAppliancesForStorage(snapshot) {
     return stored;
 }
 
-function shouldApplyCsiMotion(existingOccupancy, nextOccupancy) {
-    const existingUpdatedAt = integerOrNull(existingOccupancy?.updated_at) || 0;
-    const nextUpdatedAt = integerOrNull(nextOccupancy?.updated_at) || 0;
-    return nextUpdatedAt >= existingUpdatedAt;
-}
-
-function deviceFromCsiMotion(record) {
-    return {
-        device_id: record.device_id,
-        local_id: record.local_id,
-        name: record.name,
-        room_name: record.room_name,
-        online: true,
-        wifi_rssi: record.occupancy.rssi,
-        timestamp: record.occupancy.updated_at,
-        sensors: null,
-        occupancy: cloneJson(record.occupancy),
-        appliances: mockAppliances()
-    };
-}
-
-function mergeCsiMotionIntoSnapshot(snapshot, onlyDeviceId = "") {
+function mergeCsiMotionIntoSnapshot(snapshot) {
     if (!snapshot || !Array.isArray(snapshot.devices)) {
         return snapshot;
     }
 
-    for (const record of latestCsiMotionByDevice.values()) {
-        if (onlyDeviceId && record.device_id !== onlyDeviceId) {
-            continue;
-        }
-
-        const device = snapshot.devices.find(item => item.device_id === record.device_id);
-        if (!device) {
-            snapshot.devices.push(deviceFromCsiMotion(record));
-            continue;
-        }
-
-        if (shouldApplyCsiMotion(device.occupancy, record.occupancy)) {
-            device.occupancy = cloneJson(record.occupancy);
-            device.timestamp = Math.max(integerOrNull(device.timestamp) || 0, record.occupancy.updated_at);
-            if (device.wifi_rssi === null || device.wifi_rssi === undefined) {
-                device.wifi_rssi = record.occupancy.rssi;
-            }
-        }
+    const fusedRecord = [...latestCsiMotionByDevice.values()]
+        .filter(record => record.csi?.link_id === "fused")
+        .sort((a, b) => (integerOrNull(a.csi?.timestamp) || 0) - (integerOrNull(b.csi?.timestamp) || 0))
+        .pop();
+    if (fusedRecord) {
+        snapshot.csi = cloneJson(fusedRecord.csi);
     }
 
     snapshot.home_summary = computeHomeSummary(snapshot.devices);
@@ -626,17 +615,17 @@ function recordCsiMotion(record, options = {}) {
         return null;
     }
 
-    const occupancy = normalizeSnapshotOccupancy(record?.occupancy, serverRecvMs, {
+    const csi = normalizeSnapshotCsi(record, serverRecvMs, {
         availableDefault: true
     });
-    occupancy.available = true;
+    csi.available = true;
 
     const normalized = {
         device_id: deviceId,
         local_id: integerOrNull(record?.local_id),
         name: trimText(record?.name || record?.alias, 128),
         room_name: trimText(record?.room_name || record?.room_id || "unassigned", 128),
-        occupancy,
+        csi,
         received_at_ms: serverRecvMs,
         payload_type: CSI_MOTION_PAYLOAD_TYPE
     };
@@ -860,7 +849,7 @@ function buildModuleSummary(snapshot, modules) {
     const bmeOnline = moduleOnline(modules, "sensor.bme690") ||
         (Array.isArray(snapshot.devices) && snapshot.devices.some(device => Boolean(device.sensors)));
     const csiOnline = moduleOnline(modules, "csi.motion") ||
-        (Array.isArray(snapshot.devices) && snapshot.devices.some(device => Boolean(device.occupancy?.available)));
+        Boolean(snapshot.csi?.available);
     const serverOnline = gateway.server_connected !== undefined
         ? Boolean(gateway.server_connected)
         : Boolean(gateway.server_available ?? true);
@@ -909,7 +898,6 @@ function adaptGatewayForOverview(snapshot, statuses) {
 function adaptDeviceForOverview(device, statuses, modules) {
     const status = statuses.find(item => item.device_id === device.device_id);
     const sensors = device.sensors || {};
-    const csiModule = modules.find(module => module.device_id === device.device_id && module.module_type === "csi.motion");
     const voiceModule = modules.find(module => module.device_id === device.device_id && (module.module_type === "voice.turn" || module.module_type === "voice.prompt"));
     const lastSeen = status?.last_seen_ms ?? integerOrNull(device.timestamp);
 
@@ -931,11 +919,9 @@ function adaptDeviceForOverview(device, statuses, modules) {
             online: Boolean(voiceModule?.online),
             last_event_ms: voiceModule?.last_seen_ms ?? null
         },
-        csi: {
-            online: Boolean(csiModule?.online ?? device.occupancy?.available),
-            last_result_ms: csiModule?.last_seen_ms ?? integerOrNull(device.occupancy?.updated_at),
-            occupancy: device.occupancy || null
-        }
+        csi: normalizeSnapshotCsi(device.csi, Date.now(), {
+            availableDefault: Boolean(device.csi?.available)
+        })
     };
 }
 
@@ -966,6 +952,9 @@ async function attachUnifiedOverview(dbAll, snapshot, query = {}) {
     filteredSnapshot.gateway = adaptGatewayForOverview(filteredSnapshot, statuses);
     filteredSnapshot.modules = buildModuleSummary(filteredSnapshot, modules);
     filteredSnapshot.devices = filteredSnapshot.devices.map(device => adaptDeviceForOverview(device, statuses, modules));
+    filteredSnapshot.csi = normalizeSnapshotCsi(filteredSnapshot.csi, filteredSnapshot.received_at_ms || Date.now(), {
+        availableDefault: Boolean(filteredSnapshot.csi?.available)
+    });
     filteredSnapshot.alarms = alarms;
     filteredSnapshot.recent_commands = recentCommands.length > 0
         ? recentCommands
@@ -1113,6 +1102,34 @@ async function readDashboardSensorHistory(dbAll, query = {}) {
     }));
 }
 
+async function readDashboardCsiHistory(dbAll, query = {}) {
+    const limitResult = readDashboardLimit(query.limit);
+    if (!limitResult.ok) {
+        return limitResult;
+    }
+
+    const rows = await readLatestCsiMotionEvents(dbAll, {
+        device_id: normalizeDashboardDeviceId(query.device_id),
+        limit: limitResult.limit
+    });
+    return {
+        events: rows.map(row => ({
+            id: row.id,
+            device_id: row.device_id,
+            link_id: row.link_id,
+            state: row.state,
+            frame_energy: numberOrNull(row.frame_energy),
+            variance: numberOrNull(row.variance),
+            rssi: integerOrNull(row.rssi),
+            motion_score: numberOrNull(row.motion_score),
+            timestamp: integerOrNull(row.timestamp),
+            gateway_id: row.gateway_id || "",
+            server_recv_ms: integerOrNull(row.server_recv_ms),
+            server_time_iso: row.server_time_iso || ""
+        }))
+    };
+}
+
 async function readDashboardAsrLatest(dbAll) {
     const rows = await dbAll(
         "SELECT * FROM asr_records WHERE deleted_at IS NULL ORDER BY id DESC LIMIT 1"
@@ -1209,7 +1226,7 @@ async function readDashboardOverview(dbAll, query = {}) {
             air_quality_level: sensorLatest.air_quality_level,
             air_quality_source: sensorLatest.air_quality_source
         } : null,
-        occupancy: normalizeSnapshotOccupancy(null, Date.now(), {
+        csi: normalizeSnapshotCsi(null, Date.now(), {
             availableDefault: false
         }),
         appliances: mockAppliances()
@@ -1244,7 +1261,10 @@ async function readDashboardOverview(dbAll, query = {}) {
             air_quality_level: row.air_quality_level
         })) : [],
         recent_voice_events: [],
-        recent_commands: []
+        recent_commands: [],
+        csi: normalizeSnapshotCsi(null, Date.now(), {
+            availableDefault: false
+        })
     };
     mergeCsiMotionIntoSnapshot(snapshot, normalizeDashboardDeviceId(query.device_id));
     return attachUnifiedOverview(dbAll, snapshot, query);
@@ -1257,8 +1277,9 @@ module.exports = {
     DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
     ingestDashboardSnapshot,
     mapDashboardSensor,
-    normalizeSnapshotOccupancy,
+    normalizeSnapshotCsi,
     recordCsiMotion,
+    readDashboardCsiHistory,
     readDashboardSnapshotHistory,
     readDashboardAsrLatest,
     readDashboardDeviceStatus,

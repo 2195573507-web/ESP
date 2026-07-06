@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "csi_fusion.h"
 #include "protocol_adapter.h"
 
 #ifdef __cplusplus
@@ -41,6 +42,9 @@ void sensor_aggregator_upload_snapshot(void);
  * 失败处理：Server 转发失败不会拒绝 C5 本地请求，只在 result/offline_policy 中记录。
  */
 esp_err_t sensor_aggregator_handle_envelope(const protocol_adapter_envelope_t *envelope,
+                                            sensor_aggregator_result_t *result);
+/** @brief Forward an S3-owned canonical CSI fact to ESP-server and update snapshots. */
+esp_err_t sensor_aggregator_handle_csi_fact(const csi_fusion_fact_t *fact,
                                             sensor_aggregator_result_t *result);
 /** @brief 记录一次 voice turn 事件并尝试上传 dashboard snapshot。 */
 void sensor_aggregator_record_voice_event(const char *device_id,

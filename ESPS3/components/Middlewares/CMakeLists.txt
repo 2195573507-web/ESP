@@ -11,6 +11,7 @@ set(gateway_srcs
             wake_prompt_cache_gateway/wake_prompt_cache_gateway.c
             command_router/command_router.c
             offline_policy/offline_policy.c
+            csi_fusion/csi_fusion.c
             csi_placeholder_gateway/csi_placeholder_gateway.c
             local_http_server/local_http_server.c
             gateway_orchestrator/gateway_orchestrator.c)
@@ -31,6 +32,7 @@ set(priv_include_dirs
             wake_prompt_cache_gateway
             command_router
             offline_policy
+            csi_fusion
             csi_placeholder_gateway
             local_http_server)
 

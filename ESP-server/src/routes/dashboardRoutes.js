@@ -1,6 +1,7 @@
 const express = require("express");
 const {
     ingestDashboardSnapshot,
+    readDashboardCsiHistory,
     readDashboardAsrLatest,
     readDashboardDeviceStatus,
     readDashboardLimit,
@@ -135,6 +136,21 @@ function createDashboardRouter(options) {
         } catch (error) {
             logger.error(`[dashboard-v1] DASHBOARD_SENSOR_HISTORY_READ_FAILED ${error?.message || error}`);
             return sendDashboardError(res, 500, "DASHBOARD_SENSOR_HISTORY_READ_FAILED", "dashboard read failed");
+        }
+    });
+
+    router.get("/csi/history", async (req, res) => {
+        const limit = readDashboardLimit(req.query.limit);
+        if (!limit.ok) {
+            return sendDashboardError(res, 400, limit.code, limit.message);
+        }
+
+        try {
+            const data = await readDashboardCsiHistory(dbAll, req.query);
+            return res.json(dashboardEnvelope(data));
+        } catch (error) {
+            logger.error(`[dashboard-v1] DASHBOARD_CSI_HISTORY_READ_FAILED ${error?.message || error}`);
+            return sendDashboardError(res, 500, "DASHBOARD_CSI_HISTORY_READ_FAILED", "dashboard read failed");
         }
     });
 

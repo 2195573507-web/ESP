@@ -3,16 +3,11 @@
 
 /**
  * @file csi_types.h
- * @brief 阶段 A CSI 独立算法的数据结构定义。
+ * @brief C5 CSI edge feature data structures.
  *
- * 本文件只定义 C5 本地离线算法会用到的结构体和枚举，不接入
- * app_orchestrator，不启动 WiFi CSI callback，也不描述任何 HTTP 上传行为。
- *
- * 调用方式：
- * 1. csi_capture 把离线 I/Q 样本转换成 csi_frame_sample；
- * 2. csi_feature 对 csi_frame_sample 做滤波和窗口统计，输出 csi_window_stats；
- * 3. csi_presence 把 csi_window_stats 转换成 csi_presence_result；
- * 4. csi_result_codec 只生成结构体或日志摘要。
+ * C5 owns raw CSI only inside local callback/feature extraction. Public output from
+ * this module is a low-dimensional feature frame for S3; it does not contain raw
+ * CSI, I/Q arrays, phase arrays, or subcarrier-level payloads.
  */
 
 #include <stdbool.h>
@@ -23,20 +18,22 @@
 extern "C" {
 #endif
 
-/* 阶段 A 固定内存上限：只选择少量子载波，避免保存 raw CSI。 */
-#define CSI_PHASE_A_MAX_SELECTED_SUBCARRIERS 16U
-#define CSI_PHASE_A_MAX_WINDOW_SAMPLES 64U
+#define CSI_PHASE_A_MAX_RAW_SUBCARRIERS 64U
+#define CSI_PHASE_A_MAX_SELECTED_SUBCARRIERS 40U
+#define CSI_PHASE_A_MIN_SELECTED_SUBCARRIERS 20U
+#define CSI_PHASE_A_MAX_CALIBRATION_ENERGY_SAMPLES 96U
 
 typedef enum {
-    CSI_PRESENCE_STATE_UNKNOWN = 0,
-    CSI_PRESENCE_STATE_VACANT = 1,
-    CSI_PRESENCE_STATE_OCCUPIED = 2,
-} csi_presence_state_t;
+    CSI_PROCESSOR_STATE_INIT = 0,
+    CSI_PROCESSOR_STATE_CALIBRATION = 1,
+    CSI_PROCESSOR_STATE_RUN = 2,
+} csi_processor_state_t;
 
 typedef enum {
     CSI_SAMPLE_QUALITY_INVALID = 0,
-    CSI_SAMPLE_QUALITY_WEAK = 1,
-    CSI_SAMPLE_QUALITY_GOOD = 2,
+    CSI_SAMPLE_QUALITY_CALIBRATING = 1,
+    CSI_SAMPLE_QUALITY_WEAK = 2,
+    CSI_SAMPLE_QUALITY_GOOD = 3,
 } csi_sample_quality_t;
 
 typedef struct {
@@ -48,30 +45,19 @@ typedef struct {
     uint64_t timestamp_ms;
     int8_t rssi;
     uint8_t subcarrier_count;
-    uint16_t amplitude[CSI_PHASE_A_MAX_SELECTED_SUBCARRIERS];
+    uint16_t amplitude[CSI_PHASE_A_MAX_RAW_SUBCARRIERS];
 } csi_frame_sample_t;
 
 typedef struct {
+    uint32_t frame_seq;
+    float frame_energy;
     float variance;
-    float cv;
-    float mean_amplitude;
-    uint16_t sample_count;
-    csi_sample_quality_t quality;
+    float quality;
     int8_t rssi;
-    uint64_t updated_at_ms;
-} csi_window_stats_t;
-
-typedef struct {
-    csi_presence_state_t state;
-    float motion_score;
-    float mean_amplitude;
-    float variance;
-    float cv;
-    csi_sample_quality_t quality;
-    int8_t rssi;
+    csi_sample_quality_t quality_state;
     uint16_t sample_count;
-    uint64_t updated_at_ms;
-} csi_presence_result_t;
+    uint64_t timestamp_ms;
+} csi_feature_result_t;
 
 #ifdef __cplusplus
 }

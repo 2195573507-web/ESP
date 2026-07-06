@@ -13,22 +13,33 @@ const {
 const {
     recordEvent
 } = require("./eventLogService");
+const {
+    broadcastEvent
+} = require("./eventStreamService");
+const {
+    insertCsiMotionEvent
+} = require("../db/csiMotion");
 
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
-const CSI_OCCUPANCY_STATES = new Set(["unknown", "vacant", "occupied"]);
+const CSI_STATES = new Set(["IDLE", "MOTION", "HOLD"]);
 
 function clampMotionScore(value) {
     const numeric = toFiniteNumber(value);
     if (numeric === null) {
         return null;
     }
-
     return Math.min(Math.max(numeric, 0), 1);
 }
 
-function readOptionalInteger(value) {
-    const numeric = toIntegerOrNull(value);
-    return numeric === null ? null : numeric;
+function finiteOrNull(value) {
+    return toFiniteNumber(value);
+}
+
+function readTimestamp(payload, body, serverRecvMs) {
+    return toIntegerOrNull(payload.timestamp) ||
+        toIntegerOrNull(payload.updated_at_ms) ||
+        toIntegerOrNull(body.timestamp_ms) ||
+        serverRecvMs;
 }
 
 function validateCsiMotionEnvelope(body, serverRecvMs) {
@@ -68,43 +79,71 @@ function validateCsiMotionEnvelope(body, serverRecvMs) {
         };
     }
 
-    const occupancy = body.payload.occupancy;
-    if (!occupancy || typeof occupancy !== "object" || Array.isArray(occupancy)) {
+    const payload = body.payload;
+    if ("raw_csi" in payload ||
+        "subcarrier_data" in payload ||
+        "selected_subcarriers" in payload ||
+        "iq" in payload ||
+        "phase" in payload) {
         return {
             ok: false,
-            code: "INVALID_PAYLOAD",
-            error: "payload.occupancy object is required"
+            code: "RAW_CSI_NOT_ACCEPTED",
+            error: "raw CSI and subcarrier data are not accepted"
+        };
+    }
+    if ("occupancy" in payload ||
+        "mean_amplitude" in payload ||
+        "cv" in payload ||
+        "sample_count" in payload) {
+        return {
+            ok: false,
+            code: "LEGACY_CSI_MODEL_NOT_ACCEPTED",
+            error: "legacy occupancy and C5-derived CSI result fields are not accepted"
         };
     }
 
-    const state = trimText(occupancy.state, 16).toLowerCase() || "unknown";
-    if (!CSI_OCCUPANCY_STATES.has(state)) {
+    const state = trimText(payload.state, 16).toUpperCase();
+    if (!CSI_STATES.has(state)) {
         return {
             ok: false,
-            code: "INVALID_CSI_OCCUPANCY_STATE",
-            error: "occupancy.state must be unknown, vacant, or occupied"
+            code: "INVALID_CSI_STATE",
+            error: "state must be IDLE, MOTION, or HOLD"
         };
     }
 
-    const sampleCount = toIntegerOrNull(body.payload.sample_count);
-    const updatedAt = toIntegerOrNull(body.payload.updated_at) ||
-        toIntegerOrNull(body.timestamp_ms) ||
-        serverRecvMs;
+    const linkId = trimText(payload.link_id, 64);
+    if (!linkId) {
+        return {
+            ok: false,
+            code: "LINK_ID_REQUIRED",
+            error: "link_id is required"
+        };
+    }
+
+    const frameEnergy = finiteOrNull(payload.frame_energy);
+    const variance = finiteOrNull(payload.variance);
+    const motionScore = clampMotionScore(payload.motion_score);
+    if (frameEnergy === null || frameEnergy < 0 ||
+        variance === null || variance < 0 ||
+        motionScore === null) {
+        return {
+            ok: false,
+            code: "INVALID_CSI_NUMERIC_FIELDS",
+            error: "frame_energy, variance, and motion_score must be finite non-negative numbers"
+        };
+    }
 
     return {
         ok: true,
         csi: {
-            occupancy: {
-                state,
-                available: true,
-                motion_score: clampMotionScore(body.payload.motion_score),
-                variance: toFiniteNumber(body.payload.variance),
-                rssi: readOptionalInteger(body.payload.rssi),
-                sample_count: sampleCount === null ? 0 : Math.max(0, sampleCount),
-                updated_at: updatedAt
-            },
-            room_id: trimText(body.room_id, 128),
-            local_id: toIntegerOrNull(body.local_id)
+            device_id: trimText(payload.device_id || body.device_id, 128),
+            link_id: linkId,
+            state,
+            frame_energy: frameEnergy,
+            variance,
+            rssi: toIntegerOrNull(payload.rssi),
+            motion_score: motionScore,
+            timestamp: readTimestamp(payload, body, serverRecvMs)
         }
     };
 }
@@ -123,6 +162,7 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
     if (options.trustedDeviceId) {
         metadata.device_id = trimText(options.trustedDeviceId, 128);
     }
+
     const validation = validateCsiMotionEnvelope(body, serverRecvMs);
     if (!validation.ok) {
         return {
@@ -134,44 +174,49 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
         };
     }
 
+    const fact = {
+        ...validation.csi,
+        device_id: metadata.device_id || validation.csi.device_id,
+        gateway_id: metadata.gateway_id,
+        server_recv_ms: metadata.server_recv_ms,
+        server_time_iso: metadata.server_time_iso,
+        raw_json: body
+    };
+
     await refreshDeviceActivity(dbRun, dbAll, metadata, CSI_MOTION_PAYLOAD_TYPE);
-    const dashboardRecord = recordCsiMotion({
-        device_id: metadata.device_id,
-        local_id: validation.csi.local_id,
-        room_id: validation.csi.room_id,
-        occupancy: validation.csi.occupancy
-    }, {
+    const id = await insertCsiMotionEvent(dbRun, fact);
+    const dashboardRecord = recordCsiMotion(fact, {
         serverRecvMs
     });
+
     await recordEvent(dbRun, {
         event_type: "csi",
-        event_name: "system_log_created",
-        device_id: metadata.device_id,
-        severity: "info",
-        message: `csi motion ${validation.csi.occupancy.state}`,
-        payload: {
-            room_id: validation.csi.room_id,
-            occupancy: validation.csi.occupancy
-        },
+        event_name: "csi_motion_state_received",
+        device_id: fact.device_id,
+        severity: fact.state === "MOTION" ? "warning" : "info",
+        message: `csi state ${fact.state}`,
+        payload: fact,
         source: "device_ingest",
         server_recv_ms: metadata.server_recv_ms
     });
+
+    broadcastEvent("csi_motion", fact);
 
     return {
         ok: true,
         status: 202,
         metadata,
         data: {
-            device_id: metadata.device_id,
+            id,
+            device_id: fact.device_id,
             payload_type: CSI_MOTION_PAYLOAD_TYPE,
-            occupancy: {
-                state: validation.csi.occupancy.state
-            },
-            motion_score: validation.csi.occupancy.motion_score,
-            variance: validation.csi.occupancy.variance,
-            rssi: validation.csi.occupancy.rssi,
-            sample_count: validation.csi.occupancy.sample_count,
-            updated_at: validation.csi.occupancy.updated_at,
+            link_id: fact.link_id,
+            state: fact.state,
+            frame_energy: fact.frame_energy,
+            variance: fact.variance,
+            rssi: fact.rssi,
+            motion_score: fact.motion_score,
+            timestamp: fact.timestamp,
             server_recv_ms: metadata.server_recv_ms,
             server_time_iso: metadata.server_time_iso,
             dashboard_recorded: Boolean(dashboardRecord)
@@ -181,6 +226,7 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
 
 module.exports = {
     CSI_MOTION_PAYLOAD_TYPE,
+    CSI_STATES,
     ingestCsiMotion,
     validateCsiMotionEnvelope
 };

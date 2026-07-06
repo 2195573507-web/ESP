@@ -119,6 +119,7 @@ let dashboardState = {
     systemLogs: mockSystemLogs,
     commandLogs: [],
     operationLogs: [],
+    csiHistory: [],
     smartHomeDevices: createSmartHomeDeviceState(),
     sources: {
         sensor: "mock",
@@ -247,6 +248,9 @@ function parseTimestamp(value) {
 }
 
 function pickFirst(data, keys) {
+    if (!isPlainObject(data)) {
+        return undefined;
+    }
     for (const key of keys) {
         if (data[key] !== undefined && data[key] !== null && data[key] !== "") {
             return data[key];
@@ -276,6 +280,14 @@ function formatNumber(value, digits = 1) {
         return "--";
     }
     return Number(numeric.toFixed(digits)).toString();
+}
+
+function clamp01(value) {
+    const numeric = toNumber(value);
+    if (numeric === null) {
+        return null;
+    }
+    return Math.min(Math.max(numeric, 0), 1);
 }
 
 // 曲线时间范围：从历史点中读取真实时间戳字段；没有绝对时间的点不参与 12/24/36/48 小时筛选。
@@ -542,6 +554,26 @@ async function fetchLatestLLM() {
 async function fetchHistoryData() {
     // 当前后端没有历史数据接口，保留 mockHistoryData 作为曲线占位。
     return mockHistoryData;
+}
+
+async function fetchCsiHistory() {
+    try {
+        const query = new URLSearchParams({
+            limit: "80"
+        });
+        const response = await fetch(`/api/dashboard/v1/csi/history?${query.toString()}`, {
+            cache: "no-store"
+        });
+        if (!response.ok) {
+            throw new Error(`/api/dashboard/v1/csi/history ${response.status}`);
+        }
+        const payload = await response.json();
+        const data = unwrapDashboardV1Data(payload);
+        return Array.isArray(data?.events) ? data.events : [];
+    } catch (error) {
+        console.warn("[Dashboard] CSI history unavailable", error.message);
+        return [];
+    }
 }
 
 async function fetchAlertLogs() {
@@ -899,6 +931,109 @@ function renderMainChart() {
             context.fillText(point.time, xFor(index) - 17, padding.top + height + 30);
         }
     });
+}
+
+function normalizeCsiEvent(event) {
+    if (!isPlainObject(event)) return null;
+    const timestamp = parseTimestamp(pickFirst(event, ["timestamp", "server_recv_ms", "created_at"]));
+    const state = String(event.state || "IDLE").toUpperCase();
+    if (!["IDLE", "MOTION", "HOLD"].includes(state)) return null;
+
+    return {
+        device_id: String(event.device_id || ""),
+        link_id: String(event.link_id || "fused"),
+        state,
+        frame_energy: toNumber(event.frame_energy),
+        variance: toNumber(event.variance),
+        rssi: toNumber(event.rssi),
+        motion_score: clamp01(event.motion_score),
+        timestamp
+    };
+}
+
+function renderCsiMiniTrend(events, field, maxValue, accent) {
+    const width = 360;
+    const height = 72;
+    const values = events
+        .map(event => toNumber(event[field]))
+        .filter(value => value !== null);
+
+    if (!values.length) {
+        return '<div class="csi-empty">暂无数据</div>';
+    }
+
+    const minValue = 0;
+    const yMax = maxValue || Math.max(...values, 1);
+    const points = values.map((value, index) => {
+        const x = values.length === 1 ? width / 2 : (index / (values.length - 1)) * width;
+        const clamped = Math.max(minValue, Math.min(yMax, value));
+        const y = height - 8 - ((clamped - minValue) / (yMax - minValue || 1)) * (height - 16);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    const area = `0,${height} ${points.join(" ")} ${width},${height}`;
+
+    return `
+        <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+            <polygon points="${area}" fill="${accent}" opacity="0.12"></polygon>
+            <polyline points="${points.join(" ")}" fill="none" stroke="${accent}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline>
+        </svg>
+    `;
+}
+
+function csiStateClass(state) {
+    if (state === "MOTION") return "danger";
+    if (state === "HOLD") return "warning";
+    return "normal";
+}
+
+function renderCsiPanel() {
+    const events = (Array.isArray(dashboardState.csiHistory) ? dashboardState.csiHistory : [])
+        .map(normalizeCsiEvent)
+        .filter(Boolean)
+        .sort((a, b) => {
+            const left = a.timestamp ? a.timestamp.getTime() : 0;
+            const right = b.timestamp ? b.timestamp.getTime() : 0;
+            return left - right;
+        });
+    const latest = events[events.length - 1] || null;
+
+    const state = latest?.state || "IDLE";
+    const stateClass = csiStateClass(state);
+    const badge = document.querySelector("[data-csi-state-badge]");
+    if (badge) {
+        badge.textContent = state;
+        badge.className = `state-badge state-${stateClass}`;
+    }
+
+    setText("[data-csi-score]", latest?.motion_score === null || latest?.motion_score === undefined ? "--" : formatNumber(latest.motion_score, 3));
+    setText("[data-csi-energy]", latest?.frame_energy === null || latest?.frame_energy === undefined ? "--" : formatNumber(latest.frame_energy, 2));
+    setText("[data-csi-variance]", latest?.variance === null || latest?.variance === undefined ? "--" : formatNumber(latest.variance, 4));
+    setText("[data-csi-rssi]", latest?.rssi === null || latest?.rssi === undefined ? "--" : `${formatNumber(latest.rssi, 0)} dBm`);
+
+    const scoreTrend = document.querySelector("[data-csi-score-trend]");
+    const energyTrend = document.querySelector("[data-csi-energy-trend]");
+    if (scoreTrend) {
+        scoreTrend.innerHTML = renderCsiMiniTrend(events, "motion_score", 1, readThemeColor("--csi-score", "#2f6df6"));
+    }
+    if (energyTrend) {
+        const energyMax = Math.max(...events.map(event => toNumber(event.frame_energy) || 0), 1);
+        energyTrend.innerHTML = renderCsiMiniTrend(events, "frame_energy", energyMax, readThemeColor("--csi-energy", "#10b981"));
+    }
+
+    const timeline = document.querySelector("[data-csi-timeline]");
+    if (!timeline) return;
+    const tail = events.slice(-18);
+    if (!tail.length) {
+        timeline.innerHTML = '<div class="csi-empty">等待 S3 上报 canonical CSI 状态</div>';
+        return;
+    }
+
+    timeline.innerHTML = tail.map(event => `
+        <div class="csi-timeline-item ${csiStateClass(event.state)}" title="${escapeHtml(formatTime(event.timestamp))} ${escapeHtml(event.state)}">
+            <span>${escapeHtml(event.state)}</span>
+            <small>${escapeHtml(formatTime(event.timestamp))}</small>
+        </div>
+    `).join("");
 }
 
 function buildDynamicAlertLogs(metrics) {
@@ -1756,12 +1891,13 @@ function openCommandConfirmModal(config) {
 }
 
 async function updateDashboard() {
-    const [sensorResult, asrResult, llmResult, history, mockLogs] = await Promise.all([
+    const [sensorResult, asrResult, llmResult, history, mockLogs, csiHistory] = await Promise.all([
         fetchLatestSensor(),
         fetchLatestASR(),
         fetchLatestLLM(),
         fetchHistoryData(),
-        fetchAlertLogs()
+        fetchAlertLogs(),
+        fetchCsiHistory()
     ]);
 
     const sensor = normalizeSensor(sensorResult.data, sensorResult.source);
@@ -1776,6 +1912,7 @@ async function updateDashboard() {
     };
     dashboardState.metrics = buildMetrics(sensor);
     dashboardState.history = history;
+    dashboardState.csiHistory = csiHistory;
 
     const dynamicAlerts = buildDynamicAlertLogs(dashboardState.metrics);
     dashboardState.alertLogs = dynamicAlerts.length > 0 ? [...dynamicAlerts, ...mockLogs].slice(0, 6) : mockLogs;
@@ -1786,6 +1923,7 @@ async function updateDashboard() {
     renderAlertSummary();
     renderAlertLogs();
     renderSystemLogs();
+    renderCsiPanel();
     renderActiveLogModal();
     renderStatusHeader();
     renderSourceDebug();
@@ -2191,6 +2329,7 @@ window.updateChartTheme = () => {
     }
 
     renderMainChart();
+    renderCsiPanel();
 };
 
 // 前端定时器：集中启动和清理 Dashboard 轮询，避免重复 setInterval。

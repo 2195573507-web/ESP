@@ -25,6 +25,9 @@ const {
     ensureDashboardSnapshotTables
 } = require("./src/db/dashboardSnapshots");
 const {
+    ensureCsiMotionTables
+} = require("./src/db/csiMotion");
+const {
     ensureEventLogTables
 } = require("./src/db/eventLogs");
 const {
@@ -225,6 +228,7 @@ async function startServer() {
     await ensureDeviceStatusTables(dbRun, dbAll);
     await ensureGatewayAuthTables(dbRun, dbAll);
     await ensureDashboardSnapshotTables(dbRun, dbAll);
+    await ensureCsiMotionTables(dbRun, dbAll);
     await ensureEventLogTables(dbRun, dbAll);
     await ensureVoiceTurnsTable(dbRun, dbAll);
     await ensureCommandTables(dbRun, dbAll);
@@ -244,6 +248,7 @@ async function startServer() {
                 "sensor_timing",
                 "device_status",
                 "dashboard_snapshots",
+                "csi_motion_events",
                 "event_logs",
                 "voice_turns",
                 "commands",
