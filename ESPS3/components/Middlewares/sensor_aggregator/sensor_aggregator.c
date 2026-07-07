@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app_stack_monitor.h"
 #include "cJSON.h"
 #include "child_registry.h"
 #include "csi_fusion.h"
@@ -25,7 +26,9 @@
 #include "gateway_wifi.h"
 #include "offline_policy.h"
 #include "protocol_adapter.h"
+#include "s3_scheduler.h"
 #include "server_client.h"
+#include "network_worker.h"
 #include "voice_proxy.h"
 
 static const char *TAG = "sensor_aggregator";
@@ -99,6 +102,12 @@ static size_t s_history_cursor;
 static size_t s_voice_cursor;
 static size_t s_command_cursor;
 static bool s_has_latest_csi_fact;
+static int64_t s_last_stack_monitor_ms;
+
+static bool upload_gate_open(void)
+{
+    return gateway_wifi_is_sta_connected() && s3_scheduler_is_server_upload_allowed();
+}
 
 static int64_t now_ms(void)
 {
@@ -180,45 +189,24 @@ static const char *json_string(cJSON *root, const char *key, const char *fallbac
     return cJSON_IsString(value) && value->valuestring != NULL ? value->valuestring : fallback;
 }
 
-static bool build_csi_fact_server_json(const csi_fusion_fact_t *fact, char **out_json)
+static const char *air_quality_level_for_score(int score)
 {
-    if (fact == NULL || out_json == NULL || !fact->valid) {
-        return false;
+    if (score >= 90) {
+        return "excellent";
     }
-
-    *out_json = NULL;
-    cJSON *root = cJSON_CreateObject();
-    if (root == NULL) {
-        return false;
+    if (score >= 75) {
+        return "good";
     }
-    cJSON_AddNumberToObject(root,
-                            ESP111_PROTOCOL_JSON_SCHEMA_VERSION,
-                            ESP111_PROTOCOL_SCHEMA_VERSION);
-    cJSON_AddStringToObject(root, ESP111_PROTOCOL_JSON_PAYLOAD_TYPE, ESP111_PROTOCOL_MSG_CSI_MOTION);
-    cJSON_AddStringToObject(root, ESP111_PROTOCOL_JSON_DEVICE_ID, fact->device_id);
-    cJSON_AddStringToObject(root, ESP111_PROTOCOL_JSON_GATEWAY_ID, gateway_config_get()->gateway_id);
-    cJSON_AddStringToObject(root, "source", "s3_gateway");
-    cJSON_AddStringToObject(root, "device_type", "S3");
-    cJSON_AddBoolToObject(root, ESP111_PROTOCOL_JSON_TIME_SYNCED, false);
-    cJSON_AddNumberToObject(root, ESP111_PROTOCOL_JSON_TIMESTAMP_MS, (double)fact->timestamp_ms);
-
-    cJSON *payload = cJSON_AddObjectToObject(root, ESP111_PROTOCOL_JSON_PAYLOAD);
-    if (payload == NULL) {
-        cJSON_Delete(root);
-        return false;
+    if (score >= 55) {
+        return "moderate";
     }
-    cJSON_AddStringToObject(payload, "device_id", fact->device_id);
-    cJSON_AddStringToObject(payload, "link_id", fact->link_id);
-    cJSON_AddStringToObject(payload, "state", csi_fusion_state_to_string(fact->state));
-    cJSON_AddNumberToObject(payload, "frame_energy", fact->frame_energy);
-    cJSON_AddNumberToObject(payload, "variance", fact->variance);
-    cJSON_AddNumberToObject(payload, "rssi", fact->rssi);
-    cJSON_AddNumberToObject(payload, "motion_score", fact->motion_score);
-    cJSON_AddNumberToObject(payload, "timestamp", (double)fact->timestamp_ms);
-
-    *out_json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    return *out_json != NULL;
+    if (score >= 30) {
+        return "poor";
+    }
+    if (score >= 0) {
+        return "bad";
+    }
+    return "unknown";
 }
 
 static void update_latest_csi_locked(const csi_fusion_fact_t *fact)
@@ -229,37 +217,6 @@ static void update_latest_csi_locked(const csi_fusion_fact_t *fact)
 
     s_latest_csi_fact = *fact;
     s_has_latest_csi_fact = true;
-}
-
-static void add_snapshot_csi_json(cJSON *root)
-{
-    cJSON *csi = cJSON_AddObjectToObject(root, "csi");
-    if (csi == NULL) {
-        return;
-    }
-
-    if (!s_has_latest_csi_fact || !s_latest_csi_fact.valid) {
-        cJSON_AddBoolToObject(csi, "available", false);
-        cJSON_AddStringToObject(csi, "device_id", gateway_config_get()->gateway_id);
-        cJSON_AddStringToObject(csi, "link_id", "fused");
-        cJSON_AddStringToObject(csi, "state", "IDLE");
-        cJSON_AddNullToObject(csi, "frame_energy");
-        cJSON_AddNullToObject(csi, "variance");
-        cJSON_AddNullToObject(csi, "rssi");
-        cJSON_AddNumberToObject(csi, "motion_score", 0.0);
-        cJSON_AddNullToObject(csi, "timestamp");
-        return;
-    }
-
-    cJSON_AddBoolToObject(csi, "available", true);
-    cJSON_AddStringToObject(csi, "device_id", s_latest_csi_fact.device_id);
-    cJSON_AddStringToObject(csi, "link_id", s_latest_csi_fact.link_id);
-    cJSON_AddStringToObject(csi, "state", csi_fusion_state_to_string(s_latest_csi_fact.state));
-    cJSON_AddNumberToObject(csi, "frame_energy", s_latest_csi_fact.frame_energy);
-    cJSON_AddNumberToObject(csi, "variance", s_latest_csi_fact.variance);
-    cJSON_AddNumberToObject(csi, "rssi", s_latest_csi_fact.rssi);
-    cJSON_AddNumberToObject(csi, "motion_score", s_latest_csi_fact.motion_score);
-    cJSON_AddNumberToObject(csi, "timestamp", (double)s_latest_csi_fact.timestamp_ms);
 }
 
 static bool device_is_online(const sensor_aggregator_device_t *device, int64_t timestamp_ms)
@@ -327,7 +284,15 @@ static void report_status_change_if_needed(const char *device_id)
 static void refresh_child_status_events(void)
 {
     const gateway_runtime_config_t *config = gateway_config_get();
-    for (size_t i = 0; i < config->children_allowlist_count; i++) {
+    size_t count = config->children_allowlist_count;
+    if (count > GATEWAY_CONFIG_MAX_CHILDREN) {
+        ESP_LOGW(TAG,
+                 "children allowlist count clamped count=%u max=%u",
+                 (unsigned int)count,
+                 (unsigned int)GATEWAY_CONFIG_MAX_CHILDREN);
+        count = GATEWAY_CONFIG_MAX_CHILDREN;
+    }
+    for (size_t i = 0; i < count; i++) {
         report_status_change_if_needed(config->children_allowlist[i]);
     }
 }
@@ -480,7 +445,6 @@ static cJSON *build_snapshot_locked(void)
                             ESP111_PROTOCOL_JSON_PAYLOAD_TYPE,
                             ESP111_PROTOCOL_MSG_DASHBOARD_SNAPSHOT);
     cJSON_AddStringToObject(root, "source", "s3_gateway");
-    add_snapshot_csi_json(root);
 
     cJSON *gateway = cJSON_AddObjectToObject(root, "gateway");
     cJSON_AddStringToObject(gateway, "gateway_id", gateway_config_get()->gateway_id);
@@ -577,12 +541,19 @@ static cJSON *build_snapshot_locked(void)
     return root;
 }
 
-void sensor_aggregator_upload_snapshot(void)
+void sensor_aggregator_upload_snapshot_now(void)
 {
     if (s_lock == NULL) {
         return;
     }
 
+    if (!upload_gate_open()) {
+        return;
+    }
+    app_stack_monitor_log_periodic(TAG,
+                                   "sensor_aggregator",
+                                   &s_last_stack_monitor_ms,
+                                   APP_STACK_MONITOR_INTERVAL_MS);
     refresh_child_status_events();
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -599,6 +570,11 @@ void sensor_aggregator_upload_snapshot(void)
         ESP_LOGW(TAG, "dashboard snapshot serialize failed");
         return;
     }
+    ESP_LOGD(TAG,
+             "dashboard snapshot upload schema=%u payload_type=%s bytes=%u",
+             (unsigned int)ESP111_PROTOCOL_DASHBOARD_SNAPSHOT_SCHEMA_VERSION,
+             ESP111_PROTOCOL_MSG_DASHBOARD_SNAPSHOT,
+             (unsigned int)strlen(json));
 
     char response[SERVER_CLIENT_SMALL_BODY_BYTES];
     int status = 0;
@@ -612,6 +588,17 @@ void sensor_aggregator_upload_snapshot(void)
                  status,
                  esp_err_to_name(ret),
                  offline_policy_code_for_result(ret, status));
+    }
+}
+
+void sensor_aggregator_upload_snapshot(void)
+{
+    if (!upload_gate_open()) {
+        return;
+    }
+    esp_err_t ret = network_worker_enqueue_snapshot_upload();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "dashboard snapshot enqueue failed ret=%s", esp_err_to_name(ret));
     }
 }
 
@@ -676,16 +663,19 @@ esp_err_t sensor_aggregator_handle_envelope(const protocol_adapter_envelope_t *e
             return ret;
         }
 
-        char response[SERVER_CLIENT_SMALL_BODY_BYTES];
-        ret = server_client_post_ingest_json(server_json, response, sizeof(response), &status);
-        protocol_adapter_free_json(server_json);
-        offline_policy_record_server_result(ret, status);
+        ret = network_worker_submit_server_json(NETWORK_WORKER_SERVER_JSON_INGEST,
+                                                server_json,
+                                                "sensor_envelope");
+        if (ret != ESP_OK) {
+            protocol_adapter_free_json(server_json);
+            offline_policy_record_server_result(ret, status);
+        }
     }
 
     result->server_ret = ret;
     result->server_status = status;
     result->forwarded = kind == PROTOCOL_ADAPTER_MESSAGE_SENSOR_BME690 ?
-                            (ret == ESP_OK && status >= 200 && status < 300) :
+                            (ret == ESP_OK) :
                             true;
     result->error_code = result->forwarded ? "" : offline_policy_code_for_result(ret, status);
 
@@ -703,7 +693,192 @@ esp_err_t sensor_aggregator_handle_envelope(const protocol_adapter_envelope_t *e
     return ESP_OK;
 }
 
+esp_err_t sensor_aggregator_handle_stream_status(const char *device_id,
+                                                 int64_t timestamp_ms,
+                                                 double heap,
+                                                 double uptime,
+                                                 double wifi_rssi,
+                                                 sensor_aggregator_result_t *result)
+{
+    if (device_id == NULL || device_id[0] == '\0' || result == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(result, 0, sizeof(*result));
+    result->accepted = true;
+    result->forwarded = true;
+    result->server_ret = ESP_OK;
+    result->server_status = 0;
+    result->error_code = "";
+
+    if (s_lock != NULL) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        sensor_aggregator_device_t *device = find_device_locked(device_id);
+        if (device != NULL) {
+            device->online = true;
+            device->last_seen_ms = now_ms();
+            device->timestamp_ms = timestamp_ms > 0 ? timestamp_ms : device->last_seen_ms;
+            device->last_uptime_ms = (int64_t)uptime;
+            device->has_wifi_rssi = true;
+            device->wifi_rssi = (int)wifi_rssi;
+            device->wifi_connected = true;
+            device->voice_ready = true;
+            device->command_ready = true;
+            device->free_heap = heap > 0.0 ? (uint32_t)heap : device->free_heap;
+            device->min_free_heap = device->free_heap;
+        }
+        xSemaphoreGive(s_lock);
+    }
+
+    report_status_change_if_needed(device_id);
+    sensor_aggregator_upload_snapshot();
+    return ESP_OK;
+}
+
+static bool build_stream_sensor_server_json(const char *device_id,
+                                            int64_t timestamp_ms,
+                                            const char *link_id,
+                                            double sensor_value_1,
+                                            double sensor_value_2,
+                                            double quality,
+                                            char **out_json)
+{
+    if (device_id == NULL || device_id[0] == '\0' || out_json == NULL) {
+        return false;
+    }
+
+    *out_json = NULL;
+    int score = (int)quality;
+    const char *level = air_quality_level_for_score(score);
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        return false;
+    }
+    cJSON_AddNumberToObject(root,
+                            ESP111_PROTOCOL_JSON_SCHEMA_VERSION,
+                            ESP111_PROTOCOL_SCHEMA_VERSION);
+    cJSON_AddStringToObject(root, ESP111_PROTOCOL_JSON_PAYLOAD_TYPE, ESP111_PROTOCOL_MSG_SENSOR_BME690);
+    cJSON_AddStringToObject(root, ESP111_PROTOCOL_JSON_DEVICE_ID, device_id);
+    cJSON_AddStringToObject(root, ESP111_PROTOCOL_JSON_GATEWAY_ID, gateway_config_get()->gateway_id);
+    cJSON_AddStringToObject(root, "source", "s3_gateway");
+    cJSON_AddNumberToObject(root, ESP111_PROTOCOL_JSON_TIMESTAMP_MS, (double)timestamp_ms);
+    cJSON_AddBoolToObject(root, ESP111_PROTOCOL_JSON_TIME_SYNCED, false);
+
+    cJSON *payload = cJSON_AddObjectToObject(root, ESP111_PROTOCOL_JSON_PAYLOAD);
+    if (payload == NULL) {
+        cJSON_Delete(root);
+        return false;
+    }
+    cJSON_AddStringToObject(payload, "sensor_id", link_id != NULL && link_id[0] != '\0' ? link_id : "stream_sensor");
+    cJSON_AddNumberToObject(payload, "temperature_c", sensor_value_1);
+    cJSON_AddNumberToObject(payload, "humidity_percent", sensor_value_2);
+    cJSON_AddNumberToObject(payload, "pressure_hpa", 0.0);
+    cJSON_AddNumberToObject(payload, "gas_resistance_ohm", 0.0);
+    cJSON_AddNumberToObject(payload, "air_quality_score", score);
+    cJSON_AddStringToObject(payload, "air_quality_level", level);
+    cJSON_AddStringToObject(payload, "air_quality_confidence", "medium");
+    cJSON_AddStringToObject(payload, "air_quality_algo_version", "c5_stream_v1");
+    cJSON_AddStringToObject(payload, "air_quality_source", "esp");
+    cJSON_AddNumberToObject(payload, "sample_count", 1);
+
+    *out_json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return *out_json != NULL;
+}
+
+esp_err_t sensor_aggregator_handle_stream_sensor(const char *device_id,
+                                                 int64_t timestamp_ms,
+                                                 const char *link_id,
+                                                 double sensor_value_1,
+                                                 double sensor_value_2,
+                                                 double quality,
+                                                 sensor_aggregator_result_t *result)
+{
+    if (device_id == NULL || device_id[0] == '\0' || result == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(result, 0, sizeof(*result));
+    result->accepted = true;
+
+    int score = (int)quality;
+    const char *level = air_quality_level_for_score(score);
+    int64_t effective_timestamp = timestamp_ms > 0 ? timestamp_ms : now_ms();
+
+    if (s_lock != NULL) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        sensor_aggregator_device_t *device = find_device_locked(device_id);
+        if (device != NULL) {
+            device->online = true;
+            device->last_seen_ms = now_ms();
+            device->timestamp_ms = effective_timestamp;
+            device->has_sensor = true;
+            device->temperature = sensor_value_1;
+            device->humidity = sensor_value_2;
+            device->pressure = 0.0;
+            device->gas_resistance = 0.0;
+            device->air_quality_score = score;
+            strlcpy(device->air_quality_level, level, sizeof(device->air_quality_level));
+            strlcpy(device->air_quality_source, "s3_mapped", sizeof(device->air_quality_source));
+
+            sensor_aggregator_history_t *history = &s_history[s_history_cursor];
+            memset(history, 0, sizeof(*history));
+            history->valid = true;
+            strlcpy(history->device_id, device->device_id, sizeof(history->device_id));
+            history->timestamp_ms = effective_timestamp;
+            history->temperature = device->temperature;
+            history->humidity = device->humidity;
+            history->pressure = device->pressure;
+            history->gas_resistance = device->gas_resistance;
+            history->air_quality_score = device->air_quality_score;
+            strlcpy(history->air_quality_level, device->air_quality_level, sizeof(history->air_quality_level));
+            s_history_cursor = (s_history_cursor + 1U) % SENSOR_AGGREGATOR_HISTORY_SIZE;
+        }
+        xSemaphoreGive(s_lock);
+    }
+
+    char *server_json = NULL;
+    if (!build_stream_sensor_server_json(device_id,
+                                         effective_timestamp,
+                                         link_id,
+                                         sensor_value_1,
+                                         sensor_value_2,
+                                         quality,
+                                         &server_json)) {
+        result->server_ret = ESP_ERR_NO_MEM;
+        result->error_code = ESP111_PROTOCOL_ERROR_ADAPTER;
+        return ESP_ERR_NO_MEM;
+    }
+
+    int status = 0;
+    esp_err_t ret = network_worker_submit_server_json(NETWORK_WORKER_SERVER_JSON_INGEST,
+                                                      server_json,
+                                                      "stream_sensor");
+    if (ret != ESP_OK) {
+        cJSON_free(server_json);
+        offline_policy_record_server_result(ret, status);
+    }
+
+    result->server_ret = ret;
+    result->server_status = status;
+    result->forwarded = ret == ESP_OK;
+    result->error_code = result->forwarded ? "" : offline_policy_code_for_result(ret, status);
+    if (!result->forwarded && result->server_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG,
+                 "stream sensor forward deferred device_id=%s error_code=%s status=%d ret=%s",
+                 device_id,
+                 result->error_code,
+                 status,
+                 esp_err_to_name(ret));
+    }
+
+    sensor_aggregator_upload_snapshot();
+    return ESP_OK;
+}
+
 esp_err_t sensor_aggregator_handle_csi_fact(const csi_fusion_fact_t *fact,
+                                            const csi_fusion_telemetry_t *telemetry,
                                             sensor_aggregator_result_t *result)
 {
     if (fact == NULL || result == NULL || !fact->valid) {
@@ -720,27 +895,40 @@ esp_err_t sensor_aggregator_handle_csi_fact(const csi_fusion_fact_t *fact,
     }
 
     char *server_json = NULL;
-    if (!build_csi_fact_server_json(fact, &server_json)) {
-        result->server_ret = ESP_ERR_NO_MEM;
-        result->error_code = ESP111_PROTOCOL_ERROR_ADAPTER;
-        return ESP_ERR_NO_MEM;
+    esp_err_t build_ret = protocol_adapter_build_csi_event_v2_json(fact,
+                                                                   telemetry,
+                                                                   &server_json);
+    if (build_ret != ESP_OK) {
+        result->accepted = false;
+        result->server_ret = build_ret;
+        result->server_status = 0;
+        result->forwarded = false;
+        result->error_code = ESP111_PROTOCOL_ERROR_INVALID_CSI_RESULT;
+        ESP_LOGW(TAG,
+                 "CSI canonical event dropped tick_id=%llu ret=%s",
+                 (unsigned long long)fact->tick_id,
+                 esp_err_to_name(build_ret));
+        return ESP_OK;
     }
 
     int status = 0;
-    char response[SERVER_CLIENT_SMALL_BODY_BYTES];
-    esp_err_t ret = server_client_post_ingest_json(server_json, response, sizeof(response), &status);
-    cJSON_free(server_json);
-    offline_policy_record_server_result(ret, status);
+    esp_err_t ret = network_worker_submit_server_json(NETWORK_WORKER_SERVER_JSON_CSI_EVENT,
+                                                      server_json,
+                                                      "csi_fact");
+    if (ret != ESP_OK) {
+        protocol_adapter_free_json(server_json);
+        offline_policy_record_server_result(ret, status);
+    }
 
     result->server_ret = ret;
     result->server_status = status;
-    result->forwarded = ret == ESP_OK && status >= 200 && status < 300;
+    result->forwarded = ret == ESP_OK;
     result->error_code = result->forwarded ? "" : offline_policy_code_for_result(ret, status);
     if (!result->forwarded && result->server_ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG,
-                 "CSI fact forward deferred state=%s score=%.3f error_code=%s status=%d ret=%s",
-                 csi_fusion_state_to_string(fact->state),
-                 (double)fact->motion_score,
+                 "CSI fact forward deferred state=%s confidence=%.3f error_code=%s status=%d ret=%s",
+                 csi_fusion_state_to_string(fact->fused_state),
+                 (double)fact->confidence,
                  result->error_code,
                  status,
                  esp_err_to_name(ret));

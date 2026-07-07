@@ -109,6 +109,27 @@ static float clamp01f(float value)
     return value;
 }
 
+static float csi_feature_cv(float frame_energy, float variance)
+{
+    return frame_energy > 0.001f ? csi_sqrtf_approx(variance) / frame_energy : 0.0f;
+}
+
+static envelope_state_hint_t csi_feature_state_hint(float variance,
+                                                    float cv,
+                                                    float quality)
+{
+    if (quality <= 0.0f) {
+        return ENVELOPE_STATE_HINT_IDLE;
+    }
+    if (variance >= 260.0f || cv >= 0.22f) {
+        return ENVELOPE_STATE_HINT_MOTION;
+    }
+    if (variance >= 80.0f || cv >= 0.08f) {
+        return ENVELOPE_STATE_HINT_HOLD;
+    }
+    return ENVELOPE_STATE_HINT_IDLE;
+}
+
 static float median_float(float *values, size_t count)
 {
     if (count == 0U) {
@@ -344,7 +365,6 @@ static void finish_calibration(csi_feature_processor_t *processor)
     memset(processor->previous_clean, 0, sizeof(processor->previous_clean));
     memset(processor->smoothed_delta, 0, sizeof(processor->smoothed_delta));
     processor->has_previous_clean = false;
-    processor->processed_samples = 0U;
     processor->delta_noise_estimate = processor->noise_floor;
     processor->state = CSI_PROCESSOR_STATE_RUN;
 }
@@ -439,7 +459,7 @@ uint16_t csi_feature_amplitude_from_iq(int16_t i, int16_t q)
 
 bool csi_feature_processor_push(csi_feature_processor_t *processor,
                                 const csi_frame_sample_t *frame,
-                                csi_feature_result_t *out_feature)
+                                csi_feature_frame_t *out_feature)
 {
     if (processor == NULL || frame == NULL || out_feature == NULL ||
         frame->subcarrier_count == 0U) {
@@ -447,10 +467,11 @@ bool csi_feature_processor_push(csi_feature_processor_t *processor,
     }
 
     memset(out_feature, 0, sizeof(*out_feature));
-    out_feature->rssi = frame->rssi;
+    out_feature->metrics.rssi = frame->rssi;
     out_feature->timestamp_ms = frame->timestamp_ms;
-    out_feature->frame_seq = processor->frame_seq;
-    out_feature->quality = 0.0f;
+    out_feature->metrics.cv = 0.0f;
+    out_feature->metrics.quality = 0.0f;
+    out_feature->state_hint = ENVELOPE_STATE_HINT_IDLE;
     out_feature->quality_state = CSI_SAMPLE_QUALITY_INVALID;
 
     if (processor->state == CSI_PROCESSOR_STATE_INIT) {
@@ -461,7 +482,6 @@ bool csi_feature_processor_push(csi_feature_processor_t *processor,
     if (processor->state == CSI_PROCESSOR_STATE_CALIBRATION) {
         add_calibration_frame(processor, frame);
         out_feature->quality_state = CSI_SAMPLE_QUALITY_CALIBRATING;
-        out_feature->sample_count = processor->calibration_samples;
 
         uint64_t elapsed = frame->timestamp_ms >= processor->calibration_started_ms
                                ? frame->timestamp_ms - processor->calibration_started_ms
@@ -510,7 +530,6 @@ bool csi_feature_processor_push(csi_feature_processor_t *processor,
     }
 
     processor->has_previous_clean = true;
-    ++processor->processed_samples;
     processor->last_timestamp_ms = frame->timestamp_ms;
 
     float mean_delta = delta_sum / (float)used;
@@ -524,12 +543,14 @@ bool csi_feature_processor_push(csi_feature_processor_t *processor,
         ((1.0f - processor->config.ewma_alpha) * processor->delta_noise_estimate);
     float quality = 1.0f / (1.0f + variance + processor->delta_noise_estimate);
 
-    ++processor->frame_seq;
-    out_feature->frame_energy = energy_sum / (float)used;
-    out_feature->variance = variance;
-    out_feature->quality = clamp01f(quality);
-    out_feature->sample_count = processor->processed_samples;
-    out_feature->frame_seq = processor->frame_seq;
+    out_feature->metrics.frame_energy = energy_sum / (float)used;
+    out_feature->metrics.variance = variance;
+    out_feature->metrics.cv =
+        csi_feature_cv(out_feature->metrics.frame_energy, out_feature->metrics.variance);
+    out_feature->metrics.quality = clamp01f(quality);
+    out_feature->state_hint = csi_feature_state_hint(out_feature->metrics.variance,
+                                                     out_feature->metrics.cv,
+                                                     out_feature->metrics.quality);
     out_feature->quality_state = CSI_SAMPLE_QUALITY_GOOD;
     return true;
 }

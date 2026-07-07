@@ -1,12 +1,14 @@
-# CSI Debug Web
+# CSI Fusion Debug Web
 
-Local-only WiFi CSI debug workbench for the ESP-111 workspace.
+Local-only CSI fusion radar workbench for the ESP-111 three-node CSI sensing area.
 
 This tool is intentionally scoped to local debugging:
 
 - It serves one local page at `http://127.0.0.1:8787`.
 - It can read CSI logs from `/dev/cu.*` serial ports when `serialport` is installed.
 - It can parse pasted CSI log lines and generate mock samples without any real device.
+- It visualizes C51 / C52 / S3 as one spatial sensing area.
+- It derives topology, radar, state timeline, and link curve telemetry locally.
 - It stores history in `server.js` memory only.
 - It does not connect to ESP-server.
 - It does not connect to the formal Dashboard.
@@ -76,14 +78,14 @@ CSI_MAX_HISTORY=5000 CSI_HISTORY_LIMIT=1000 node server.js
    http://127.0.0.1:8787
    ```
 
-3. Click `生成模拟样本`.
+3. Click `模拟帧`.
 
-4. Confirm `最新状态区`, `曲线区`, and `Raw JSON 区` update.
+4. Confirm `CSI Fusion Status`, `三节点拓扑`, `Radar View`, `状态时间轴`, and `链路曲线` update.
 
-5. Paste this example into `手动调试区` and click `解析这一行`:
+5. Paste this example into `导入` / `日志行` and click `解析日志`:
 
    ```text
-   I (12345) csi_service: csi summary {"schema":1,"device_id":"c5","room_id":"lab","state":"occupied","motion_score":0.72,"variance":0.44,"cv":0.08,"rssi":-35,"noise_floor":-90,"packet_count":64,"updated_at_ms":123456}
+   I (45678) csi_gateway: CSI_FUSION_TELEMETRY {"type":"csi_fusion","schema_version":2,"trace_id":"csi-v2-42","tick_id":42,"links":["C51","C52"],"fused_state":{"state":"HOLD","confidence":0.58,"motion_score":0.58},"confidence":0.58,"motion_score":0.58,"timestamp_ms":4200}
    ```
 
 6. Use `导出 JSON`, `导出 CSV`, and `清空历史`.
@@ -166,28 +168,28 @@ npm test
 
 ## Supported Log Lines
 
-Current summary JSON:
+S3 fusion telemetry:
 
 ```text
-csi_service: csi summary {"schema":1,"state":"vacant","motion_score":0.02,"variance":0.14,"cv":0.013,"rssi":-31,"packet_count":32,"updated_at_ms":123456}
+I (45678) csi_gateway: CSI_FUSION_TELEMETRY {"type":"csi_fusion","schema_version":2,"trace_id":"csi-v2-42","tick_id":42,"links":["C51","C52"],"fused_state":{"state":"HOLD","confidence":0.58,"motion_score":0.58},"confidence":0.58,"motion_score":0.58,"timestamp_ms":4200}
 ```
 
-ESP-IDF prefixed summary:
+C5 feature frame:
 
 ```text
-I (12345) csi_service: csi summary {"schema":1,"device_id":"c5","room_id":"lab","state":"occupied","motion_score":0.72,"variance":0.44,"cv":0.08,"rssi":-35,"noise_floor":-90,"packet_count":64,"updated_at_ms":123456}
+I (12000) csi_server_client: CSI_C5_FEATURE {"schema_version":"c5-feature-v1","device_id":"C51","link_id":"S3_TO_C51","timestamp_ms":12000,"metrics":{"frame_energy":18.2,"variance":0.15,"cv":0.09,"rssi":-44,"quality":0.93},"state_hint":"MOTION","source":"csi_phase_a"}
 ```
 
-Short `CSI:` style JSON:
+Canonical CSI fact from ESP-server-compatible surfaces:
 
 ```text
-I (12345) CSI: {"device_id":"c5","motion_score":0.61,"rssi":-42,"amplitude":23.4,"packet_count":88}
+{"payload_type":"csi.motion","device_id":"gateway-1","timestamp_ms":123456,"payload":{"state":"MOTION","frame_energy":22.5,"variance":0.32,"rssi":-38,"motion_score":0.81,"confidence":0.77}}
 ```
 
-Placeholder gateway style with key/value fields:
+Legacy summary parsing is still accepted for old logs. It is expanded into synthetic four-link telemetry for the UI:
 
 ```text
-W (12345) csi_placeholder_gateway: device_id=c5 room_id=lab motion_score=0.18 rssi=-51 packet_count=18 state=vacant
+I (12345) csi_service: csi summary {"schema":1,"device_id":"c5","state":"occupied","motion_score":0.72,"variance":0.44,"rssi":-35,"updated_at_ms":123456}
 ```
 
 Legacy line:
@@ -197,6 +199,45 @@ CSI_SAMPLE {"device_id":"sensair_c51","room_id":"bedroom","rssi":-42,"packet_cou
 ```
 
 Parse failures return JSON with `ok:false`, `error`, and `raw_line`. They do not stop the server.
+
+## Local Telemetry Engine
+
+`src/csiTelemetryEngine.js` upgrades every accepted input into the same link telemetry shape. It stays in memory and does not write to ESP-server or any database.
+
+Normalized link event:
+
+```json
+{
+  "timestamp": 4200,
+  "link_id": "S3_TO_C51",
+  "source": "S3",
+  "target": "C51",
+  "motion_score": 0.7,
+  "energy": 20.2,
+  "variance": 0.12,
+  "quality": 0.8,
+  "rssi": -41,
+  "state": "MOTION"
+}
+```
+
+Supported links:
+
+- `S3_TO_C51`
+- `S3_TO_C52`
+- `C51_TO_C52`
+- `C52_TO_C51`
+
+It produces:
+
+- `fusion_status`: nodes, link health count, current `IDLE/MOTION/HOLD`, and confidence.
+- `topology`: C51/C52/S3 node positions plus four CSI edges.
+- `radar_frame`: latest motion intensity, confidence, and activity heat.
+- `state_timeline`: dwell-time/hysteresis-aware state timeline.
+- `series`: `motion_score`, `energy`, `quality`, and `link_health` timelines.
+- `aligned_csi_timeline`: aligned frames by `tick_id`, then timestamp window.
+
+The parser auto-detects S3 `csi_fusion` telemetry, canonical CSI facts, C5 feature frames, and older summary facts. Alignment uses a sliding window capped to 200-500 ms; use `window_ms` to tune it.
 
 ## Curl Checks
 
@@ -218,12 +259,18 @@ Read recent history:
 curl 'http://127.0.0.1:8787/api/csi/history?limit=10'
 ```
 
+Read local UI telemetry:
+
+```sh
+curl 'http://127.0.0.1:8787/api/csi/telemetry?limit=200&window_ms=400'
+```
+
 Parse one log line:
 
 ```sh
 curl -X POST http://127.0.0.1:8787/api/csi/log-line \
   -H 'Content-Type: application/json' \
-  -d '{"line":"I (12345) csi_service: csi summary {\"schema\":1,\"device_id\":\"c5\",\"room_id\":\"lab\",\"state\":\"occupied\",\"motion_score\":0.72,\"variance\":0.44,\"cv\":0.08,\"rssi\":-35,\"noise_floor\":-90,\"packet_count\":64,\"updated_at_ms\":123456}"}'
+  -d '{"line":"I (12000) csi_server_client: CSI_C5_FEATURE {\"schema_version\":\"c5-feature-v1\",\"device_id\":\"C51\",\"link_id\":\"S3_TO_C51\",\"timestamp_ms\":12000,\"metrics\":{\"frame_energy\":18.2,\"variance\":0.15,\"cv\":0.09,\"rssi\":-44,\"quality\":0.93},\"state_hint\":\"MOTION\",\"source\":\"csi_phase_a\"}"}'
 ```
 
 Export JSON:
@@ -281,7 +328,7 @@ Body:
 
 ```json
 {
-  "line": "I (12345) csi_service: csi summary {\"motion_score\":0.72}"
+  "line": "I (12000) csi_server_client: CSI_C5_FEATURE {\"schema_version\":\"c5-feature-v1\",\"device_id\":\"C51\",\"link_id\":\"S3_TO_C51\",\"timestamp_ms\":12000,\"metrics\":{\"frame_energy\":18.2,\"variance\":0.15,\"cv\":0.09,\"rssi\":-44,\"quality\":0.93},\"state_hint\":\"MOTION\",\"source\":\"csi_phase_a\"}"
 }
 ```
 
@@ -308,6 +355,21 @@ limit=200
 
 `limit` defaults to `1000` and is capped at `5000` unless `CSI_MAX_HISTORY` is set.
 
+### GET /api/csi/telemetry
+
+Builds local-only CSI telemetry output from in-memory history.
+
+Optional query:
+
+```text
+device_id=c5
+limit=200
+window_ms=400
+min_dwell_ms=600
+```
+
+The response includes `fusion_status`, `topology`, `radar_frame`, `series`, `motion_heat_series`, `confidence_envelope`, `aligned_csi_timeline`, and `state_timeline`. This endpoint is for local tools/frontends only; it does not persist or send data to ESP-server.
+
 ### DELETE /api/csi/history
 
 Clears memory history.
@@ -329,7 +391,7 @@ Backwards-compatible manual sample insertion endpoint.
 - `node server.js` starts at `http://127.0.0.1:8787`.
 - Missing `serialport` does not prevent startup.
 - `POST /api/csi/mock` updates Latest, Curves, and Raw JSON.
-- Pasting a `csi summary` line and clicking `解析这一行` updates the page.
+- Pasting a `CSI_C5_FEATURE` or `CSI_FUSION_TELEMETRY` line and clicking `解析这一行` updates the page.
 - History sample limit can switch between `200`, `500`, `1000`, `2000`, and `5000`.
 - `DELETE /api/csi/history` clears Latest, Curves, Raw JSON, and device list.
 - JSON and CSV export endpoints return current in-memory history.

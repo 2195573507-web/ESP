@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "envelope_builder.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,6 +24,7 @@ extern "C" {
 #define CSI_PHASE_A_MAX_SELECTED_SUBCARRIERS 40U
 #define CSI_PHASE_A_MIN_SELECTED_SUBCARRIERS 20U
 #define CSI_PHASE_A_MAX_CALIBRATION_ENERGY_SAMPLES 96U
+#define CSI_FEATURE_LINK_ID_MAX_LEN 16U
 
 typedef enum {
     CSI_PROCESSOR_STATE_INIT = 0,
@@ -49,15 +52,20 @@ typedef struct {
 } csi_frame_sample_t;
 
 typedef struct {
-    uint32_t frame_seq;
     float frame_energy;
     float variance;
+    float cv;
+    int rssi;
     float quality;
-    int8_t rssi;
-    csi_sample_quality_t quality_state;
-    uint16_t sample_count;
+} csi_feature_metrics_t;
+
+typedef struct {
+    char link_id[CSI_FEATURE_LINK_ID_MAX_LEN];
     uint64_t timestamp_ms;
-} csi_feature_result_t;
+    csi_feature_metrics_t metrics;
+    envelope_state_hint_t state_hint;
+    csi_sample_quality_t quality_state;
+} csi_feature_frame_t;
 
 #ifdef __cplusplus
 }

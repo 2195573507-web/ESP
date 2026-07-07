@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include "cJSON.h"
+#include "csi_fusion.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -81,6 +82,10 @@ esp_err_t protocol_adapter_validate_local_envelope(const protocol_adapter_envelo
 /** @brief 将 envelope 构造成 S3 -> Server ingest JSON；sensor_aggregator 调用，返回 JSON 需释放。 */
 esp_err_t protocol_adapter_build_server_ingest_json(const protocol_adapter_envelope_t *envelope,
                                                     char **out_json);
+/** @brief 将 S3 fusion telemetry 构造成 canonical CSI event v2；不暴露 C5 device-specific 字段。 */
+esp_err_t protocol_adapter_build_csi_event_v2_json(const csi_fusion_fact_t *fact,
+                                                   const csi_fusion_telemetry_t *telemetry,
+                                                   char **out_json);
 /** @brief 将 C5 短 id 映射为完整 device_id；local HTTP 和 command router 调用。 */
 const char *protocol_adapter_local_device_id_to_device_id(uint8_t local_id);
 /** @brief 将 C5 短 id 映射为默认 alias；register payload 补全时调用。 */

@@ -22,16 +22,20 @@
 #include "gateway_config.h"
 #include "offline_policy.h"
 #include "protocol_adapter.h"
+#include "s3_scheduler.h"
 #include "sensor_aggregator.h"
 #include "server_client.h"
+#include "lwip/sockets.h"
 
 static const char *TAG = "voice_proxy";
 
-#define VOICE_PROXY_BUSY_SKIP_LOG_INTERVAL_MS 30000
+enum {
+    VOICE_PROXY_LOCAL_SOCKET_TIMEOUT_SEC =
+        (ESP111_PROTOCOL_SERVER_VOICE_TIMEOUT_MS + 999) / 1000 + 5,
+};
 
 static SemaphoreHandle_t s_voice_lock;
 static char s_active_device_id[CHILD_REGISTRY_DEVICE_ID_LEN];
-static int64_t s_last_busy_skip_log_ms;
 
 typedef struct {
     httpd_req_t *req;
@@ -64,7 +68,41 @@ static esp_err_t send_json_error(httpd_req_t *req,
     return ret;
 }
 
-static esp_err_t read_pcm_body(httpd_req_t *req, uint8_t **out_pcm, size_t *out_len)
+static const char *safe_device_id(const char *device_id)
+{
+    return device_id != NULL && device_id[0] != '\0' ? device_id : "<unknown>";
+}
+
+static void apply_voice_socket_timeout(httpd_req_t *req, const char *device_id)
+{
+    int sock = httpd_req_to_sockfd(req);
+    if (sock < 0) {
+        ESP_LOGW(TAG, "voice local socket lookup failed device_id=%s", safe_device_id(device_id));
+        return;
+    }
+
+    struct timeval timeout = {
+        .tv_sec = VOICE_PROXY_LOCAL_SOCKET_TIMEOUT_SEC,
+        .tv_usec = 0,
+    };
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+        ESP_LOGW(TAG,
+                 "voice local recv timeout set failed device_id=%s errno=%d",
+                 safe_device_id(device_id),
+                 errno);
+    }
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+        ESP_LOGW(TAG,
+                 "voice local send timeout set failed device_id=%s errno=%d",
+                 safe_device_id(device_id),
+                 errno);
+    }
+}
+
+static esp_err_t read_pcm_body(httpd_req_t *req,
+                               const char *device_id,
+                               uint8_t **out_pcm,
+                               size_t *out_len)
 {
     if (req == NULL || out_pcm == NULL || out_len == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -74,6 +112,11 @@ static esp_err_t read_pcm_body(httpd_req_t *req, uint8_t **out_pcm, size_t *out_
     *out_len = 0;
     if (req->content_len <= 0 ||
         (size_t)req->content_len > gateway_config_get()->voice_upload_max_bytes) {
+        ESP_LOGW(TAG,
+                 "voice request invalid content length device_id=%s content_length=%u max_bytes=%u",
+                 safe_device_id(device_id),
+                 (unsigned int)req->content_len,
+                 (unsigned int)gateway_config_get()->voice_upload_max_bytes);
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -85,8 +128,8 @@ static esp_err_t read_pcm_body(httpd_req_t *req, uint8_t **out_pcm, size_t *out_
         return ESP_ERR_NO_MEM;
     }
 
-    int remaining = req->content_len;
-    int offset = 0;
+    size_t remaining = (size_t)req->content_len;
+    size_t offset = 0;
     while (remaining > 0) {
         int read = httpd_req_recv(req, (char *)buf + offset, remaining);
         if (read <= 0) {
@@ -100,12 +143,27 @@ static esp_err_t read_pcm_body(httpd_req_t *req, uint8_t **out_pcm, size_t *out_
             heap_caps_free(buf);
             return read == HTTPD_SOCK_ERR_TIMEOUT ? ESP_ERR_TIMEOUT : ESP_ERR_INVALID_STATE;
         }
-        offset += read;
-        remaining -= read;
+        offset += (size_t)read;
+        remaining -= (size_t)read;
+    }
+
+    if (offset != (size_t)req->content_len) {
+        ESP_LOGW(TAG,
+                 "voice request body incomplete device_id=%s received_bytes=%u expected_bytes=%u",
+                 safe_device_id(device_id),
+                 (unsigned int)offset,
+                 (unsigned int)req->content_len);
+        heap_caps_free(buf);
+        return ESP_ERR_INVALID_SIZE;
     }
 
     *out_pcm = buf;
-    *out_len = (size_t)req->content_len;
+    *out_len = offset;
+    ESP_LOGI(TAG,
+             "received pcm bytes device_id=%s received_bytes=%u content_length=%u",
+             safe_device_id(device_id),
+             (unsigned int)offset,
+             (unsigned int)req->content_len);
     return ESP_OK;
 }
 
@@ -166,6 +224,7 @@ static void voice_proxy_release_active_device(const char *device_id)
     if (device_id != NULL && device_id[0] != '\0') {
         child_registry_set_voice_busy(device_id, false);
     }
+    s3_scheduler_set_voice_busy(false);
 
     xSemaphoreTake(s_voice_lock, portMAX_DELAY);
     s_active_device_id[0] = '\0';
@@ -183,6 +242,7 @@ esp_err_t voice_proxy_init(void)
         return ESP_ERR_NO_MEM;
     }
     s_active_device_id[0] = '\0';
+    s3_scheduler_set_voice_busy(false);
     ESP_LOGI(TAG, "voice proxy initialized single_session=true max_bytes=%u",
              (unsigned int)gateway_config_get()->voice_upload_max_bytes);
     return ESP_OK;
@@ -198,41 +258,6 @@ bool voice_proxy_is_busy(void)
     busy = s_active_device_id[0] != '\0';
     xSemaphoreGive(s_voice_lock);
     return busy;
-}
-
-void voice_proxy_log_busy_skip(const char *task_name)
-{
-    bool should_log = false;
-    int64_t now_ms = esp_timer_get_time() / 1000;
-
-    if (s_voice_lock == NULL) {
-        return;
-    }
-
-    xSemaphoreTake(s_voice_lock, portMAX_DELAY);
-    if (s_last_busy_skip_log_ms == 0 ||
-        now_ms - s_last_busy_skip_log_ms >= VOICE_PROXY_BUSY_SKIP_LOG_INTERVAL_MS) {
-        s_last_busy_skip_log_ms = now_ms;
-        should_log = true;
-    }
-    xSemaphoreGive(s_voice_lock);
-
-    if (should_log) {
-        ESP_LOGI(TAG,
-                 "voice busy, skip non-voice task%s%s",
-                 task_name != NULL && task_name[0] != '\0' ? ": " : "",
-                 task_name != NULL && task_name[0] != '\0' ? task_name : "");
-    }
-}
-
-bool voice_proxy_should_skip_non_voice_task(const char *task_name)
-{
-    if (!voice_proxy_is_busy()) {
-        return false;
-    }
-
-    voice_proxy_log_busy_skip(task_name);
-    return true;
 }
 
 esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
@@ -275,10 +300,12 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
     strlcpy(s_active_device_id, device_id, sizeof(s_active_device_id));
     xSemaphoreGive(s_voice_lock);
     child_registry_set_voice_busy(device_id, true);
+    s3_scheduler_set_voice_busy(true);
+    apply_voice_socket_timeout(req, device_id);
 
     uint8_t *pcm = NULL;
     size_t pcm_len = 0;
-    esp_err_t ret = read_pcm_body(req, &pcm, &pcm_len);
+    esp_err_t ret = read_pcm_body(req, device_id, &pcm, &pcm_len);
     if (ret != ESP_OK) {
         voice_proxy_release_active_device(device_id);
         if (ret == ESP_ERR_INVALID_STATE || ret == ESP_ERR_TIMEOUT) {
@@ -300,6 +327,12 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
         .req = req,
         .device_id = device_id,
     };
+    ESP_LOGI(TAG,
+             "forward start device_id=%s pcm_bytes=%u upstream=%s timeout_ms=%u",
+             device_id,
+             (unsigned int)pcm_len,
+             ESP111_PROTOCOL_SERVER_ROUTE_VOICE_TURN,
+             (unsigned int)ESP111_PROTOCOL_SERVER_VOICE_TIMEOUT_MS);
     ret = server_client_post_voice_turn(device_id,
                                         pcm,
                                         pcm_len,
@@ -314,19 +347,20 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
         stream_ctx.expected_bytes = (size_t)response_content_length;
     }
 
-    voice_proxy_release_active_device(device_id);
-
     if (stream_ctx.disconnected) {
         offline_policy_record_server_result(ESP_OK, status);
+        voice_proxy_release_active_device(device_id);
         return stream_ctx.send_error != ESP_OK ? stream_ctx.send_error : ESP_FAIL;
     }
 
     offline_policy_record_server_result(ret, status);
     if (ret == ESP_OK) {
+        /* ESP-IDF emits the terminating 0\r\n\r\n chunk for data=NULL,len=0. */
         esp_err_t end_ret = httpd_resp_send_chunk(req, NULL, 0);
         if (end_ret != ESP_OK) {
             stream_ctx.disconnected = true;
             voice_proxy_log_child_send_disconnect(&stream_ctx, end_ret);
+            voice_proxy_release_active_device(device_id);
             return end_ret;
         }
         int64_t duration_ms = esp_timer_get_time() / 1000 - turn_start_ms;
@@ -337,6 +371,7 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
                  (unsigned int)stream_ctx.bytes_sent,
                  (long long)duration_ms);
         ESP_LOGI(TAG, "voice turn proxied device_id=%s bytes=%u", device_id, (unsigned int)pcm_len);
+        voice_proxy_release_active_device(device_id);
         return ESP_OK;
     }
 
@@ -351,6 +386,7 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
         if (end_ret != ESP_OK) {
             voice_proxy_log_child_send_disconnect(&stream_ctx, end_ret);
         }
+        voice_proxy_release_active_device(device_id);
         return ESP_FAIL;
     }
 
@@ -360,5 +396,7 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
                               strcmp(error_code, ESP111_PROTOCOL_ERROR_PAYLOAD_TOO_LARGE) == 0 ?
                                   "413 Payload Too Large" :
                               "503 Service Unavailable";
-    return send_json_error(req, http_status, error_code, esp_err_to_name(ret));
+    esp_err_t error_ret = send_json_error(req, http_status, error_code, esp_err_to_name(ret));
+    voice_proxy_release_active_device(device_id);
+    return error_ret;
 }

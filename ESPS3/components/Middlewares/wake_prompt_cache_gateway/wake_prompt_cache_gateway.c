@@ -24,8 +24,10 @@
 #include "esp_spiffs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "gateway_config.h"
 #include "gateway_wifi.h"
+#include "s3_scheduler.h"
 
 static const char *TAG = "wake_prompt_s3";
 
@@ -44,6 +46,7 @@ static const char *TAG = "wake_prompt_s3";
 #define WAKE_PROMPT_MAX_PCM_BYTES (96U * 1024U)
 #define WAKE_PROMPT_MIN_PCM_BYTES 64U
 #define WAKE_PROMPT_HTTP_TIMEOUT_MS 8000
+#define WAKE_PROMPT_DOWNLOAD_TOTAL_TIMEOUT_MS 20000
 #define WAKE_PROMPT_READ_BYTES 1024U
 #define WAKE_PROMPT_HEADER_BYTES 128U
 #define WAKE_PROMPT_URL_BYTES 320U
@@ -262,7 +265,8 @@ static esp_err_t wake_prompt_read_config(wake_prompt_metadata_t *out_config)
     if (out_config == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!gateway_wifi_is_sta_connected()) {
+    if (!gateway_wifi_is_net_ready() || !gateway_wifi_is_sta_connected() ||
+        !s3_scheduler_is_server_upload_allowed()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -287,6 +291,7 @@ static esp_err_t wake_prompt_read_config(wake_prompt_metadata_t *out_config)
         .buffer_size = 512,
         .event_handler = wake_prompt_body_event,
         .user_data = &body_ctx,
+        .keep_alive_enable = false,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
@@ -454,6 +459,11 @@ static esp_err_t wake_prompt_http_event(esp_http_client_event_t *evt)
 
 static esp_err_t wake_prompt_download_pcm(const wake_prompt_metadata_t *remote)
 {
+    if (!gateway_wifi_is_net_ready() || !gateway_wifi_is_sta_connected() ||
+        !s3_scheduler_is_server_upload_allowed()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     char url[WAKE_PROMPT_URL_BYTES];
     esp_err_t ret = wake_prompt_build_url(WAKE_PROMPT_PCM_ENDPOINT, url, sizeof(url));
     if (ret != ESP_OK) {
@@ -468,6 +478,7 @@ static esp_err_t wake_prompt_download_pcm(const wake_prompt_metadata_t *remote)
         .buffer_size = WAKE_PROMPT_READ_BYTES,
         .event_handler = wake_prompt_http_event,
         .user_data = &http_ctx,
+        .keep_alive_enable = false,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
@@ -511,7 +522,14 @@ static esp_err_t wake_prompt_download_pcm(const wake_prompt_metadata_t *remote)
         if (buf == NULL) {
             ret = ESP_ERR_NO_MEM;
         } else {
+            const int64_t read_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
             while (!esp_http_client_is_complete_data_received(client)) {
+                const int64_t elapsed_ms =
+                    (int64_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) - read_start_ms;
+                if (elapsed_ms > WAKE_PROMPT_DOWNLOAD_TOTAL_TIMEOUT_MS) {
+                    ret = ESP_ERR_TIMEOUT;
+                    break;
+                }
                 int read_len = esp_http_client_read(client, (char *)buf, WAKE_PROMPT_READ_BYTES);
                 if (read_len > 0) {
                     total += (size_t)read_len;

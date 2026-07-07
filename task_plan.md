@@ -22,3 +22,27 @@ Complete P0/P1/P2 firmware-side integration from `docs/esp-backend-api-integrati
 - [x] Phase 4: Add only required C5 lightweight frame/reconnect adjustments and keep C51/C52 aligned.
 - [x] Phase 5: Update necessary docs and run syntax/build checks.
 - [x] Phase 6: Final scope and completion report.
+
+---
+
+# Task Plan: CSI Three-Layer State Machine Refactor
+
+## Goal
+
+Refactor CSI into a C5 edge feature extractor, S3 gateway fusion/state-machine owner, and ESP-server state storage/streaming center.
+
+## Constraints
+
+- C5 never calls ESP-server `/api/...` routes.
+- C5 emits feature-only CSI frames, not raw CSI, I/Q, selected subcarrier lists, or state decisions.
+- S3 is the only CSI state and `motion_score` source.
+- ESP-server accepts/stores/broadcasts canonical facts only and performs no signal processing.
+- Dashboard may be edited only for canonical CSI score/energy/state views.
+
+## Phases
+
+- [x] Phase 1: Design/spec and current implementation handoff reviewed.
+- [x] Phase 2: Fix compile/syntax issues from the in-progress refactor.
+- [x] Phase 3: Run C51/C52 parity and firmware/server boundary scans.
+- [x] Phase 4: Run backend syntax, tests, smoke checks, and dashboard validation where possible.
+- [x] Phase 5: Record final validation evidence and remaining caveats.

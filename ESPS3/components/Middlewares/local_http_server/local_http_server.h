@@ -24,6 +24,8 @@ extern "C" {
  * 失败处理：gateway_orchestrator 使用 ESP_ERROR_CHECK 处理关键启动失败。
  */
 esp_err_t local_http_server_start(void);
+/** @brief 停止 S3 本地 HTTP server；保留给显式生命周期控制使用。 */
+esp_err_t local_http_server_stop(void);
 
 #ifdef __cplusplus
 }

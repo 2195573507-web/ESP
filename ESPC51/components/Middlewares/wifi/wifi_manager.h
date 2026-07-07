@@ -14,11 +14,14 @@
 #include <stddef.h>
 
 /* WiFi 重连参数：C5 只连接 ESPS3 SoftAP，不扫描家庭 WiFi 列表。 */
-#define WIFI_RESCAN_DELAY_MS          3000  // 找不到 gateway SoftAP 后的重试间隔。
+#define WIFI_RECONNECT_BACKOFF_MIN_MS 1000  // 断开后最短重连退避，避免快速循环 connect。
+#define WIFI_RECONNECT_BACKOFF_MAX_MS 3000  // 连续失败后的最大重连退避。
+#define WIFI_RECONNECT_BACKOFF_STEP_MS 1000 // 每次失败增加的退避步长。
 #define WIFI_CONNECT_TIMEOUT_MS       15000 // 首次连接等待超时。
 #define WIFI_RECONNECT_TASK_STACK     3072  // 重连任务栈大小；只做连接状态机。
 #define WIFI_RECONNECT_TASK_PRIORITY  5     // 重连任务优先级。
 #define WIFI_STABLE_REQUIRED_MS       3000  // 认为 WiFi 稳定所需的连续连接时长。
+#define WIFI_DOWN_STABLE_REQUIRED_MS  1000  // 断开持续一小段时间后才通知上层 DOWN。
 
 /**
  * @brief 初始化Wi-Fi管理功能
@@ -72,5 +75,14 @@ bool wifi_is_connected(void);
  * @return 已连接且稳定返回 true，否则返回 false。
  */
 bool wifi_is_stable(void);
+
+/**
+ * @brief 判断 WiFi 是否已持续断开一段时间。
+ *
+ * 调用方法：gateway_link 后台任务使用；不要在 WiFi 事件回调里做上层状态切换。
+ *
+ * @return 已断开且超过 WIFI_DOWN_STABLE_REQUIRED_MS 返回 true，否则返回 false。
+ */
+bool wifi_is_down_stable(void);
 
 #endif // WIFI_MANAGER_H

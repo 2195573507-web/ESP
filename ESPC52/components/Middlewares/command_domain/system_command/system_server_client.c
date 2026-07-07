@@ -16,10 +16,12 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "device_protocol_metadata.h"
+#include "device_stream_client.h"
 #include "esp111_protocol_common.h"
 #include "screen_service.h"
 #include "server_comm_config.h"
@@ -71,6 +73,12 @@ static bool s_capabilities_registered;
 static uint32_t s_capabilities_register_error_count;
 static SemaphoreHandle_t s_scratch_lock;
 static system_server_client_scratch_t *s_scratch;
+
+static int system_server_client_read_rssi_value(void)
+{
+    wifi_ap_record_t ap = {0};
+    return esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? (int)ap.rssi : 0;
+}
 
 static esp_err_t system_server_client_ensure_scratch(void)
 {
@@ -534,13 +542,12 @@ static void system_server_client_read_rssi_json(char *out, size_t out_size)
         return;
     }
 
-    wifi_ap_record_t ap = {0};
-    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-        snprintf(out, out_size, "%d", (int)ap.rssi);
-        return;
+    int rssi = system_server_client_read_rssi_value();
+    if (rssi != 0) {
+        snprintf(out, out_size, "%d", rssi);
+    } else {
+        strlcpy(out, "null", out_size);
     }
-
-    strlcpy(out, "null", out_size);
 }
 
 static esp_err_t system_server_client_build_health_json(system_server_client_scratch_t *scratch,
@@ -793,70 +800,24 @@ esp_err_t system_server_client_send_heartbeat(const char *device_id)
 {
     const char *target_device_id =
         (device_id != NULL && device_id[0] != '\0') ? device_id : server_comm_get_device_id();
-
-    system_server_client_scratch_t *scratch = NULL;
-    esp_err_t ret = system_server_client_take_scratch(&scratch);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    device_protocol_metadata_t metadata = {0};
-    device_protocol_prepare_metadata(&metadata, ESP111_PROTOCOL_MSG_HEARTBEAT);
-    ret = system_server_client_build_health_json(scratch,
-                                                 &metadata,
-                                                 ESP111_PROTOCOL_LOCAL_HEALTH_HEARTBEAT);
-    if (ret != ESP_OK) {
-        system_server_client_give_scratch();
-        return ret;
-    }
     (void)target_device_id;
-
-    server_comm_http_response_t response = {0};
-    ret = server_comm_http_post_json_with_headers(SYSTEM_COMMAND_HEARTBEAT_ENDPOINT,
-                                                  scratch->json_body,
-                                                  metadata.headers,
-                                                  metadata.header_count,
-                                                  SYSTEM_COMMAND_HTTP_TIMEOUT_MS,
-                                                  NULL,
-                                                  0,
-                                                  &response);
-    system_server_client_give_scratch();
-    return ret;
+    return device_stream_client_publish(ESP111_PROTOCOL_DEVICE_STREAM_TYPE_STATUS,
+                                        "S3",
+                                        (double)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                                        (double)esp_timer_get_time() / 1000.0,
+                                        (double)system_server_client_read_rssi_value());
 }
 
 esp_err_t system_server_client_send_status(const char *device_id)
 {
     const char *target_device_id =
         (device_id != NULL && device_id[0] != '\0') ? device_id : server_comm_get_device_id();
-
-    system_server_client_scratch_t *scratch = NULL;
-    esp_err_t ret = system_server_client_take_scratch(&scratch);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    device_protocol_metadata_t metadata = {0};
-    device_protocol_prepare_metadata(&metadata, ESP111_PROTOCOL_MSG_STATUS);
-    ret = system_server_client_build_health_json(scratch,
-                                                 &metadata,
-                                                 ESP111_PROTOCOL_LOCAL_HEALTH_STATUS);
-    if (ret != ESP_OK) {
-        system_server_client_give_scratch();
-        return ret;
-    }
     (void)target_device_id;
-
-    server_comm_http_response_t response = {0};
-    ret = server_comm_http_post_json_with_headers(SYSTEM_COMMAND_STATUS_ENDPOINT,
-                                                  scratch->json_body,
-                                                  metadata.headers,
-                                                  metadata.header_count,
-                                                  SYSTEM_COMMAND_HTTP_TIMEOUT_MS,
-                                                  NULL,
-                                                  0,
-                                                  &response);
-    system_server_client_give_scratch();
-    return ret;
+    return device_stream_client_publish(ESP111_PROTOCOL_DEVICE_STREAM_TYPE_STATUS,
+                                        "S3",
+                                        (double)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                                        (double)esp_timer_get_time() / 1000.0,
+                                        (double)system_server_client_read_rssi_value());
 }
 
 esp_err_t system_server_client_poll_commands(const char *device_id)

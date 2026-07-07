@@ -1,7 +1,6 @@
 const {
     readDeviceMetadata,
     toFiniteNumber,
-    toIntegerOrNull,
     trimText
 } = require("./deviceMetadata");
 const {
@@ -21,149 +20,131 @@ const {
 } = require("../db/csiMotion");
 
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
+const CSI_EVENT_SCHEMA_VERSION = "v2";
 const CSI_STATES = new Set(["IDLE", "MOTION", "HOLD"]);
+const TOP_LEVEL_KEYS = new Set([
+    "schema_version",
+    "trace_id",
+    "tick_id",
+    "fused_state",
+    "confidence",
+    "links",
+    "timestamp_ms"
+]);
 
-function clampMotionScore(value) {
+function isPlainObject(value) {
+    return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOnlyKeys(object, allowedKeys) {
+    return Object.keys(object).every(key => allowedKeys.has(key)) &&
+        allowedKeys.size === Object.keys(object).length;
+}
+
+function finiteNumber(value, min = -Infinity, max = Infinity) {
     const numeric = toFiniteNumber(value);
-    if (numeric === null) {
+    if (numeric === null || numeric < min || numeric > max) {
         return null;
     }
-    return Math.min(Math.max(numeric, 0), 1);
+    return numeric;
 }
 
-function finiteOrNull(value) {
-    return toFiniteNumber(value);
+function strictInteger(value, min = -Infinity, max = Infinity) {
+    const numeric = finiteNumber(value, min, max);
+    if (numeric === null || !Number.isInteger(numeric)) {
+        return null;
+    }
+    return numeric;
 }
 
-function readTimestamp(payload, body, serverRecvMs) {
-    return toIntegerOrNull(payload.timestamp) ||
-        toIntegerOrNull(payload.updated_at_ms) ||
-        toIntegerOrNull(body.timestamp_ms) ||
-        serverRecvMs;
+function invalid(code, error) {
+    return {
+        ok: false,
+        code,
+        error
+    };
 }
 
-function validateCsiMotionEnvelope(body, serverRecvMs) {
-    if (!body || typeof body !== "object" || Array.isArray(body)) {
-        return {
-            ok: false,
-            code: "INVALID_ENVELOPE",
-            error: "JSON object envelope is required"
-        };
+function validateCanonicalLink(link, expectedIndex) {
+    const expected = `link_${expectedIndex}`;
+    if (link !== expected) {
+        return invalid("INVALID_CSI_LINK", "links must use canonical link_N identifiers");
     }
-    if (Number(body.schema_version) !== 1) {
-        return {
-            ok: false,
-            code: "INVALID_SCHEMA_VERSION",
-            error: "schema_version must be 1"
-        };
+    return {
+        ok: true,
+        link: expected
+    };
+}
+
+function validateCanonicalCsiEventV2(body) {
+    if (!isPlainObject(body) || !hasOnlyKeys(body, TOP_LEVEL_KEYS)) {
+        return invalid("INVALID_CANONICAL_CSI_EVENT", "canonical CSI event v2 object is required");
     }
-    if (trimText(body.payload_type, 80) !== CSI_MOTION_PAYLOAD_TYPE) {
-        return {
-            ok: false,
-            code: "UNSUPPORTED_PAYLOAD_TYPE",
-            error: "payload_type must be csi.motion"
-        };
+    if (body.schema_version !== CSI_EVENT_SCHEMA_VERSION) {
+        return invalid("INVALID_SCHEMA_VERSION", "schema_version must be v2");
     }
-    if (!trimText(body.device_id, 128)) {
-        return {
-            ok: false,
-            code: "DEVICE_ID_REQUIRED",
-            error: "device_id is required"
-        };
-    }
-    if (!body.payload || typeof body.payload !== "object" || Array.isArray(body.payload)) {
-        return {
-            ok: false,
-            code: "INVALID_PAYLOAD",
-            error: "payload object is required"
-        };
+    const traceId = trimText(body.trace_id, 128);
+    if (!traceId || traceId !== body.trace_id) {
+        return invalid("INVALID_TRACE_ID", "trace_id must be a non-empty canonical string");
     }
 
-    const payload = body.payload;
-    if ("raw_csi" in payload ||
-        "subcarrier_data" in payload ||
-        "selected_subcarriers" in payload ||
-        "iq" in payload ||
-        "phase" in payload) {
-        return {
-            ok: false,
-            code: "RAW_CSI_NOT_ACCEPTED",
-            error: "raw CSI and subcarrier data are not accepted"
-        };
-    }
-    if ("occupancy" in payload ||
-        "mean_amplitude" in payload ||
-        "cv" in payload ||
-        "sample_count" in payload) {
-        return {
-            ok: false,
-            code: "LEGACY_CSI_MODEL_NOT_ACCEPTED",
-            error: "legacy occupancy and C5-derived CSI result fields are not accepted"
-        };
+    const tickId = strictInteger(body.tick_id, 0);
+    const timestampMs = strictInteger(body.timestamp_ms, 1);
+    const confidence = finiteNumber(body.confidence, 0, 1);
+    if (tickId === null || timestampMs === null || confidence === null) {
+        return invalid("INVALID_CANONICAL_TIMING", "tick_id, timestamp_ms, and confidence are invalid");
     }
 
-    const state = trimText(payload.state, 16).toUpperCase();
+    const state = trimText(body.fused_state, 16).toUpperCase();
     if (!CSI_STATES.has(state)) {
-        return {
-            ok: false,
-            code: "INVALID_CSI_STATE",
-            error: "state must be IDLE, MOTION, or HOLD"
-        };
+        return invalid("INVALID_FUSED_STATE", "fused_state must be IDLE, MOTION, or HOLD");
     }
 
-    const linkId = trimText(payload.link_id, 64);
-    if (!linkId) {
-        return {
-            ok: false,
-            code: "LINK_ID_REQUIRED",
-            error: "link_id is required"
-        };
+    if (!Array.isArray(body.links) || body.links.length === 0 || body.links.length > 8) {
+        return invalid("INVALID_CSI_LINKS", "links must be a non-empty canonical array");
     }
-
-    const frameEnergy = finiteOrNull(payload.frame_energy);
-    const variance = finiteOrNull(payload.variance);
-    const motionScore = clampMotionScore(payload.motion_score);
-    if (frameEnergy === null || frameEnergy < 0 ||
-        variance === null || variance < 0 ||
-        motionScore === null) {
-        return {
-            ok: false,
-            code: "INVALID_CSI_NUMERIC_FIELDS",
-            error: "frame_energy, variance, and motion_score must be finite non-negative numbers"
-        };
+    const links = [];
+    for (let i = 0; i < body.links.length; i++) {
+        const validation = validateCanonicalLink(body.links[i], i);
+        if (!validation.ok) {
+            return validation;
+        }
+        links.push(validation.link);
     }
 
     return {
         ok: true,
         csi: {
-            device_id: trimText(payload.device_id || body.device_id, 128),
-            link_id: linkId,
+            trace_id: traceId,
+            tick_id: tickId,
+            link_id: "fused",
             state,
-            frame_energy: frameEnergy,
-            variance,
-            rssi: toIntegerOrNull(payload.rssi),
-            motion_score: motionScore,
-            timestamp: readTimestamp(payload, body, serverRecvMs)
+            frame_energy: null,
+            variance: null,
+            rssi: null,
+            motion_score: confidence,
+            confidence,
+            timestamp: timestampMs,
+            links
         }
     };
 }
 
-async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
+async function ingestCanonicalCsiEventV2(dbRun, dbAll, body, options = {}) {
     const serverRecvMs = Number.isFinite(options.serverRecvMs) ? options.serverRecvMs : Date.now();
+    const gatewayId = trimText(options.trustedGatewayId, 128);
     const metadata = readDeviceMetadata({
-        body,
+        body: {},
         headers: options.headers,
         query: options.query,
-        deviceId: options.trustedDeviceId,
+        deviceId: gatewayId,
         payloadType: CSI_MOTION_PAYLOAD_TYPE,
         serverRecvMs
     });
-    metadata.gateway_id = trimText(options.trustedGatewayId, 128);
-    if (options.trustedDeviceId) {
-        metadata.device_id = trimText(options.trustedDeviceId, 128);
-    }
+    metadata.gateway_id = gatewayId;
+    metadata.device_id = gatewayId;
 
-    const validation = validateCsiMotionEnvelope(body, serverRecvMs);
+    const validation = validateCanonicalCsiEventV2(body);
     if (!validation.ok) {
         return {
             ok: false,
@@ -175,9 +156,15 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
     }
 
     const fact = {
-        ...validation.csi,
-        device_id: metadata.device_id || validation.csi.device_id,
+        device_id: metadata.device_id,
         gateway_id: metadata.gateway_id,
+        link_id: validation.csi.link_id,
+        state: validation.csi.state,
+        frame_energy: validation.csi.frame_energy,
+        variance: validation.csi.variance,
+        rssi: validation.csi.rssi,
+        motion_score: validation.csi.motion_score,
+        timestamp: validation.csi.timestamp,
         server_recv_ms: metadata.server_recv_ms,
         server_time_iso: metadata.server_time_iso,
         raw_json: body
@@ -191,12 +178,16 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
 
     await recordEvent(dbRun, {
         event_type: "csi",
-        event_name: "csi_motion_state_received",
+        event_name: "canonical_csi_event_v2_received",
         device_id: fact.device_id,
         severity: fact.state === "MOTION" ? "warning" : "info",
-        message: `csi state ${fact.state}`,
-        payload: fact,
-        source: "device_ingest",
+        message: `canonical csi state ${fact.state}`,
+        payload: {
+            ...validation.csi,
+            device_id: fact.device_id,
+            gateway_id: fact.gateway_id
+        },
+        source: "kernel_csi_event",
         server_recv_ms: metadata.server_recv_ms
     });
 
@@ -208,6 +199,8 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
         metadata,
         data: {
             id,
+            trace_id: validation.csi.trace_id,
+            tick_id: validation.csi.tick_id,
             device_id: fact.device_id,
             payload_type: CSI_MOTION_PAYLOAD_TYPE,
             link_id: fact.link_id,
@@ -216,6 +209,7 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
             variance: fact.variance,
             rssi: fact.rssi,
             motion_score: fact.motion_score,
+            confidence: validation.csi.confidence,
             timestamp: fact.timestamp,
             server_recv_ms: metadata.server_recv_ms,
             server_time_iso: metadata.server_time_iso,
@@ -225,8 +219,9 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
 }
 
 module.exports = {
+    CSI_EVENT_SCHEMA_VERSION,
     CSI_MOTION_PAYLOAD_TYPE,
     CSI_STATES,
-    ingestCsiMotion,
-    validateCsiMotionEnvelope
+    ingestCanonicalCsiEventV2,
+    validateCanonicalCsiEventV2
 };

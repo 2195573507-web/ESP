@@ -1,6 +1,7 @@
 set(gateway_srcs
             gateway_config/gateway_config.c
             gateway_wifi/gateway_wifi.c
+            network_worker/network_worker.c
             child_registry/child_registry.c
             protocol_adapter/protocol_adapter.c
             server_client/server_client.c
@@ -11,6 +12,8 @@ set(gateway_srcs
             wake_prompt_cache_gateway/wake_prompt_cache_gateway.c
             command_router/command_router.c
             offline_policy/offline_policy.c
+            runtime/s3_scheduler.c
+            device_stream_gateway/device_stream_gateway.c
             csi_fusion/csi_fusion.c
             csi_placeholder_gateway/csi_placeholder_gateway.c
             local_http_server/local_http_server.c
@@ -22,6 +25,7 @@ set(include_dirs
 set(priv_include_dirs
             gateway_config
             gateway_wifi
+            network_worker
             child_registry
             protocol_adapter
             server_client
@@ -32,6 +36,8 @@ set(priv_include_dirs
             wake_prompt_cache_gateway
             command_router
             offline_policy
+            runtime
+            device_stream_gateway
             csi_fusion
             csi_placeholder_gateway
             local_http_server)

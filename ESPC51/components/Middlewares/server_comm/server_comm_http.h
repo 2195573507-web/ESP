@@ -65,7 +65,7 @@ void server_comm_http_set_non_voice_paused(bool paused);
  * @brief 向 S3 local gateway 发起 GET JSON 请求。
  *
  * 调用位置：system command/wake prompt 等需要 GET 的模块。
- * @param endpoint /local/v1 路径或完整 URL。
+ * @param endpoint /local/v1 路径；完整 URL 和 Server API 路径会被拒绝。
  * @param timeout_ms 本次请求超时，0 表示使用默认值。
  * @param response_body 可选响应缓存。
  * @param response_body_size 响应缓存长度。

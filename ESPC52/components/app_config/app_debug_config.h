@@ -133,7 +133,6 @@ static inline void app_debug_apply_log_levels(void)
     esp_log_level_set("pp", ESP_LOG_WARN);
     esp_log_level_set("net80211", ESP_LOG_WARN);
     esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
-    esp_log_level_set("esp-tls", ESP_LOG_WARN);
     esp_log_level_set("transport_base", ESP_LOG_WARN);
     esp_log_level_set("esp_http_client", ESP_LOG_WARN);
 }

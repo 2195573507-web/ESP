@@ -91,6 +91,15 @@ esp_err_t server_comm_build_url(const char *endpoint, char *url, size_t url_size
         return ESP_ERR_NOT_ALLOWED;
     }
 
+    size_t local_base_len = strlen(ESP111_PROTOCOL_LOCAL_BASE);
+    if (strncmp(endpoint, ESP111_PROTOCOL_LOCAL_BASE, local_base_len) != 0 ||
+        (endpoint[local_base_len] != '\0' &&
+         endpoint[local_base_len] != '/' &&
+         endpoint[local_base_len] != '?' &&
+         endpoint[local_base_len] != '#')) {
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
     const char *base = server_comm_get_base_url();
     size_t base_len = strlen(base);
     while (base_len > 0 && base[base_len - 1] == '/') {

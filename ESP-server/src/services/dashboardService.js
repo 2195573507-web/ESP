@@ -454,6 +454,13 @@ function normalizeGatewaySnapshot(body, serverRecvMs = Date.now()) {
             error: "dashboard snapshot devices must not include legacy occupancy CSI fields"
         };
     }
+    if (isPlainObject(body.csi) && body.csi.available !== false) {
+        return {
+            ok: false,
+            code: "CANONICAL_CSI_EVENT_REQUIRED",
+            error: "dashboard snapshot must not carry CSI state; use /kernel/csi_event"
+        };
+    }
 
     const devices = (Array.isArray(body.devices) ? body.devices : [])
         .map(device => normalizeSnapshotDevice(device, serverRecvMs))

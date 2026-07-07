@@ -29,10 +29,13 @@ set(voice_srcs
             voice_domain/voice_chain.c)
 
 set(runtime_srcs
-            runtime/app_runtime.c)
+            runtime/app_runtime.c
+            runtime/c5_backpressure_controller.c)
 
 set(device_protocol_srcs
-            device_protocol/device_protocol_metadata.c)
+            device_protocol/envelope_builder.c
+            device_protocol/device_protocol_metadata.c
+            device_protocol/device_stream_client.c)
 
 set(sensor_srcs
             sensor_domain/bme690/driver/bme690.c
@@ -96,6 +99,7 @@ set(requires
             freertos
             heap
             esp_http_client
+            lwip
             IIS
             IIC
             log

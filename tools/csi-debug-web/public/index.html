@@ -3,27 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CSI 调试工作台</title>
+  <title>CSI Fusion Radar</title>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #0f1115;
-      --panel: #171b21;
-      --panel-2: #202630;
-      --panel-3: #11151b;
-      --line: #364150;
-      --line-soft: rgba(255, 255, 255, 0.1);
-      --text: #edf1f4;
-      --muted: #98a6b3;
-      --muted-2: #73808c;
-      --accent: #43d6ad;
-      --accent-2: #f1c75b;
-      --accent-3: #7cb7ff;
-      --danger: #ff6f73;
-      --ok: #78df8e;
-      --warn: #ffca6e;
-      --shadow: rgba(0, 0, 0, 0.28);
-      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      --bg: #11100d;
+      --surface: #1a1812;
+      --surface-2: #242116;
+      --surface-3: #0d0d0b;
+      --line: #403a29;
+      --line-soft: rgba(244, 241, 232, 0.12);
+      --text: #f4f1e8;
+      --muted: #aaa390;
+      --muted-2: #77715f;
+      --green: #4ade80;
+      --amber: #f2b84b;
+      --cyan: #6dd6e8;
+      --red: #ff6b5a;
+      --violet: #b6a0ff;
+      --shadow: rgba(0, 0, 0, 0.34);
+      font-family: "Avenir Next", "DIN Alternate", "SF Pro Text", sans-serif;
     }
 
     * {
@@ -34,11 +33,9 @@
       margin: 0;
       min-width: 320px;
       background:
-        linear-gradient(90deg, rgba(255,255,255,0.034) 1px, transparent 1px) 0 0 / 30px 30px,
-        linear-gradient(0deg, rgba(255,255,255,0.024) 1px, transparent 1px) 0 0 / 30px 30px,
-        radial-gradient(circle at 8% 0%, rgba(67, 214, 173, 0.12), transparent 30%),
-        radial-gradient(circle at 88% 12%, rgba(241, 199, 91, 0.1), transparent 28%),
-        var(--bg);
+        linear-gradient(90deg, rgba(244, 241, 232, 0.035) 1px, transparent 1px) 0 0 / 32px 32px,
+        linear-gradient(0deg, rgba(244, 241, 232, 0.025) 1px, transparent 1px) 0 0 / 32px 32px,
+        linear-gradient(180deg, #15130f, var(--bg));
       color: var(--text);
     }
 
@@ -51,7 +48,7 @@
       border: 1px solid var(--line);
       border-radius: 6px;
       padding: 8px 12px;
-      background: var(--panel-2);
+      background: var(--surface-2);
       color: var(--text);
       cursor: pointer;
       text-decoration: none;
@@ -59,22 +56,23 @@
       align-items: center;
       justify-content: center;
       gap: 8px;
+      white-space: nowrap;
     }
 
     button:hover, .download-link:hover {
-      border-color: var(--accent);
+      border-color: var(--cyan);
     }
 
     button.primary {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #07110f;
-      font-weight: 700;
+      background: var(--green);
+      border-color: var(--green);
+      color: #06100a;
+      font-weight: 800;
     }
 
     button.danger {
-      border-color: rgba(255, 111, 115, 0.55);
-      color: #ffd6d7;
+      border-color: rgba(255, 107, 90, 0.62);
+      color: #ffd8d2;
     }
 
     button:disabled {
@@ -88,14 +86,16 @@
       border: 1px solid var(--line);
       border-radius: 6px;
       padding: 9px 10px;
-      background: #0b0e12;
+      background: #0b0a08;
       color: var(--text);
     }
 
     textarea {
-      min-height: 108px;
+      min-height: 112px;
       resize: vertical;
       line-height: 1.45;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
     }
 
     label {
@@ -106,136 +106,124 @@
     }
 
     main {
-      width: min(1560px, calc(100vw - 28px));
+      width: min(1640px, calc(100vw - 28px));
       margin: 0 auto;
-      padding: 22px 0 34px;
+      padding: 20px 0 34px;
     }
 
-    .topbar {
+    .topline {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: end;
+      grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.2fr);
       gap: 16px;
-      padding-bottom: 18px;
+      align-items: stretch;
+      padding-bottom: 16px;
       border-bottom: 1px solid var(--line);
     }
 
-    h1 {
+    h1, h2, h3 {
       margin: 0;
-      font-size: clamp(24px, 3vw, 38px);
       letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 30px;
       line-height: 1.05;
     }
 
-    .subtle {
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.45;
-    }
-
-    .status-stack {
-      display: grid;
-      gap: 8px;
-      justify-items: end;
-    }
-
-    .status-pill {
-      display: inline-flex;
+    h2 {
+      font-size: 14px;
+      display: flex;
       align-items: center;
-      gap: 8px;
-      min-width: 126px;
-      justify-content: center;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 8px 12px;
-      background: rgba(23, 27, 33, 0.96);
-      box-shadow: 0 10px 30px var(--shadow);
-      text-transform: uppercase;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .muted {
+      color: var(--muted);
       font-size: 12px;
-      font-weight: 700;
+      line-height: 1.4;
     }
 
-    .dot {
-      width: 9px;
-      height: 9px;
-      border-radius: 50%;
-      background: var(--danger);
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
     }
 
-    .status-pill.running .dot {
-      background: var(--ok);
-      box-shadow: 0 0 18px rgba(120, 223, 142, 0.65);
-    }
-
-    .status-pill.warn .dot {
-      background: var(--warn);
-      box-shadow: 0 0 16px rgba(255, 202, 110, 0.45);
-    }
-
-    .notice {
-      display: none;
-      margin-top: 14px;
-      border: 1px solid rgba(255, 202, 110, 0.45);
+    .stat {
+      min-height: 72px;
+      border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 10px 12px;
-      color: #ffe6b5;
-      background: rgba(83, 59, 20, 0.35);
-      line-height: 1.45;
+      background: rgba(26, 24, 18, 0.94);
+      padding: 10px;
+      box-shadow: 0 14px 36px var(--shadow);
+    }
+
+    .stat-label {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .stat-value {
+      margin-top: 7px;
+      font-size: 20px;
+      font-weight: 800;
+      line-height: 1.15;
       overflow-wrap: anywhere;
     }
 
-    .notice.visible {
-      display: block;
+    .node-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
     }
 
-    .layout {
+    .node-chip {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 5px 8px;
+      color: var(--text);
+      background: #0d0d0b;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .workspace {
       display: grid;
       grid-template-columns: 340px minmax(0, 1fr);
       gap: 18px;
       margin-top: 18px;
     }
 
-    .column {
+    .rail, .stage {
       display: grid;
       gap: 18px;
       align-content: start;
     }
 
-    .panel {
+    .section {
+      border-top: 1px solid var(--line);
+      padding-top: 4px;
+    }
+
+    .tool-box {
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: rgba(23, 27, 33, 0.95);
+      background: rgba(26, 24, 18, 0.96);
       box-shadow: 0 18px 42px var(--shadow);
       overflow: hidden;
     }
 
-    .panel h2 {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin: 0;
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--line);
-      background: #121720;
-      font-size: 14px;
-      letter-spacing: 0;
-    }
-
-    .panel-body {
+    .tool-body {
       padding: 14px;
     }
 
     .form-grid {
       display: grid;
       gap: 10px;
-    }
-
-    .inline-grid {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 10px;
-      align-items: end;
     }
 
     .action-row {
@@ -248,39 +236,81 @@
       grid-template-columns: repeat(3, minmax(0, 1fr));
     }
 
-    .serial-hint {
-      margin-top: 12px;
-      border: 1px dashed var(--line);
+    .notice {
+      display: none;
+      margin-top: 14px;
+      border: 1px solid rgba(242, 184, 75, 0.45);
       border-radius: 8px;
-      padding: 10px;
-      color: var(--muted);
-      background: var(--panel-3);
+      padding: 10px 12px;
+      color: #ffe4a4;
+      background: rgba(92, 61, 13, 0.34);
       line-height: 1.45;
       overflow-wrap: anywhere;
     }
 
-    .port-list, .device-list {
+    .notice.visible {
+      display: block;
+    }
+
+    .run-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 11px;
+      background: #0d0d0b;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--red);
+    }
+
+    .run-pill.running .dot {
+      background: var(--green);
+      box-shadow: 0 0 18px rgba(74, 222, 128, 0.62);
+    }
+
+    .run-pill.warn .dot {
+      background: var(--amber);
+      box-shadow: 0 0 16px rgba(242, 184, 75, 0.48);
+    }
+
+    .serial-hint {
+      margin-top: 12px;
+      border-top: 1px dashed var(--line-soft);
+      padding-top: 10px;
+      color: var(--muted);
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+
+    .port-list {
       display: grid;
       gap: 8px;
       margin-top: 12px;
     }
 
-    .port-button, .device-button {
-      width: 100%;
-      text-align: left;
-      justify-content: space-between;
-      background: var(--panel-3);
-    }
-
     .port-button {
+      width: 100%;
       display: grid;
       justify-items: stretch;
       gap: 4px;
+      text-align: left;
+      background: var(--surface-3);
     }
 
-    .port-button.active, .device-button.active {
-      border-color: var(--accent);
-      color: var(--accent);
+    .port-button.active {
+      border-color: var(--cyan);
+      color: var(--cyan);
     }
 
     .port-meta {
@@ -296,7 +326,7 @@
 
     .kv-row {
       display: grid;
-      grid-template-columns: minmax(116px, 0.48fr) minmax(0, 1fr);
+      grid-template-columns: minmax(108px, 0.48fr) minmax(0, 1fr);
       gap: 10px;
       align-items: start;
       border-bottom: 1px dashed var(--line-soft);
@@ -316,66 +346,24 @@
     .kv-value {
       overflow-wrap: anywhere;
       line-height: 1.4;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
     }
 
-    .latest-grid {
+    .fusion-grid {
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-      gap: 10px;
+      grid-template-columns: minmax(0, 1.18fr) minmax(320px, 0.82fr);
+      gap: 18px;
     }
 
-    .metric {
-      min-height: 76px;
+    .canvas-shell {
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 10px;
-      background: var(--panel-3);
-    }
-
-    .metric.strong {
-      border-color: rgba(67, 214, 173, 0.48);
-      background: linear-gradient(180deg, rgba(67, 214, 173, 0.12), rgba(17, 21, 27, 0.95));
-    }
-
-    .metric-label {
-      color: var(--muted);
-      font-size: 11px;
-      overflow-wrap: anywhere;
-    }
-
-    .metric-value {
-      margin-top: 8px;
-      font-size: 18px;
-      line-height: 1.2;
-      overflow-wrap: anywhere;
-    }
-
-    .charts-header {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .charts-header select {
-      width: 112px;
-      padding: 6px 8px;
-    }
-
-    .charts {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 14px;
-    }
-
-    .chart-wrap {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #0b0e12;
       overflow: hidden;
-      min-width: 0;
+      background: #0b0a08;
     }
 
-    .chart-title {
+    .canvas-title {
       display: flex;
       justify-content: space-between;
       gap: 12px;
@@ -388,7 +376,60 @@
     canvas {
       display: block;
       width: 100%;
-      height: 230px;
+      height: 260px;
+    }
+
+    #topologyCanvas {
+      height: 430px;
+    }
+
+    #radarCanvas {
+      height: 430px;
+    }
+
+    #timelineCanvas {
+      height: 138px;
+    }
+
+    .link-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .link-tile {
+      border-top: 3px solid var(--line);
+      background: rgba(26, 24, 18, 0.82);
+      padding: 10px 0 0;
+      min-width: 0;
+    }
+
+    .link-name {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+
+    .link-metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
     }
 
     pre {
@@ -398,12 +439,14 @@
       overflow: auto;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
-      color: #dce3e7;
-      background: #0b0e12;
+      color: #eee8d6;
+      background: #0b0a08;
       padding: 14px;
       border-radius: 8px;
       border: 1px solid var(--line);
       line-height: 1.45;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
     }
 
     .empty-state {
@@ -413,7 +456,7 @@
       padding: 18px;
       color: var(--muted);
       text-align: center;
-      background: var(--panel-3);
+      background: rgba(13, 13, 11, 0.74);
     }
 
     body.no-data .empty-state {
@@ -421,7 +464,7 @@
     }
 
     body.no-data .data-zone {
-      opacity: 0.48;
+      opacity: 0.58;
     }
 
     .toast {
@@ -434,7 +477,7 @@
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 12px 14px;
-      background: #121720;
+      background: #17140f;
       color: var(--text);
       box-shadow: 0 18px 44px var(--shadow);
       line-height: 1.45;
@@ -446,65 +489,83 @@
     }
 
     .toast.error {
-      border-color: rgba(255, 111, 115, 0.65);
-      color: #ffd7d8;
+      border-color: rgba(255, 107, 90, 0.65);
+      color: #ffd8d2;
     }
 
     .toast.ok {
-      border-color: rgba(120, 223, 142, 0.55);
+      border-color: rgba(74, 222, 128, 0.55);
       color: #dcffe3;
     }
 
-    @media (max-width: 1120px) {
-      .layout, .charts {
+    @media (max-width: 1240px) {
+      .workspace, .topline, .fusion-grid {
         grid-template-columns: 1fr;
       }
 
-      .latest-grid {
+      .status-grid, .link-strip, .chart-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
 
-    @media (max-width: 620px) {
+    @media (max-width: 680px) {
       main {
-        width: min(100vw - 20px, 1560px);
-        padding-top: 16px;
+        width: min(100vw - 20px, 1640px);
+        padding-top: 14px;
       }
 
-      .topbar {
+      h1 {
+        font-size: 24px;
+      }
+
+      .status-grid, .link-strip, .chart-grid, .action-row, .action-row.three {
         grid-template-columns: 1fr;
       }
 
-      .status-stack {
-        justify-items: start;
-      }
-
-      .latest-grid, .action-row, .action-row.three, .inline-grid {
-        grid-template-columns: 1fr;
+      #topologyCanvas, #radarCanvas {
+        height: 340px;
       }
     }
   </style>
 </head>
 <body class="no-data">
   <main>
-    <header class="topbar">
+    <header class="topline">
       <div>
-        <h1>CSI 调试工作台</h1>
-        <div class="subtle">本地串口 CSI 调试台；不连接 ESP-server，不写数据库，历史只保存在当前 Node 进程内存里。</div>
+        <h1>CSI Fusion Status</h1>
+        <div class="node-row" id="nodeRow">
+          <span class="node-chip">C51</span>
+          <span class="node-chip">C52</span>
+          <span class="node-chip">S3</span>
+        </div>
       </div>
-      <div class="status-stack">
-        <div id="runState" class="status-pill"><span class="dot"></span><span>未连接串口</span></div>
-        <div id="sampleBadge" class="subtle">0 个样本</div>
+      <div class="status-grid">
+        <div class="stat">
+          <div class="stat-label">节点</div>
+          <div class="stat-value" id="nodeStatus">C51 C52 S3</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">链路</div>
+          <div class="stat-value" id="linkHealth">0/4 healthy</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">当前状态</div>
+          <div class="stat-value" id="fusionState">IDLE</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">置信度</div>
+          <div class="stat-value" id="confidenceValue">0%</div>
+        </div>
       </div>
     </header>
 
     <div id="globalNotice" class="notice"></div>
 
-    <div class="layout">
-      <aside class="column">
-        <section class="panel">
-          <h2>串口连接区 <button type="button" id="refreshPorts">刷新端口</button></h2>
-          <div class="panel-body">
+    <div class="workspace">
+      <aside class="rail">
+        <section class="tool-box">
+          <h2 class="tool-body">串口 <button type="button" id="refreshPorts">刷新端口</button></h2>
+          <div class="tool-body">
             <form id="serialForm" class="form-grid">
               <label>串口路径
                 <input id="serialPort" name="port" list="serialPortList" placeholder="/dev/cu.usbmodemxxx" autocomplete="off">
@@ -523,53 +584,20 @@
                 <button type="button" id="stopSerial">断开</button>
               </div>
             </form>
-            <div id="serialHint" class="serial-hint">正在读取串口状态...</div>
+            <div id="serialHint" class="serial-hint">读取串口状态...</div>
             <div id="serialPorts" class="port-list"></div>
           </div>
         </section>
 
-        <section class="panel">
-          <h2>连接状态</h2>
-          <div class="panel-body kv" id="serialStatus"></div>
+        <section class="tool-box">
+          <h2 class="tool-body"><span>运行状态</span><span id="runState" class="run-pill"><span class="dot"></span><span>未连接串口</span></span></h2>
+          <div class="tool-body kv" id="serialStatus"></div>
         </section>
 
-        <section class="panel">
-          <h2>设备</h2>
-          <div class="panel-body">
-            <label>当前设备 device_id
-              <select id="deviceSelect"></select>
-            </label>
-            <div class="device-list" id="deviceList"></div>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>数据操作区</h2>
-          <div class="panel-body form-grid">
-            <div class="action-row">
-              <a class="download-link" href="/api/csi/export.json" download>导出 JSON</a>
-              <a class="download-link" href="/api/csi/export.csv" download>导出 CSV</a>
-            </div>
-            <button type="button" id="clearHistory" class="danger">清空历史</button>
-          </div>
-        </section>
-      </aside>
-
-      <section class="column">
-        <div class="empty-state">还没有 CSI 样本。可以点击“生成模拟样本”，或在手动调试区粘贴一行 csi summary 日志。</div>
-
-        <section class="panel data-zone">
-          <h2>最新状态区 <span id="latestStamp" class="subtle"></span></h2>
-          <div class="panel-body">
-            <div class="latest-grid" id="latestGrid"></div>
-          </div>
-        </section>
-
-        <section class="panel data-zone">
-          <h2>
-            <span>曲线区 <span id="historyCount" class="subtle"></span></span>
-            <span class="charts-header">
-              <span class="subtle">样本数</span>
+        <section class="tool-box">
+          <h2 class="tool-body">数据</h2>
+          <div class="tool-body form-grid">
+            <label>历史窗口
               <select id="historyLimit">
                 <option value="200">200</option>
                 <option value="500">500</option>
@@ -577,42 +605,85 @@
                 <option value="2000">2000</option>
                 <option value="5000">5000</option>
               </select>
-            </span>
-          </h2>
-          <div class="panel-body charts">
-            <div class="chart-wrap">
-              <div class="chart-title"><span>运动评分 motion_score</span><span id="motionRange"></span></div>
-              <canvas id="motionCanvas" width="520" height="260"></canvas>
-            </div>
-            <div class="chart-wrap">
-              <div class="chart-title"><span>信号强度 rssi</span><span id="rssiRange"></span></div>
-              <canvas id="rssiCanvas" width="520" height="260"></canvas>
-            </div>
-            <div class="chart-wrap">
-              <div class="chart-title"><span>幅度 / 方差</span><span id="amplitudeRange"></span></div>
-              <canvas id="amplitudeCanvas" width="520" height="260"></canvas>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>手动调试区</h2>
-          <div class="panel-body form-grid">
-            <label>粘贴单行日志
-              <textarea id="manualLine" spellcheck="false">I (12345) csi_service: csi summary {"schema":1,"device_id":"c5","room_id":"lab","state":"occupied","motion_score":0.72,"variance":0.44,"cv":0.08,"rssi":-35,"noise_floor":-90,"packet_count":64,"updated_at_ms":123456}</textarea>
             </label>
             <div class="action-row">
-              <button type="button" id="parseLine" class="primary">解析这一行</button>
-              <button type="button" id="mockSample">生成模拟样本</button>
+              <a class="download-link" href="/api/csi/export.json" download>导出 JSON</a>
+              <a class="download-link" href="/api/csi/export.csv" download>导出 CSV</a>
+            </div>
+            <button type="button" id="clearHistory" class="danger">清空历史</button>
+          </div>
+        </section>
+
+        <section class="tool-box">
+          <h2 class="tool-body">导入</h2>
+          <div class="tool-body form-grid">
+            <label>JSON
+              <textarea id="jsonImport" spellcheck="false">{"type":"csi_fusion","tick_id":42,"timestamp_ms":4200,"link_states":{"S3_TO_C51":{"motion_score":0.70,"frame_energy":20.2,"variance":0.12,"rssi":-41,"quality":0.80},"S3_TO_C52":{"motion_score":0.30,"frame_energy":12.6,"variance":0.08,"rssi":-48,"quality":0.60},"C51_TO_C52":{"motion_score":0.44,"frame_energy":15.1,"variance":0.11,"rssi":-45,"quality":0.72},"C52_TO_C51":{"motion_score":0.22,"frame_energy":9.7,"variance":0.07,"rssi":-50,"quality":0.66}},"fused_state":{"motion_score":0.58,"state":"HOLD","confidence":0.71}}</textarea>
+            </label>
+            <button type="button" id="importJson" class="primary">导入 JSON</button>
+            <label>日志行
+              <textarea id="manualLine" spellcheck="false">I (45678) csi_gateway: CSI_FUSION_TELEMETRY {"type":"csi_fusion","schema_version":2,"trace_id":"csi-v2-42","tick_id":42,"links":["C51","C52"],"fused_state":{"state":"HOLD","confidence":0.58,"motion_score":0.58},"confidence":0.58,"motion_score":0.58,"timestamp_ms":4200}</textarea>
+            </label>
+            <div class="action-row">
+              <button type="button" id="parseLine">解析日志</button>
+              <button type="button" id="mockSample">模拟帧</button>
+            </div>
+          </div>
+        </section>
+      </aside>
+
+      <section class="stage">
+        <div class="empty-state">等待 CSI fusion telemetry</div>
+
+        <section class="fusion-grid data-zone">
+          <div class="section">
+            <h2>三节点拓扑 <span id="sampleBadge" class="muted">0 samples</span></h2>
+            <div class="canvas-shell">
+              <canvas id="topologyCanvas"></canvas>
+            </div>
+            <div id="linkStrip" class="link-strip"></div>
+          </div>
+
+          <div class="section">
+            <h2>Radar View <span id="radarMeta" class="muted">IDLE</span></h2>
+            <div class="canvas-shell">
+              <canvas id="radarCanvas"></canvas>
             </div>
           </div>
         </section>
 
-        <section class="panel data-zone">
-          <h2>原始 JSON 区</h2>
-          <div class="panel-body">
-            <pre id="rawJson">{}</pre>
+        <section class="section data-zone">
+          <h2>状态时间轴 <span id="timelineMeta" class="muted">IDLE / MOTION / HOLD</span></h2>
+          <div class="canvas-shell">
+            <canvas id="timelineCanvas"></canvas>
           </div>
+        </section>
+
+        <section class="section data-zone">
+          <h2>链路曲线 <span id="historyCount" class="muted">0 frames</span></h2>
+          <div class="chart-grid">
+            <div class="canvas-shell">
+              <div class="canvas-title"><span>motion_score timeline</span><span id="motionRange"></span></div>
+              <canvas id="motionCanvas"></canvas>
+            </div>
+            <div class="canvas-shell">
+              <div class="canvas-title"><span>energy timeline</span><span id="energyRange"></span></div>
+              <canvas id="energyCanvas"></canvas>
+            </div>
+            <div class="canvas-shell">
+              <div class="canvas-title"><span>quality timeline</span><span id="qualityRange"></span></div>
+              <canvas id="qualityCanvas"></canvas>
+            </div>
+            <div class="canvas-shell">
+              <div class="canvas-title"><span>link health timeline</span><span id="healthRange"></span></div>
+              <canvas id="healthCanvas"></canvas>
+            </div>
+          </div>
+        </section>
+
+        <section class="section data-zone">
+          <h2>Telemetry Engine JSON <span id="parserMeta" class="muted"></span></h2>
+          <pre id="telemetryJson">{}</pre>
         </section>
       </section>
     </div>
@@ -620,69 +691,54 @@
 
   <div id="toast" class="toast"></div>
 
-	<script>
-	    var REFRESH_INTERVAL_DEFAULT_MS = 1000;
-	    var REFRESH_INTERVAL_MIN_MS = 100;
-	    var REFRESH_INTERVAL_MAX_MS = 5000;
-	    var REFRESH_INTERVAL_HISTORY_SIZE = 12;
-	    var HISTORY_LIMIT_DEFAULT = 1000;
-	    var CHART_MAX_DISPLAY_POINTS = 520;
-	    var SERIAL_STATUS_REFRESH_INTERVAL_MS = 1000;
-	    var SERIAL_PORTS_REFRESH_INTERVAL_MS = 5000;
+  <script>
+    var REFRESH_INTERVAL_DEFAULT_MS = 1000;
+    var REFRESH_INTERVAL_MIN_MS = 100;
+    var REFRESH_INTERVAL_MAX_MS = 5000;
+    var REFRESH_INTERVAL_HISTORY_SIZE = 12;
+    var HISTORY_LIMIT_DEFAULT = 1000;
+    var SERIAL_STATUS_REFRESH_INTERVAL_MS = 1000;
+    var SERIAL_PORTS_REFRESH_INTERVAL_MS = 5000;
+    var TELEMETRY_WINDOW_MS = 400;
+    var LINK_IDS = ['S3_TO_C51', 'S3_TO_C52', 'C51_TO_C52', 'C52_TO_C51'];
+    var LINK_COLORS = {
+      S3_TO_C51: '#4ade80',
+      S3_TO_C52: '#6dd6e8',
+      C51_TO_C52: '#f2b84b',
+      C52_TO_C51: '#b6a0ff',
+      fused: '#ff6b5a'
+    };
+    var NODE_POS = {
+      C51: { x: 0.5, y: 0.16 },
+      C52: { x: 0.18, y: 0.78 },
+      S3: { x: 0.82, y: 0.78 }
+    };
 
-	    var state = {
-	      latest: {},
-	      devices: [],
-	      selectedDevice: '',
-	      history: [],
-	      status: {},
-	      ports: [],
-	      historyLimit: HISTORY_LIMIT_DEFAULT,
-	      refreshInFlight: false,
-	      refreshTimer: 0,
-	      refreshIntervalMs: REFRESH_INTERVAL_DEFAULT_MS,
-	      statusRefreshInFlight: false,
-	      statusRefreshTimer: 0,
-	      portsRefreshInFlight: false,
-	      portsRefreshTimer: 0,
-	    };
-
-    var latestFields = [
-      ['received_at_iso', '样本时间', true],
-      ['device_id', '设备 ID', true],
-      ['room_id', '房间 ID', false],
-      ['rssi', '信号强度 rssi', true],
-      ['noise_floor', '噪声底 noise_floor', false],
-      ['packet_count', '包数 packet_count', false],
-      ['motion_score', '运动评分 motion_score', true],
-      ['occupancy', '占用状态 occupancy', true],
-      ['motion_state', '运动状态 motion', false],
-      ['variance', '方差 variance', false],
-      ['amplitude_variance', '幅度方差 amplitude_var', false],
-      ['cv', '变异系数 cv', false],
-      ['source_format', '来源格式 source', false],
-      ['updated_at_ms', '更新时间 updated_at_ms', false],
-      ['raw_line', '原始日志 raw_line', false],
-    ];
+    var state = {
+      telemetry: null,
+      latestSample: null,
+      totalCount: 0,
+      status: {},
+      ports: [],
+      historyLimit: HISTORY_LIMIT_DEFAULT,
+      refreshInFlight: false,
+      refreshTimer: 0,
+      refreshIntervalMs: REFRESH_INTERVAL_DEFAULT_MS,
+      statusRefreshInFlight: false,
+      statusRefreshTimer: 0,
+      portsRefreshInFlight: false,
+      portsRefreshTimer: 0
+    };
 
     var el = {
-      runState: document.getElementById('runState'),
+      nodeStatus: document.getElementById('nodeStatus'),
+      linkHealth: document.getElementById('linkHealth'),
+      fusionState: document.getElementById('fusionState'),
+      confidenceValue: document.getElementById('confidenceValue'),
       sampleBadge: document.getElementById('sampleBadge'),
       globalNotice: document.getElementById('globalNotice'),
+      runState: document.getElementById('runState'),
       serialStatus: document.getElementById('serialStatus'),
-      deviceSelect: document.getElementById('deviceSelect'),
-      deviceList: document.getElementById('deviceList'),
-      latestGrid: document.getElementById('latestGrid'),
-      latestStamp: document.getElementById('latestStamp'),
-      historyCount: document.getElementById('historyCount'),
-      historyLimit: document.getElementById('historyLimit'),
-      rawJson: document.getElementById('rawJson'),
-      motionCanvas: document.getElementById('motionCanvas'),
-      rssiCanvas: document.getElementById('rssiCanvas'),
-      amplitudeCanvas: document.getElementById('amplitudeCanvas'),
-      motionRange: document.getElementById('motionRange'),
-      rssiRange: document.getElementById('rssiRange'),
-      amplitudeRange: document.getElementById('amplitudeRange'),
       serialForm: document.getElementById('serialForm'),
       serialPort: document.getElementById('serialPort'),
       serialPortList: document.getElementById('serialPortList'),
@@ -692,19 +748,52 @@
       refreshPorts: document.getElementById('refreshPorts'),
       serialHint: document.getElementById('serialHint'),
       serialPorts: document.getElementById('serialPorts'),
+      historyLimit: document.getElementById('historyLimit'),
+      clearHistory: document.getElementById('clearHistory'),
+      jsonImport: document.getElementById('jsonImport'),
+      importJson: document.getElementById('importJson'),
       manualLine: document.getElementById('manualLine'),
       parseLine: document.getElementById('parseLine'),
       mockSample: document.getElementById('mockSample'),
-      clearHistory: document.getElementById('clearHistory'),
-      toast: document.getElementById('toast'),
+      topologyCanvas: document.getElementById('topologyCanvas'),
+      radarCanvas: document.getElementById('radarCanvas'),
+      timelineCanvas: document.getElementById('timelineCanvas'),
+      motionCanvas: document.getElementById('motionCanvas'),
+      energyCanvas: document.getElementById('energyCanvas'),
+      qualityCanvas: document.getElementById('qualityCanvas'),
+      healthCanvas: document.getElementById('healthCanvas'),
+      motionRange: document.getElementById('motionRange'),
+      energyRange: document.getElementById('energyRange'),
+      qualityRange: document.getElementById('qualityRange'),
+      healthRange: document.getElementById('healthRange'),
+      radarMeta: document.getElementById('radarMeta'),
+      timelineMeta: document.getElementById('timelineMeta'),
+      historyCount: document.getElementById('historyCount'),
+      parserMeta: document.getElementById('parserMeta'),
+      linkStrip: document.getElementById('linkStrip'),
+      telemetryJson: document.getElementById('telemetryJson'),
+      toast: document.getElementById('toast')
     };
+
+    function numeric(value) {
+      var number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function clamp01(value) {
+      var number = Number(value);
+      if (!Number.isFinite(number)) {
+        return 0;
+      }
+      return Math.max(0, Math.min(1, number));
+    }
 
     function formatValue(value) {
       if (value === undefined || value === null || value === '') {
         return '-';
       }
       if (typeof value === 'number') {
-        return Number.isInteger(value) ? String(value) : value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+        return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
       }
       if (typeof value === 'boolean') {
         return value ? '是' : '否';
@@ -712,74 +801,19 @@
       return String(value);
     }
 
-    function occupancyLabel(value) {
-      var text = String(value || '').trim().toLowerCase();
-      if (text === 'vacant') {
-        return '无人';
-      }
-      if (text === 'occupied') {
-        return '有人';
-      }
-      if (text === 'unknown') {
-        return '未知';
-      }
-      return formatValue(value);
+    function formatPercent(value) {
+      return String(Math.round(clamp01(value) * 100)) + '%';
     }
 
-    function motionLabel(value) {
-      var text = String(value || '').trim().toLowerCase();
-      if (text === 'idle' || text === 'static') {
-        return '静止';
+    function formatAge(value) {
+      var age = numeric(value);
+      if (age === null) {
+        return '-';
       }
-      if (text === 'motion' || text === 'moving' || text === 'active') {
-        return '运动';
+      if (age < 1000) {
+        return String(Math.round(age)) + 'ms';
       }
-      if (text === 'unknown') {
-        return '未知';
-      }
-      return formatValue(value);
-    }
-
-    function sourceFormatLabel(value) {
-      var text = String(value || '').trim().toLowerCase();
-      if (text === 'csi summary') {
-        return 'CSI 摘要';
-      }
-      if (text === 'csi json') {
-        return 'CSI JSON';
-      }
-      if (text === 'csi_placeholder_gateway') {
-        return 'CSI 网关占位';
-      }
-      return formatValue(value);
-    }
-
-    function readField(sample, field) {
-      if (!sample) {
-        return undefined;
-      }
-      if (field === 'occupancy') {
-        return occupancyLabel(sample.occupancy || sample.state);
-      }
-      if (field === 'motion_state') {
-        return motionLabel(sample.motion_state || sample.motion || '');
-      }
-      if (field === 'source_format') {
-        return sourceFormatLabel(sample.source_format);
-      }
-      if (field === 'variance') {
-        return sample.variance !== undefined ? sample.variance : sample.amplitude_variance;
-      }
-      if (field === 'amplitude_variance') {
-        return sample.amplitude_variance !== undefined ? sample.amplitude_variance : sample.variance;
-      }
-      if (field === 'packet_count') {
-        return sample.packet_count !== undefined ? sample.packet_count : sample.sample_count;
-      }
-      if (field === 'motion_score') {
-        return sample.motion_score !== undefined ? sample.motion_score : sample.presence_score;
-      }
-      return sample[field];
+      return (age / 1000).toFixed(1).replace(/\.0$/, '') + 's';
     }
 
     async function fetchJson(url, options) {
@@ -812,7 +846,7 @@
         'line did not contain a supported CSI marker': '这一行不包含支持的 CSI 标记',
         'JSON payload must be an object': 'JSON 负载必须是对象',
         'request body must be JSON': '请求体必须是 JSON',
-        'Not found': '接口不存在',
+        'Not found': '接口不存在'
       };
       if (exact[text]) {
         return exact[text];
@@ -825,8 +859,6 @@
         .replace('failed to close serial port', '关闭串口失败')
         .replace('serial port error', '串口错误')
         .replace('serial mode unavailable', '串口模式不可用')
-        .replace('Missing optional dependency "serialport"; serial APIs are disabled.', '缺少可选依赖 serialport，串口接口已禁用。')
-        .replace('Run "npm install" to enable serial port mode.', '运行 npm install 后重启即可启用串口模式。')
         .replace(/^HTTP (\d+)$/, 'HTTP 错误 $1');
     }
 
@@ -842,7 +874,7 @@
     function renderNotice() {
       var message = '';
       if (state.status && state.status.serialport_available === false) {
-        message = '未安装 serialport，串口功能不可用，但可使用粘贴日志/模拟样本。运行 npm install 后重启可启用串口。';
+        message = '未安装 serialport，串口功能不可用，但可使用导入或模拟帧。';
       } else if (state.status && (state.status.lastError || state.status.last_error)) {
         message = localizeMessage(state.status.lastError || state.status.last_error);
       }
@@ -850,13 +882,12 @@
       el.globalNotice.classList.toggle('visible', Boolean(message));
     }
 
-    function renderStatus() {
+    function renderSerialStatus() {
       var connected = Boolean(state.status.connected || state.status.running);
       var serialAvailable = state.status.serialport_available !== false;
       el.runState.classList.toggle('running', connected);
       el.runState.classList.toggle('warn', !connected && !serialAvailable);
       el.runState.querySelector('span:last-child').textContent = connected ? '串口运行中' : serialAvailable ? '未连接串口' : '串口不可用';
-      el.sampleBadge.textContent = String(state.totalCount || state.history.length || 0) + ' 个样本';
       el.connectSerial.disabled = !serialAvailable;
       el.stopSerial.disabled = !serialAvailable;
 
@@ -869,7 +900,7 @@
         ['已读行数', state.status.lines_seen || 0],
         ['样本数', state.status.samples_seen || 0],
         ['最后一行', state.status.last_line || '-'],
-        ['最后错误', state.status.lastError || state.status.last_error || '-'],
+        ['最后错误', state.status.lastError || state.status.last_error || '-']
       ];
 
       el.serialStatus.innerHTML = rows.map(function (row) {
@@ -889,13 +920,13 @@
       }).join('');
 
       if (!serialAvailable) {
-        el.serialHint.textContent = '未安装 serialport，串口功能不可用；你仍然可以粘贴日志或生成模拟样本完成验证。';
+        el.serialHint.textContent = 'serialport 缺失';
       } else if (connected) {
-        el.serialHint.textContent = '已连接串口 ' + activePort + ' @ ' + formatValue(state.status.baudRate || state.status.baud) + '。';
+        el.serialHint.textContent = activePort + ' @ ' + formatValue(state.status.baudRate || state.status.baud);
       } else if (ports.length) {
-        el.serialHint.textContent = '请选择一个 /dev/cu.* 串口，或启动前设置 CSI_SERIAL_PORT=/dev/cu.xxx 自动连接。';
+        el.serialHint.textContent = String(ports.length) + ' 个串口';
       } else {
-        el.serialHint.textContent = '未发现 /dev/cu.* 串口；请连接 ESP USB 串口，或使用手动调试区。';
+        el.serialHint.textContent = '未发现 /dev/cu.* 串口';
       }
 
       el.serialPorts.innerHTML = ports.length
@@ -905,249 +936,436 @@
             port.manufacturer,
             port.vendorId && port.productId ? 'VID:' + port.vendorId + ' PID:' + port.productId : '',
             port.serialNumber ? 'SN:' + port.serialNumber : '',
-            port.unavailable_reason || '',
+            port.unavailable_reason || ''
           ].filter(Boolean).join(' / ');
-          return '<button class="port-button' + active + '" type="button" data-port="' + escapeAttr(port.path) + '"><span>' + escapeHtml(port.path) + '</span><span class="port-meta">' + escapeHtml(meta || '串口设备') + '</span></button>';
+          return '<button class="port-button' + active + '" type="button" data-port="' + escapeAttr(port.path) + '"><span>' + escapeHtml(port.path) + '</span><span class="port-meta">' + escapeHtml(meta || 'serial') + '</span></button>';
         }).join('')
-        : '<div class="subtle">未发现 /dev/cu.* 串口</div>';
+        : '<div class="muted">暂无串口</div>';
     }
 
-    function renderDevices() {
-      var previous = state.selectedDevice;
-      if (!state.devices.includes(state.selectedDevice)) {
-        state.selectedDevice = state.devices[0] || '';
-      }
-
-      el.deviceSelect.innerHTML = state.devices.length
-        ? state.devices.map(function (device) {
-          return '<option value="' + escapeAttr(device) + '">' + escapeHtml(device) + '</option>';
-        }).join('')
-        : '<option value="">全部设备</option>';
-      el.deviceSelect.value = state.selectedDevice;
-
-      el.deviceList.innerHTML = state.devices.length
-        ? state.devices.map(function (device) {
-          var sample = state.latest[device] || {};
-          var active = device === state.selectedDevice ? ' active' : '';
-          return '<button class="device-button' + active + '" type="button" data-device="' + escapeAttr(device) + '"><span>' + escapeHtml(device) + '</span><span>' + escapeHtml(formatValue(readField(sample, 'motion_score'))) + '</span></button>';
-        }).join('')
-        : '<div class="subtle">暂无设备</div>';
-
-      if (previous !== state.selectedDevice) {
-        refreshHistory();
-      }
+    function latestFrames() {
+      return state.telemetry && Array.isArray(state.telemetry.aligned_csi_timeline)
+        ? state.telemetry.aligned_csi_timeline
+        : [];
     }
 
-    function selectedSample() {
-      if (state.selectedDevice && state.latest[state.selectedDevice]) {
-        return state.latest[state.selectedDevice];
-      }
-      return state.latestSample || null;
-    }
-
-    function renderLatest() {
-      var sample = selectedSample();
-      var hasData = Boolean(sample);
+    function renderFusionStatus() {
+      var model = state.telemetry || {};
+      var status = model.fusion_status || {};
+      var frames = latestFrames();
+      var hasData = frames.length > 0;
       document.body.classList.toggle('no-data', !hasData);
+      el.nodeStatus.textContent = (status.nodes || ['C51', 'C52', 'S3']).join(' ');
+      el.linkHealth.textContent = String(status.links_healthy || 0) + '/' + String(status.links_total || 4) + ' healthy';
+      el.fusionState.textContent = status.current_state || 'IDLE';
+      el.confidenceValue.textContent = formatPercent(status.confidence || 0);
+      el.sampleBadge.textContent = String(state.totalCount || 0) + ' samples';
+      el.historyCount.textContent = String(frames.length) + ' frames';
+      el.radarMeta.textContent = (status.current_state || 'IDLE') + ' ' + formatPercent(status.motion_intensity || 0);
+      el.timelineMeta.textContent = frames.length ? String(frames.length) + ' aligned frames' : 'IDLE / MOTION / HOLD';
+      el.parserMeta.textContent = model.parser ? String(model.parser.event_count || 0) + ' link events' : '';
+    }
 
-      el.latestGrid.innerHTML = latestFields.map(function (entry) {
-        var field = entry[0];
-        var label = entry[1];
-        var strong = entry[2];
-        var value = sample ? readField(sample, field) : undefined;
-        return '<div class="metric ' + (strong ? 'strong' : '') + '"><div class="metric-label">' + escapeHtml(label) + '</div><div class="metric-value">' + escapeHtml(formatValue(value)) + '</div></div>';
+    function renderLinkStrip() {
+      var topology = state.telemetry && state.telemetry.topology ? state.telemetry.topology : { edges: [] };
+      var edgesById = {};
+      topology.edges.forEach(function (edge) {
+        edgesById[edge.link_id] = edge;
+      });
+      el.linkStrip.innerHTML = LINK_IDS.map(function (linkId) {
+        var edge = edgesById[linkId] || { link_id: linkId };
+        var color = edgeColor(edge);
+        return '<div class="link-tile" style="border-color:' + escapeAttr(color) + '">' +
+          '<div class="link-name"><span>' + escapeHtml(linkId) + '</span><span>' + escapeHtml(edge.state || '-') + '</span></div>' +
+          '<div class="link-metrics">' +
+          '<span>motion ' + escapeHtml(formatValue(edge.motion_score)) + '</span>' +
+          '<span>quality ' + escapeHtml(formatValue(edge.quality)) + '</span>' +
+          '<span>energy ' + escapeHtml(formatValue(edge.energy)) + '</span>' +
+          '<span>age ' + escapeHtml(formatAge(edge.age_ms)) + '</span>' +
+          '</div></div>';
       }).join('');
-      el.latestStamp.textContent = sample && sample.received_at_iso ? sample.received_at_iso : '';
-      el.rawJson.textContent = sample ? JSON.stringify(sample, null, 2) : '{}';
     }
 
-    function renderCharts() {
-      el.historyCount.textContent = String(state.history.length) + ' / ' + String(state.historyLimit) + ' 个样本';
-      var rootStyle = getComputedStyle(document.documentElement);
-      drawSeries(el.motionCanvas, state.history.map(function (sample) { return numeric(readField(sample, 'motion_score')); }), rootStyle.getPropertyValue('--accent').trim(), el.motionRange, '暂无 motion_score');
-      drawSeries(el.rssiCanvas, state.history.map(function (sample) { return numeric(sample.rssi); }), rootStyle.getPropertyValue('--accent-3').trim(), el.rssiRange, '暂无 rssi');
-      drawSeries(el.amplitudeCanvas, state.history.map(function (sample) {
-        return numeric(sample.amplitude !== undefined ? sample.amplitude : (sample.amplitude_variance !== undefined ? sample.amplitude_variance : sample.variance));
-      }), rootStyle.getPropertyValue('--accent-2').trim(), el.amplitudeRange, '暂无幅度或方差');
+    function renderTelemetryJson() {
+      var model = state.telemetry || {};
+      var preview = {
+        fusion_status: model.fusion_status || null,
+        topology: model.topology || null,
+        radar_frame: model.radar_frame || null,
+        state_timeline: (model.state_timeline || []).slice(-12),
+        parser: model.parser || null
+      };
+      el.telemetryJson.textContent = JSON.stringify(preview, null, 2);
     }
 
-	    function numeric(value) {
-	      var number = Number(value);
-	      return Number.isFinite(number) ? number : null;
-	    }
+    function renderAllVisuals() {
+      renderFusionStatus();
+      renderLinkStrip();
+      renderTelemetryJson();
+      drawTopology();
+      drawRadar();
+      drawTimeline();
+      drawCharts();
+    }
 
-	    function clampRefreshInterval(value) {
-	      var number = Number(value);
-	      if (!Number.isFinite(number)) {
-	        return REFRESH_INTERVAL_DEFAULT_MS;
-	      }
-	      return Math.max(REFRESH_INTERVAL_MIN_MS, Math.min(REFRESH_INTERVAL_MAX_MS, Math.round(number)));
-	    }
-
-	    function median(values) {
-	      if (!values.length) {
-	        return null;
-	      }
-	      var sorted = values.slice().sort(function (a, b) { return a - b; });
-	      var middle = Math.floor(sorted.length / 2);
-	      if (sorted.length % 2) {
-	        return sorted[middle];
-	      }
-	      return (sorted[middle - 1] + sorted[middle]) / 2;
-	    }
-
-	    function estimateRefreshIntervalMs() {
-	      var samples = state.history.slice(-REFRESH_INTERVAL_HISTORY_SIZE);
-	      var timestamps = samples.map(function (sample) {
-	        return numeric(sample.server_time_ms || sample.received_at_ms || sample.updated_at_ms);
-	      }).filter(function (value) {
-	        return value !== null;
-	      });
-	      var deltas = [];
-	      for (var i = 1; i < timestamps.length; i += 1) {
-	        var delta = timestamps[i] - timestamps[i - 1];
-	        if (delta > 0 && delta <= REFRESH_INTERVAL_MAX_MS * 4) {
-	          deltas.push(delta);
-	        }
-	      }
-	      return clampRefreshInterval(median(deltas) || REFRESH_INTERVAL_DEFAULT_MS);
-	    }
-
-	    function scheduleNextRefresh() {
-	      window.clearTimeout(state.refreshTimer);
-	      state.refreshIntervalMs = estimateRefreshIntervalMs();
-	      state.refreshTimer = window.setTimeout(refreshDataLoop, state.refreshIntervalMs);
-	    }
-
-	    function scheduleStatusRefresh() {
-	      window.clearTimeout(state.statusRefreshTimer);
-	      state.statusRefreshTimer = window.setTimeout(refreshStatusLoop, SERIAL_STATUS_REFRESH_INTERVAL_MS);
-	    }
-
-	    function schedulePortsRefresh() {
-	      window.clearTimeout(state.portsRefreshTimer);
-	      state.portsRefreshTimer = window.setTimeout(refreshPortsLoop, SERIAL_PORTS_REFRESH_INTERVAL_MS);
-	    }
-
-    function drawSeries(canvas, values, color, rangeTarget, emptyText) {
+    function prepareCanvas(canvas) {
+      var rect = canvas.getBoundingClientRect();
+      var width = Math.max(320, Math.round(rect.width));
+      var height = Math.max(120, Math.round(rect.height));
+      var dpr = window.devicePixelRatio || 1;
+      if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+      }
       var ctx = canvas.getContext('2d');
-      var width = canvas.width;
-      var height = canvas.height;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
-      ctx.fillStyle = '#0b0e12';
-      ctx.fillRect(0, 0, width, height);
+      return { ctx: ctx, width: width, height: height };
+    }
 
-      var padding = 28;
-      var usableWidth = width - padding * 2;
-      var usableHeight = height - padding * 2;
-      var points = values.map(function (value, index) {
-        return { value: value, index: index };
-      }).filter(function (point) {
-        return point.value !== null;
+    function edgeColor(edge) {
+      var motion = clamp01(edge.motion_score || 0);
+      var health = clamp01(edge.health !== undefined ? edge.health : edge.quality || 0);
+      if (health < 0.18) {
+        return '#77715f';
+      }
+      if (motion >= 0.62) {
+        return '#ff6b5a';
+      }
+      if (motion >= 0.34) {
+        return '#f2b84b';
+      }
+      return LINK_COLORS[edge.link_id] || '#4ade80';
+    }
+
+    function nodePoint(nodeId, width, height) {
+      var pos = NODE_POS[nodeId] || { x: 0.5, y: 0.5 };
+      return {
+        x: 52 + pos.x * (width - 104),
+        y: 42 + pos.y * (height - 84)
+      };
+    }
+
+    function drawTopology() {
+      var prepared = prepareCanvas(el.topologyCanvas);
+      var ctx = prepared.ctx;
+      var width = prepared.width;
+      var height = prepared.height;
+      var model = state.telemetry || {};
+      var topology = model.topology || { edges: [] };
+      ctx.fillStyle = '#0b0a08';
+      ctx.fillRect(0, 0, width, height);
+      drawGrid(ctx, width, height, 42);
+
+      var edgeOffsets = {
+        S3_TO_C51: -18,
+        S3_TO_C52: 18,
+        C51_TO_C52: -18,
+        C52_TO_C51: 18
+      };
+      topology.edges.forEach(function (edge) {
+        var source = nodePoint(edge.source, width, height);
+        var target = nodePoint(edge.target, width, height);
+        drawEdge(ctx, source, target, edge, edgeOffsets[edge.link_id] || 0);
       });
 
-      drawGrid(ctx, padding, width, height);
+      ['C51', 'C52', 'S3'].forEach(function (nodeId) {
+        var point = nodePoint(nodeId, width, height);
+        drawNode(ctx, point.x, point.y, nodeId);
+      });
+    }
 
-      if (points.length === 0) {
-        ctx.fillStyle = '#98a6b3';
-        ctx.font = '14px ui-monospace, Menlo, monospace';
-        ctx.fillText(emptyText || '等待数据', padding, height / 2);
+    function drawEdge(ctx, source, target, edge, offset) {
+      var dx = target.x - source.x;
+      var dy = target.y - source.y;
+      var length = Math.sqrt(dx * dx + dy * dy) || 1;
+      var nx = -dy / length;
+      var ny = dx / length;
+      var c1 = {
+        x: source.x + dx * 0.44 + nx * offset,
+        y: source.y + dy * 0.44 + ny * offset
+      };
+      var c2 = {
+        x: source.x + dx * 0.56 + nx * offset,
+        y: source.y + dy * 0.56 + ny * offset
+      };
+      var color = edgeColor(edge);
+      var strength = clamp01(edge.visual_strength || 0);
+      ctx.save();
+      ctx.globalAlpha = 0.24 + clamp01(edge.health || 0) * 0.76;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2 + strength * 8;
+      ctx.lineCap = 'round';
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 6 + strength * 18;
+      ctx.beginPath();
+      ctx.moveTo(source.x, source.y);
+      ctx.bezierCurveTo(c1.x, c1.y, c2.x, c2.y, target.x, target.y);
+      ctx.stroke();
+      drawArrow(ctx, c2, target, color);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#f4f1e8';
+      ctx.font = '12px SFMono-Regular, Menlo, monospace';
+      ctx.fillText(edge.link_id, (source.x + target.x) / 2 + nx * (offset + 10), (source.y + target.y) / 2 + ny * (offset + 10));
+      ctx.restore();
+    }
+
+    function drawArrow(ctx, from, to, color) {
+      var angle = Math.atan2(to.y - from.y, to.x - from.x);
+      var size = 8;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(to.x, to.y);
+      ctx.lineTo(to.x - Math.cos(angle - 0.42) * size, to.y - Math.sin(angle - 0.42) * size);
+      ctx.lineTo(to.x - Math.cos(angle + 0.42) * size, to.y - Math.sin(angle + 0.42) * size);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    function drawNode(ctx, x, y, label) {
+      ctx.save();
+      ctx.fillStyle = '#15130f';
+      ctx.strokeStyle = label === 'S3' ? '#6dd6e8' : '#4ade80';
+      ctx.lineWidth = 2;
+      ctx.shadowColor = ctx.strokeStyle;
+      ctx.shadowBlur = 16;
+      ctx.beginPath();
+      ctx.arc(x, y, label === 'S3' ? 26 : 22, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#f4f1e8';
+      ctx.font = '800 14px Avenir Next, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, x, y);
+      ctx.restore();
+    }
+
+    function drawRadar() {
+      var prepared = prepareCanvas(el.radarCanvas);
+      var ctx = prepared.ctx;
+      var width = prepared.width;
+      var height = prepared.height;
+      var radar = state.telemetry && state.telemetry.radar_frame ? state.telemetry.radar_frame : null;
+      ctx.fillStyle = '#0b0a08';
+      ctx.fillRect(0, 0, width, height);
+      var cx = width / 2;
+      var cy = height / 2;
+      var radius = Math.min(width, height) * 0.38;
+      ctx.strokeStyle = 'rgba(244,241,232,0.16)';
+      ctx.lineWidth = 1;
+      for (var ring = 1; ring <= 4; ring += 1) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius * ring / 4, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      for (var spoke = 0; spoke < 8; spoke += 1) {
+        var angle = spoke * Math.PI / 4;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + Math.cos(angle) * radius, cy + Math.sin(angle) * radius);
+        ctx.stroke();
+      }
+      ctx.fillStyle = '#6dd6e8';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.font = '12px SFMono-Regular, Menlo, monospace';
+      ctx.fillText('S3', cx + 10, cy - 10);
+
+      var angles = {
+        S3_TO_C51: -58,
+        S3_TO_C52: -122,
+        C51_TO_C52: -180,
+        C52_TO_C51: 0
+      };
+      var heat = radar && Array.isArray(radar.activity_heat) ? radar.activity_heat : [];
+      heat.forEach(function (point) {
+        var angleDeg = angles[point.link_id] || 0;
+        var radians = angleDeg * Math.PI / 180;
+        var distance = radius * (0.28 + clamp01(point.activity_heat) * 0.7);
+        var x = cx + Math.cos(radians) * distance;
+        var y = cy + Math.sin(radians) * distance;
+        var color = LINK_COLORS[point.link_id] || '#4ade80';
+        var heatValue = clamp01(point.activity_heat);
+        ctx.save();
+        ctx.globalAlpha = 0.18 + heatValue * 0.7;
+        ctx.fillStyle = color;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 20 + heatValue * 30;
+        ctx.beginPath();
+        ctx.arc(x, y, 12 + heatValue * 28, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#f4f1e8';
+        ctx.font = '11px SFMono-Regular, Menlo, monospace';
+        ctx.fillText(point.link_id, x + 14, y + 4);
+        ctx.restore();
+      });
+    }
+
+    function drawTimeline() {
+      var prepared = prepareCanvas(el.timelineCanvas);
+      var ctx = prepared.ctx;
+      var width = prepared.width;
+      var height = prepared.height;
+      var timeline = state.telemetry && Array.isArray(state.telemetry.state_timeline) ? state.telemetry.state_timeline : [];
+      ctx.fillStyle = '#0b0a08';
+      ctx.fillRect(0, 0, width, height);
+      drawGrid(ctx, width, height, 36);
+      if (!timeline.length) {
+        drawEmpty(ctx, width, height, 'waiting for state timeline');
+        return;
+      }
+      var minTs = timeline[0].timestamp_ms || 0;
+      var maxTs = timeline[timeline.length - 1].timestamp_ms || (minTs + 1);
+      if (maxTs <= minTs) {
+        maxTs = minTs + 1;
+      }
+      var y = 38;
+      var barHeight = 36;
+      timeline.forEach(function (item, index) {
+        var next = timeline[index + 1] || item;
+        var x1 = 24 + ((item.timestamp_ms - minTs) / (maxTs - minTs)) * (width - 48);
+        var x2 = 24 + (((next.timestamp_ms || item.timestamp_ms) - minTs) / (maxTs - minTs)) * (width - 48);
+        var w = Math.max(3, x2 - x1);
+        ctx.fillStyle = stateColor(item.state);
+        ctx.globalAlpha = 0.88;
+        ctx.fillRect(x1, y, w, barHeight);
+      });
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#f4f1e8';
+      ctx.font = '12px SFMono-Regular, Menlo, monospace';
+      ctx.fillText('IDLE', 24, 102);
+      ctx.fillText('MOTION', 92, 102);
+      ctx.fillText('HOLD', 182, 102);
+      drawLegendDot(ctx, 70, 98, stateColor('IDLE'));
+      drawLegendDot(ctx, 152, 98, stateColor('MOTION'));
+      drawLegendDot(ctx, 224, 98, stateColor('HOLD'));
+    }
+
+    function stateColor(value) {
+      if (value === 'MOTION') {
+        return '#ff6b5a';
+      }
+      if (value === 'HOLD') {
+        return '#f2b84b';
+      }
+      return '#4ade80';
+    }
+
+    function drawCharts() {
+      var model = state.telemetry || {};
+      var series = model.series || {};
+      drawMultiSeries(el.motionCanvas, series.motion_score || [], 'motion_score', el.motionRange, true);
+      drawMultiSeries(el.energyCanvas, series.energy || [], 'energy', el.energyRange, false);
+      drawMultiSeries(el.qualityCanvas, series.quality || [], 'quality', el.qualityRange, true);
+      drawMultiSeries(el.healthCanvas, series.link_health || [], 'link_health', el.healthRange, true);
+    }
+
+    function drawMultiSeries(canvas, rows, label, rangeTarget, fixed01) {
+      var prepared = prepareCanvas(canvas);
+      var ctx = prepared.ctx;
+      var width = prepared.width;
+      var height = prepared.height;
+      ctx.fillStyle = '#0b0a08';
+      ctx.fillRect(0, 0, width, height);
+      drawGrid(ctx, width, height, 34);
+      if (!rows.length) {
+        drawEmpty(ctx, width, height, 'waiting for ' + label);
         rangeTarget.textContent = '';
         return;
       }
 
-      var min = Math.min.apply(null, points.map(function (point) { return point.value; }));
-      var max = Math.max.apply(null, points.map(function (point) { return point.value; }));
+      var fields = label === 'motion_score' ? ['fused'].concat(LINK_IDS) : LINK_IDS.slice();
+      var pointsByField = {};
+      var values = [];
+      fields.forEach(function (field) {
+        pointsByField[field] = rows.map(function (row, index) {
+          var value = numeric(row[field]);
+          if (value !== null) {
+            values.push(value);
+          }
+          return { index: index, value: value };
+        }).filter(function (point) {
+          return point.value !== null;
+        });
+      });
+      if (!values.length) {
+        drawEmpty(ctx, width, height, 'waiting for ' + label);
+        rangeTarget.textContent = '';
+        return;
+      }
+      var min = fixed01 ? 0 : Math.min.apply(null, values);
+      var max = fixed01 ? 1 : Math.max.apply(null, values);
       if (min === max) {
         min -= 1;
         max += 1;
       }
       rangeTarget.textContent = formatValue(min) + ' .. ' + formatValue(max);
 
-      var displayPoints = smoothDisplayPoints(decimateDisplayPoints(points, CHART_MAX_DISPLAY_POINTS));
-      var chartPoints = displayPoints.map(function (point) {
-        return {
-          x: padding + (values.length <= 1 ? usableWidth : (point.index / (values.length - 1)) * usableWidth),
-          y: padding + (1 - (point.value - min) / (max - min)) * usableHeight
-        };
-      });
-
-      ctx.strokeStyle = colorWithAlpha(color, 0.18);
-      ctx.lineWidth = 6;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.beginPath();
-      drawSmoothPath(ctx, chartPoints);
-      ctx.stroke();
-
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2.2;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.beginPath();
-      drawSmoothPath(ctx, chartPoints);
-      ctx.stroke();
-
-      ctx.fillStyle = color;
-      chartPoints.forEach(function (point) {
+      fields.forEach(function (field) {
+        var points = pointsByField[field];
+        if (!points.length) {
+          return;
+        }
+        var color = LINK_COLORS[field] || LINK_COLORS.fused;
+        var chartPoints = points.map(function (point) {
+          return {
+            x: 32 + (rows.length <= 1 ? 0 : point.index / (rows.length - 1)) * (width - 64),
+            y: 22 + (1 - (point.value - min) / (max - min)) * (height - 58)
+          };
+        });
+        ctx.strokeStyle = colorWithAlpha(color, field === 'fused' ? 0.95 : 0.72);
+        ctx.lineWidth = field === 'fused' ? 3 : 2;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
         ctx.beginPath();
-        ctx.arc(point.x, point.y, 2.4, 0, Math.PI * 2);
-        ctx.fill();
+        drawSmoothPath(ctx, chartPoints);
+        ctx.stroke();
+      });
+      drawChartLegend(ctx, fields, width, height);
+    }
+
+    function drawChartLegend(ctx, fields, width, height) {
+      var x = 28;
+      var y = height - 18;
+      ctx.font = '10px SFMono-Regular, Menlo, monospace';
+      fields.forEach(function (field) {
+        var color = LINK_COLORS[field] || LINK_COLORS.fused;
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y - 8, 10, 3);
+        ctx.fillStyle = '#aaa390';
+        ctx.fillText(field, x + 14, y - 5);
+        x += Math.min(128, 18 + field.length * 7);
+        if (x > width - 120) {
+          x = 28;
+          y -= 16;
+        }
       });
     }
 
-    function decimateDisplayPoints(points, maxPoints) {
-      if (points.length <= maxPoints) {
-        return points;
+    function drawGrid(ctx, width, height, step) {
+      ctx.strokeStyle = 'rgba(244,241,232,0.08)';
+      ctx.lineWidth = 1;
+      for (var x = 0; x <= width; x += step) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
       }
-
-      var bucketSize = Math.ceil(points.length / maxPoints);
-      var displayPoints = [points[0]];
-      for (var start = 1; start < points.length - 1; start += bucketSize) {
-        var end = Math.min(points.length - 1, start + bucketSize);
-        var minPoint = points[start];
-        var maxPoint = points[start];
-        for (var i = start + 1; i < end; i += 1) {
-          if (points[i].value < minPoint.value) {
-            minPoint = points[i];
-          }
-          if (points[i].value > maxPoint.value) {
-            maxPoint = points[i];
-          }
-        }
-        if (minPoint.index < maxPoint.index) {
-          displayPoints.push(minPoint, maxPoint);
-        } else if (maxPoint.index < minPoint.index) {
-          displayPoints.push(maxPoint, minPoint);
-        } else {
-          displayPoints.push(minPoint);
-        }
+      for (var y = 0; y <= height; y += step) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
       }
-      displayPoints.push(points[points.length - 1]);
-      return displayPoints;
-    }
-
-    function smoothDisplayPoints(points) {
-      if (points.length < 4) {
-        return points;
-      }
-
-      var smoothed = points.map(function (point, index) {
-        var previous = points[Math.max(0, index - 1)];
-        var next = points[Math.min(points.length - 1, index + 1)];
-        return {
-          index: point.index,
-          value: previous.value * 0.2 + point.value * 0.6 + next.value * 0.2
-        };
-      });
-
-      smoothed[0].value = points[0].value;
-      smoothed[smoothed.length - 1].value = points[points.length - 1].value;
-      return smoothed;
     }
 
     function drawSmoothPath(ctx, points) {
-      if (points.length === 0) {
+      if (!points.length) {
         return;
       }
       ctx.moveTo(points[0].x, points[0].y);
@@ -1158,7 +1376,6 @@
         ctx.lineTo(points[1].x, points[1].y);
         return;
       }
-
       for (var i = 0; i < points.length - 1; i += 1) {
         var previous = points[Math.max(0, i - 1)];
         var current = points[i];
@@ -1170,6 +1387,19 @@
         var cp2y = next.y - (following.y - current.y) / 8;
         ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, next.x, next.y);
       }
+    }
+
+    function drawEmpty(ctx, width, height, text) {
+      ctx.fillStyle = '#aaa390';
+      ctx.font = '13px SFMono-Regular, Menlo, monospace';
+      ctx.fillText(text, 24, height / 2);
+    }
+
+    function drawLegendDot(ctx, x, y, color) {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(x, y - 4, 4, 0, Math.PI * 2);
+      ctx.fill();
     }
 
     function colorWithAlpha(color, alpha) {
@@ -1195,51 +1425,81 @@
       return 'rgba(' + r + ', ' + g + ', ' + b + ', ' + alpha + ')';
     }
 
-    function drawGrid(ctx, padding, width, height) {
-      ctx.strokeStyle = 'rgba(255,255,255,0.09)';
-      ctx.lineWidth = 1;
-      for (var i = 0; i <= 4; i += 1) {
-        var y = padding + ((height - padding * 2) / 4) * i;
-        ctx.beginPath();
-        ctx.moveTo(padding, y);
-        ctx.lineTo(width - padding, y);
-        ctx.stroke();
+    function clampRefreshInterval(value) {
+      var number = Number(value);
+      if (!Number.isFinite(number)) {
+        return REFRESH_INTERVAL_DEFAULT_MS;
       }
-      for (var j = 0; j <= 6; j += 1) {
-        var x = padding + ((width - padding * 2) / 6) * j;
-        ctx.beginPath();
-        ctx.moveTo(x, padding);
-        ctx.lineTo(x, height - padding);
-        ctx.stroke();
+      return Math.max(REFRESH_INTERVAL_MIN_MS, Math.min(REFRESH_INTERVAL_MAX_MS, Math.round(number)));
+    }
+
+    function median(values) {
+      if (!values.length) {
+        return null;
       }
+      var sorted = values.slice().sort(function (a, b) { return a - b; });
+      var middle = Math.floor(sorted.length / 2);
+      if (sorted.length % 2) {
+        return sorted[middle];
+      }
+      return (sorted[middle - 1] + sorted[middle]) / 2;
+    }
+
+    function estimateRefreshIntervalMs() {
+      var frames = latestFrames().slice(-REFRESH_INTERVAL_HISTORY_SIZE);
+      var timestamps = frames.map(function (frame) {
+        return numeric(frame.observed_at_ms || frame.timestamp_ms);
+      }).filter(function (value) {
+        return value !== null;
+      });
+      var deltas = [];
+      for (var i = 1; i < timestamps.length; i += 1) {
+        var delta = timestamps[i] - timestamps[i - 1];
+        if (delta > 0 && delta <= REFRESH_INTERVAL_MAX_MS * 4) {
+          deltas.push(delta);
+        }
+      }
+      return clampRefreshInterval(median(deltas) || REFRESH_INTERVAL_DEFAULT_MS);
+    }
+
+    function scheduleNextRefresh() {
+      window.clearTimeout(state.refreshTimer);
+      state.refreshIntervalMs = estimateRefreshIntervalMs();
+      state.refreshTimer = window.setTimeout(refreshDataLoop, state.refreshIntervalMs);
+    }
+
+    function scheduleStatusRefresh() {
+      window.clearTimeout(state.statusRefreshTimer);
+      state.statusRefreshTimer = window.setTimeout(refreshStatusLoop, SERIAL_STATUS_REFRESH_INTERVAL_MS);
+    }
+
+    function schedulePortsRefresh() {
+      window.clearTimeout(state.portsRefreshTimer);
+      state.portsRefreshTimer = window.setTimeout(refreshPortsLoop, SERIAL_PORTS_REFRESH_INTERVAL_MS);
+    }
+
+    async function refreshTelemetry() {
+      var params = new URLSearchParams({
+        limit: String(state.historyLimit),
+        window_ms: String(TELEMETRY_WINDOW_MS)
+      });
+      state.telemetry = await fetchJson('/api/csi/telemetry?' + params.toString());
+      renderAllVisuals();
     }
 
     async function refreshLatest() {
       var data = await fetchJson('/api/csi/latest');
-      state.latest = data.latest || {};
-      state.devices = data.devices || Object.keys(state.latest).sort();
       state.latestSample = data.latest_sample || data.sample || null;
       state.totalCount = data.count || 0;
-      renderDevices();
-      renderLatest();
-      renderStatus();
-    }
-
-    async function refreshHistory() {
-      var params = new URLSearchParams({ limit: String(state.historyLimit) });
-      if (state.selectedDevice) {
-        params.set('device_id', state.selectedDevice);
+      if (!state.telemetry && data.telemetry) {
+        state.telemetry = data.telemetry;
       }
-      var data = await fetchJson('/api/csi/history?' + params.toString());
-      state.history = data.history || [];
-      state.totalCount = data.count || state.totalCount || 0;
-      renderCharts();
-      renderStatus();
+      renderFusionStatus();
     }
 
     async function refreshStatus() {
       state.status = await fetchJson('/api/serial/status');
-      renderStatus();
+      renderSerialStatus();
       renderSerialPorts();
     }
 
@@ -1248,108 +1508,90 @@
       state.ports = data.ports || [];
       if (data.status) {
         state.status = data.status;
-        renderStatus();
+        renderSerialStatus();
       }
       renderSerialPorts();
     }
 
-	    async function refreshAll() {
-	      if (state.refreshInFlight) {
-	        return;
-	      }
-	      state.refreshInFlight = true;
+    async function refreshAll() {
+      if (state.refreshInFlight) {
+        return;
+      }
+      state.refreshInFlight = true;
       try {
-        await Promise.all([refreshLatest(), refreshHistory(), refreshStatus(), refreshPorts()]);
+        await Promise.all([refreshLatest(), refreshTelemetry(), refreshStatus(), refreshPorts()]);
       } catch (error) {
         state.status = Object.assign({}, state.status, { lastError: error.message });
-        renderStatus();
+        renderSerialStatus();
         renderSerialPorts();
-		      } finally {
-		        state.refreshInFlight = false;
-		        scheduleNextRefresh();
-		        scheduleStatusRefresh();
-		        schedulePortsRefresh();
-		      }
-		    }
+      } finally {
+        state.refreshInFlight = false;
+        scheduleNextRefresh();
+        scheduleStatusRefresh();
+        schedulePortsRefresh();
+      }
+    }
 
-	    async function refreshDataLoop() {
-	      if (state.refreshInFlight) {
-	        scheduleNextRefresh();
-	        return;
-	      }
-	      state.refreshInFlight = true;
-	      try {
-	        await Promise.all([refreshLatest(), refreshHistory()]);
-	      } catch (error) {
-	        state.status = Object.assign({}, state.status, { lastError: error.message });
-	        renderStatus();
-	      } finally {
-	        state.refreshInFlight = false;
-	        scheduleNextRefresh();
-	      }
-	    }
+    async function refreshDataLoop() {
+      if (state.refreshInFlight) {
+        scheduleNextRefresh();
+        return;
+      }
+      state.refreshInFlight = true;
+      try {
+        await Promise.all([refreshLatest(), refreshTelemetry()]);
+      } catch (error) {
+        state.status = Object.assign({}, state.status, { lastError: error.message });
+        renderSerialStatus();
+      } finally {
+        state.refreshInFlight = false;
+        scheduleNextRefresh();
+      }
+    }
 
-	    async function refreshStatusLoop() {
-	      if (state.statusRefreshInFlight) {
-	        scheduleStatusRefresh();
-	        return;
-	      }
-	      state.statusRefreshInFlight = true;
-	      try {
-	        await refreshStatus();
-	      } catch (error) {
-	        state.status = Object.assign({}, state.status, { lastError: error.message });
-	        renderStatus();
-	      } finally {
-	        state.statusRefreshInFlight = false;
-	        scheduleStatusRefresh();
-	      }
-	    }
+    async function refreshStatusLoop() {
+      if (state.statusRefreshInFlight) {
+        scheduleStatusRefresh();
+        return;
+      }
+      state.statusRefreshInFlight = true;
+      try {
+        await refreshStatus();
+      } catch (error) {
+        state.status = Object.assign({}, state.status, { lastError: error.message });
+        renderSerialStatus();
+      } finally {
+        state.statusRefreshInFlight = false;
+        scheduleStatusRefresh();
+      }
+    }
 
-	    async function refreshPortsLoop() {
-	      if (state.portsRefreshInFlight) {
-	        schedulePortsRefresh();
-	        return;
-	      }
-	      state.portsRefreshInFlight = true;
-	      try {
-	        await refreshPorts();
-	      } catch (error) {
-	        state.status = Object.assign({}, state.status, { lastError: error.message });
-	        renderStatus();
-	        renderSerialPorts();
-	      } finally {
-	        state.portsRefreshInFlight = false;
-	        schedulePortsRefresh();
-	      }
-	    }
+    async function refreshPortsLoop() {
+      if (state.portsRefreshInFlight) {
+        schedulePortsRefresh();
+        return;
+      }
+      state.portsRefreshInFlight = true;
+      try {
+        await refreshPorts();
+      } catch (error) {
+        state.status = Object.assign({}, state.status, { lastError: error.message });
+        renderSerialStatus();
+        renderSerialPorts();
+      } finally {
+        state.portsRefreshInFlight = false;
+        schedulePortsRefresh();
+      }
+    }
 
     async function refreshDataOnly() {
       try {
         await refreshLatest();
-        await refreshHistory();
+        await refreshTelemetry();
       } catch (error) {
         showToast(error.message, 'error');
       }
     }
-
-    el.deviceSelect.addEventListener('change', function () {
-      state.selectedDevice = el.deviceSelect.value;
-      renderDevices();
-      renderLatest();
-      refreshHistory();
-    });
-
-    el.deviceList.addEventListener('click', function (event) {
-      var button = event.target.closest('[data-device]');
-      if (!button) {
-        return;
-      }
-      state.selectedDevice = button.dataset.device;
-      renderDevices();
-      renderLatest();
-      refreshHistory();
-    });
 
     el.serialPorts.addEventListener('click', function (event) {
       var button = event.target.closest('[data-port]');
@@ -1371,13 +1613,13 @@
       event.preventDefault();
       var body = {
         port: el.serialPort.value.trim(),
-        baudRate: Number.parseInt(el.serialBaud.value, 10) || 115200,
+        baudRate: Number.parseInt(el.serialBaud.value, 10) || 115200
       };
       try {
         await fetchJson('/api/serial/connect', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
+          body: JSON.stringify(body)
         });
         showToast('串口已连接', 'ok');
       } catch (error) {
@@ -1398,14 +1640,29 @@
       refreshStatus();
     });
 
+    el.importJson.addEventListener('click', async function () {
+      try {
+        var payload = JSON.parse(el.jsonImport.value.trim());
+        await fetchJson('/api/csi/sample', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        showToast('JSON 已导入', 'ok');
+        refreshDataOnly();
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    });
+
     el.parseLine.addEventListener('click', async function () {
       try {
         await fetchJson('/api/csi/log-line', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ line: el.manualLine.value.trim() }),
+          body: JSON.stringify({ line: el.manualLine.value.trim() })
         });
-        showToast('日志行已解析并写入历史', 'ok');
+        showToast('日志已解析', 'ok');
         refreshDataOnly();
       } catch (error) {
         showToast(error.message, 'error');
@@ -1416,7 +1673,7 @@
     el.mockSample.addEventListener('click', async function () {
       try {
         await fetchJson('/api/csi/mock', { method: 'POST' });
-        showToast('已生成模拟样本', 'ok');
+        showToast('模拟帧已写入', 'ok');
         refreshDataOnly();
       } catch (error) {
         showToast(error.message, 'error');
@@ -1425,26 +1682,25 @@
 
     el.historyLimit.addEventListener('change', function () {
       state.historyLimit = Number.parseInt(el.historyLimit.value, 10) || HISTORY_LIMIT_DEFAULT;
-      refreshHistory();
+      refreshTelemetry();
     });
 
     el.clearHistory.addEventListener('click', async function () {
       try {
         await fetchJson('/api/csi/history', { method: 'DELETE' });
-        state.latest = {};
-        state.devices = [];
-        state.selectedDevice = '';
+        state.telemetry = null;
         state.latestSample = null;
-        state.history = [];
         state.totalCount = 0;
-        renderDevices();
-        renderLatest();
-        renderCharts();
-        renderStatus();
+        renderAllVisuals();
+        renderSerialStatus();
         showToast('历史已清空', 'ok');
       } catch (error) {
         showToast(error.message, 'error');
       }
+    });
+
+    window.addEventListener('resize', function () {
+      renderAllVisuals();
     });
 
     function escapeHtml(value) {
@@ -1460,7 +1716,7 @@
       return escapeHtml(value);
     }
 
-	    refreshAll();
-	  </script>
+    refreshAll();
+  </script>
 </body>
 </html>

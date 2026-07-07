@@ -18,7 +18,6 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 #include "freertos/task.h"
@@ -265,8 +264,7 @@ const char *server_comm_err_to_name(server_comm_err_t err)
 
 bool server_comm_wifi_is_ready(void)
 {
-    wifi_ap_record_t ap = {0};
-    return esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+    return gateway_link_wifi_is_stable();
 }
 
 bool server_comm_http_status_is_success(int status_code)
@@ -1093,17 +1091,31 @@ esp_err_t server_comm_http_fetch_headers(server_comm_raw_stream_t *stream,
 }
 
 static bool server_comm_stream_response_complete(server_comm_raw_stream_t *stream,
+                                                 int64_t content_length,
+                                                 bool chunked,
                                                  size_t total_read)
 {
     if (stream == NULL || stream->client == NULL) {
         return true;
     }
-    if (esp_http_client_is_complete_data_received(stream->client)) {
-        return true;
+    if (content_length >= 0) {
+        return total_read >= (size_t)content_length;
     }
+    if (chunked) {
+        return esp_http_client_is_complete_data_received(stream->client);
+    }
+    return false;
+}
 
-    int64_t content_length = esp_http_client_get_content_length(stream->client);
-    return content_length >= 0 && total_read >= (size_t)content_length;
+static bool server_comm_unknown_length_response_closed(int read_len,
+                                                       int64_t content_length,
+                                                       bool chunked,
+                                                       size_t total_read)
+{
+    return content_length < 0 &&
+           !chunked &&
+           total_read > 0 &&
+           (read_len == 0 || read_len == -ESP_ERR_HTTP_CONNECTION_CLOSED);
 }
 
 esp_err_t server_comm_http_read_response(server_comm_raw_stream_t *stream,
@@ -1123,6 +1135,12 @@ esp_err_t server_comm_http_read_response(server_comm_raw_stream_t *stream,
         }
     }
 
+    int64_t content_length = esp_http_client_get_content_length(stream->client);
+    bool chunked = esp_http_client_is_chunked_response(stream->client);
+    if (response != NULL) {
+        response->content_length = content_length;
+        response->chunked = chunked;
+    }
     int status = response != NULL ? response->status_code :
                                     esp_http_client_get_status_code(stream->client);
     if (!server_comm_http_status_is_success(status)) {
@@ -1135,6 +1153,9 @@ esp_err_t server_comm_http_read_response(server_comm_raw_stream_t *stream,
     }
 
     if (status == 204) {
+        ESP_LOGI(TAG,
+                 "response read done content_length=0 chunked=%d total_read=0 complete=1 empty_read_count=0 first_byte_ms=0 last_byte_ms=0",
+                 chunked ? 1 : 0);
         return ESP_OK;
     }
 
@@ -1149,12 +1170,18 @@ esp_err_t server_comm_http_read_response(server_comm_raw_stream_t *stream,
 
     size_t total_read = 0;
     int empty_reads = 0;
+    int64_t first_byte_ms = 0;
+    int64_t last_byte_ms = 0;
+    bool complete = server_comm_stream_response_complete(stream,
+                                                         content_length,
+                                                         chunked,
+                                                         total_read);
     if (stream->read_timeout_ms > 0) {
         (void)esp_http_client_set_timeout_ms(stream->client,
                                              (int)stream->read_timeout_ms);
     }
 
-    while (!server_comm_stream_response_complete(stream, total_read)) {
+    while (!complete) {
         if (stream->abort_requested || !gateway_link_is_ready()) {
             heap_caps_free(read_buf);
             gateway_link_record_http_result(ESP_ERR_INVALID_STATE,
@@ -1164,8 +1191,14 @@ esp_err_t server_comm_http_read_response(server_comm_raw_stream_t *stream,
         }
         if (server_comm_stream_total_timeout_expired(stream)) {
             ESP_LOGE(TAG,
-                     "response read total timeout total=%u timeout_ms=%u",
+                     "response read total timeout content_length=%lld chunked=%d total_read=%u complete=%d empty_read_count=%d first_byte_ms=%lld last_byte_ms=%lld timeout_ms=%u",
+                     (long long)content_length,
+                     chunked ? 1 : 0,
                      (unsigned int)total_read,
+                     complete ? 1 : 0,
+                     empty_reads,
+                     (long long)first_byte_ms,
+                     (long long)last_byte_ms,
                      (unsigned int)stream->total_timeout_ms);
             heap_caps_free(read_buf);
             gateway_link_record_http_result(ESP_ERR_TIMEOUT,
@@ -1181,9 +1214,14 @@ esp_err_t server_comm_http_read_response(server_comm_raw_stream_t *stream,
             empty_reads = 0;
             total_read += (size_t)read_len;
             stream->response_bytes += (size_t)read_len;
+            int64_t now_ms = server_comm_now_ms();
             if (stream->first_response_byte_ms == 0) {
-                stream->first_response_byte_ms = server_comm_now_ms();
+                stream->first_response_byte_ms = now_ms;
             }
+            if (first_byte_ms == 0) {
+                first_byte_ms = stream->first_response_byte_ms;
+            }
+            last_byte_ms = now_ms;
             if (on_data != NULL) {
                 ret = on_data(read_buf, (size_t)read_len, user_ctx);
                 if (ret != ESP_OK) {
@@ -1191,12 +1229,41 @@ esp_err_t server_comm_http_read_response(server_comm_raw_stream_t *stream,
                     return ret;
                 }
             }
+            complete = server_comm_stream_response_complete(stream,
+                                                            content_length,
+                                                            chunked,
+                                                            total_read);
             continue;
+        }
+
+        if (server_comm_unknown_length_response_closed(read_len,
+                                                       content_length,
+                                                       chunked,
+                                                       total_read)) {
+            complete = true;
+            break;
+        }
+
+        complete = server_comm_stream_response_complete(stream,
+                                                        content_length,
+                                                        chunked,
+                                                        total_read);
+        if (complete) {
+            break;
         }
 
         if (read_len < 0 && read_len != -ESP_ERR_HTTP_EAGAIN) {
             if (!gateway_link_in_reconnect_mode()) {
-                ESP_LOGE(TAG, "response read failed read_len=%d", read_len);
+                ESP_LOGE(TAG,
+                         "response read failed read_len=%d content_length=%lld chunked=%d total_read=%u complete=%d empty_read_count=%d first_byte_ms=%lld last_byte_ms=%lld",
+                         read_len,
+                         (long long)content_length,
+                         chunked ? 1 : 0,
+                         (unsigned int)total_read,
+                         complete ? 1 : 0,
+                         empty_reads,
+                         (long long)first_byte_ms,
+                         (long long)last_byte_ms);
             }
             heap_caps_free(read_buf);
             esp_err_t read_ret = stream->detailed_errors ?
@@ -1214,17 +1281,17 @@ esp_err_t server_comm_http_read_response(server_comm_raw_stream_t *stream,
                                             server_comm_request_is_reconnect_for_current_task());
         }
 
-        if (server_comm_stream_response_complete(stream, total_read)) {
-            break;
-        }
-
         empty_reads++;
         if (empty_reads >= SERVER_COMM_HTTP_MAX_EMPTY_READS) {
             ESP_LOGE(TAG,
-                     "response read timeout total=%u content_length=%lld complete=%d",
+                     "response read timeout content_length=%lld chunked=%d total_read=%u complete=%d empty_read_count=%d first_byte_ms=%lld last_byte_ms=%lld",
+                     (long long)content_length,
+                     chunked ? 1 : 0,
                      (unsigned int)total_read,
-                     (long long)esp_http_client_get_content_length(stream->client),
-                     esp_http_client_is_complete_data_received(stream->client) ? 1 : 0);
+                     complete ? 1 : 0,
+                     empty_reads,
+                     (long long)first_byte_ms,
+                     (long long)last_byte_ms);
             heap_caps_free(read_buf);
             gateway_link_record_http_result(ESP_ERR_TIMEOUT,
                                             server_comm_voice_request_is_active_for_current_task(),
@@ -1237,6 +1304,15 @@ esp_err_t server_comm_http_read_response(server_comm_raw_stream_t *stream,
     if (response != NULL) {
         response->body_len = total_read;
     }
+    ESP_LOGI(TAG,
+             "response read done content_length=%lld chunked=%d total_read=%u complete=%d empty_read_count=%d first_byte_ms=%lld last_byte_ms=%lld",
+             (long long)content_length,
+             chunked ? 1 : 0,
+             (unsigned int)total_read,
+             complete ? 1 : 0,
+             empty_reads,
+             (long long)first_byte_ms,
+             (long long)last_byte_ms);
     heap_caps_free(read_buf);
     gateway_link_record_http_result(ESP_OK,
                                     server_comm_voice_request_is_active_for_current_task(),

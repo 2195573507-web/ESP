@@ -3,8 +3,8 @@
  * @brief C5 终端 BME690 相对空气质量计算。
  *
  * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用），只根据 bme690_read() 的本地读数
- * 计算相对空气质量分数和 baseline。它不读取硬件、不上传数据、不改变 /local/v1/sensor
- * 的字段顺序。
+ * 计算相对空气质量分数和 baseline。它不读取硬件、不上传数据、不改变统一设备流
+ * sensor 帧的 v1/v2/v3 映射。
  */
 
 #include "bme_air_quality.h"

@@ -5,8 +5,9 @@
  * @file bme_sensor_service.h
  * @brief C5 终端 BME690 后台服务接口。
  *
- * app_orchestrator_start() 在 WiFi/系统服务后启动本模块；voice_chain 在语音 turn 前后
- * 通过 pause/wait_paused/resume 协调网络和 heap。BME_SENSOR_DEVICE_ID 是传感模块
+ * app_orchestrator_start() 在 WiFi/系统服务后注册本模块；C5 scheduler 驱动单次
+ * tick，voice_chain 在语音 turn 前后通过 pause/wait_paused/resume 协调网络和 heap。
+ * BME_SENSOR_DEVICE_ID 是传感模块
  * sensor_id，不是整机 device_id。
  */
 
@@ -17,15 +18,6 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif
-
-/* BME690 后台服务配置：语音独占时会暂停本服务，避免上传占用 heap/网络。 */
-#ifndef BME_SENSOR_TASK_STACK
-#define BME_SENSOR_TASK_STACK 6144U // BME 后台任务栈，单位字节。
-#endif
-
-#ifndef BME_SENSOR_TASK_PRIORITY
-#define BME_SENSOR_TASK_PRIORITY 2U // BME 后台任务优先级，低于语音链路。
 #endif
 
 #ifndef BME_SENSOR_READ_UPLOAD_PERIOD_MS
@@ -49,15 +41,23 @@ extern "C" {
 #endif
 
 /**
- * @brief 启动 BME690 后台读取/上传服务。
+ * @brief 注册 BME690 scheduler 驱动读取/上传服务。
  *
  * 调用位置：app_orchestrator_start()。
  * 调用时机：WiFi 稳定、system_service 初始化后调用一次；重复调用不会重复创建任务。
  * 输入参数：无。
- * @return ESP_OK 表示任务已启动或已在运行；任务创建失败返回 ESP_ERR_NO_MEM。
+ * @return ESP_OK 表示服务已注册或已在运行。
  * 失败处理：orchestrator 记录错误，语音和命令链路仍按各自配置继续。
  */
 esp_err_t bme_sensor_service_start(void);
+
+/**
+ * @brief Scheduler 调用：执行一次 BME690 read/quality/update/upload。
+ *
+ * 调用前和函数内部都会经过 c5_should_run(C5_TASK_TYPE_BME_SENSOR) gate；函数不做
+ * 固定周期 delay，也不创建独立 service loop。
+ */
+esp_err_t bme_sensor_service_tick(void);
 
 /**
  * @brief 暂停 BME690 后台读取/上传。

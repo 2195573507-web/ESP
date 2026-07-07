@@ -4,6 +4,13 @@
 const fs = require('fs');
 const http = require('http');
 const { URL } = require('url');
+const {
+  annotateSampleWithTelemetry,
+  buildTelemetryUiModel,
+  DEFAULT_ALIGNMENT_WINDOW_MS,
+  LINK_IDS,
+  normalizeWindowMs,
+} = require('./src/csiTelemetryEngine');
 const { clampHistoryLimit, createHistoryLimits } = require('./src/historyLimits');
 const { createToolResolver } = require('./src/toolResolver');
 
@@ -135,6 +142,12 @@ function normalizeBoolean(value) {
 
 function normalizeSampleFields(rawSample, sourceFormat, rawLine) {
   const sample = { ...rawSample };
+  const metrics = sample.metrics && typeof sample.metrics === 'object' && !Array.isArray(sample.metrics)
+    ? sample.metrics
+    : {};
+  const features = sample.features && typeof sample.features === 'object' && !Array.isArray(sample.features)
+    ? sample.features
+    : {};
   const state = normalizeOccupancyState(sample.state ?? sample.occupancy ?? sample.presence_state);
   const motionState = String(sample.motion_state ?? sample.motion ?? '').trim().toLowerCase();
 
@@ -190,6 +203,21 @@ function normalizeSampleFields(rawSample, sourceFormat, rawLine) {
   if (sample.motion_score === undefined && sample.presence_score !== undefined) {
     sample.motion_score = sample.presence_score;
   }
+  if (sample.motion_score === undefined && features.motion_score_local !== undefined) {
+    sample.motion_score = features.motion_score_local;
+  }
+  if (sample.frame_energy === undefined && metrics.frame_energy !== undefined) {
+    sample.frame_energy = metrics.frame_energy;
+  }
+  if (sample.variance === undefined && metrics.variance !== undefined) {
+    sample.variance = metrics.variance;
+  }
+  if (sample.rssi === undefined && metrics.rssi !== undefined) {
+    sample.rssi = metrics.rssi;
+  }
+  if (sample.quality === undefined && features.quality !== undefined) {
+    sample.quality = features.quality;
+  }
   if (sample.updated_at_ms === undefined && sample.esp_time_ms !== undefined) {
     sample.updated_at_ms = sample.esp_time_ms;
   }
@@ -206,12 +234,12 @@ function normalizeSampleFields(rawSample, sourceFormat, rawLine) {
 function recordSample(rawSample, sourceFormat, rawLine) {
   const now = Date.now();
   const normalized = normalizeSampleFields(rawSample, sourceFormat, rawLine);
-  const sample = {
+  const sample = annotateSampleWithTelemetry({
     ...normalized,
     device_id: normalizeDeviceId(normalized),
     server_time_ms: now,
     received_at_iso: new Date(now).toISOString(),
-  };
+  });
 
   globalHistory.push(sample);
   trimToMax(globalHistory, MAX_HISTORY);
@@ -265,7 +293,11 @@ function parseKeyValuePayload(payload) {
 
 function findMarkerPayload(line) {
   const markers = [
+    { marker: 'CSI_FUSION_TELEMETRY', sourceFormat: 'CSI_FUSION_TELEMETRY' },
+    { marker: 'CSI_C5_FEATURE', sourceFormat: 'CSI_C5_FEATURE' },
+    { marker: 'CSI_CANONICAL_EVENT', sourceFormat: 'CSI_CANONICAL_EVENT' },
     { marker: 'csi_service: csi summary', sourceFormat: 'csi summary' },
+    { marker: 'csi feature', sourceFormat: 'csi feature' },
     { marker: 'csi summary', sourceFormat: 'csi summary' },
     { marker: 'CSI_SAMPLE', sourceFormat: 'CSI_SAMPLE' },
     { marker: 'CSI:', sourceFormat: 'CSI' },
@@ -592,17 +624,40 @@ function getHistory(deviceId, limit) {
   return source.slice(-safeLimit);
 }
 
+function getTelemetryPayload(url) {
+  const deviceId = url.searchParams.get('device_id') || '';
+  const limit = url.searchParams.get('limit') || String(DEFAULT_LIMIT);
+  const windowMs = normalizeWindowMs(url.searchParams.get('window_ms'));
+  const minDwellMs = toFiniteNumber(url.searchParams.get('min_dwell_ms'));
+  const history = getHistory(deviceId, limit);
+
+  return buildTelemetryUiModel(history, {
+    windowMs,
+    minDwellMs: minDwellMs !== null ? minDwellMs : undefined,
+  });
+}
+
+function latestTelemetryModel(limit = DEFAULT_LIMIT) {
+  return buildTelemetryUiModel(getHistory('', limit), {
+    windowMs: DEFAULT_ALIGNMENT_WINDOW_MS,
+  });
+}
+
 function getLatestPayload() {
   const latestEntries = Array.from(latestByDevice.entries()).sort(([a], [b]) => a.localeCompare(b));
   const latest = Object.fromEntries(latestEntries);
   const latestSample = globalHistory[globalHistory.length - 1] || null;
+  const telemetry = latestTelemetryModel(Math.min(DEFAULT_LIMIT, 1000));
   return {
     ok: true,
     count: globalHistory.length,
     devices: latestEntries.map(([device]) => device),
+    links: LINK_IDS,
     latest,
     latest_sample: latestSample,
     sample: latestSample,
+    fusion_status: telemetry.fusion_status,
+    telemetry,
     status: latestSample
       ? {
         device_id: latestSample.device_id || '',
@@ -621,34 +676,89 @@ function getLatestPayload() {
 
 function createMockSample() {
   const now = Date.now();
-  const phase = (globalHistory.length % 18) / 18;
-  const motionScore = Number((0.45 + Math.sin(phase * Math.PI * 2) * 0.35 + Math.random() * 0.08).toFixed(3));
-  const occupied = motionScore >= 0.52;
+  const tickId = Math.round(now / 100);
+  const phase = (globalHistory.length % 36) / 36;
+  const wave = (offset) => Math.max(0, Math.min(1, 0.45 + Math.sin((phase + offset) * Math.PI * 2) * 0.34 + Math.random() * 0.06));
+  const linkStates = {};
+  const linkOffsets = {
+    S3_TO_C51: 0,
+    S3_TO_C52: 0.14,
+    C51_TO_C52: 0.31,
+    C52_TO_C51: 0.48,
+  };
+
+  for (const linkId of LINK_IDS) {
+    const motionScore = Number(wave(linkOffsets[linkId] || 0).toFixed(3));
+    const energy = Number((8 + motionScore * 24 + Math.random() * 3).toFixed(3));
+    const variance = Number((0.03 + motionScore * 0.28 + Math.random() * 0.02).toFixed(5));
+    linkStates[linkId] = {
+      link_id: linkId,
+      motion_score: motionScore,
+      frame_energy: energy,
+      variance,
+      quality: Number((0.68 + Math.random() * 0.27).toFixed(3)),
+      rssi: Math.round(-36 - Math.random() * 18),
+      state: motionScore >= 0.62 ? 'MOTION' : motionScore >= 0.34 ? 'HOLD' : 'IDLE',
+      frame_seq: globalHistory.length + 1,
+      timestamp_ms: now,
+    };
+  }
+
+  const scores = LINK_IDS.map((linkId) => linkStates[linkId].motion_score);
+  const motionScore = scores.reduce((sum, value) => sum + value, 0) / scores.length;
+  const fusedState = motionScore >= 0.62 ? 'MOTION' : motionScore >= 0.34 ? 'HOLD' : 'IDLE';
   return {
-    schema: 1,
-    device_id: DEFAULT_DEVICE_ID,
-    room_id: 'local-lab',
-    state: occupied ? 'occupied' : 'vacant',
-    occupancy: occupied ? 'occupied' : 'vacant',
-    motion_state: occupied ? 'motion' : 'idle',
-    motion_score: Math.max(0, Math.min(1, motionScore)),
-    variance: Number((0.11 + Math.random() * 0.48).toFixed(4)),
-    amplitude_variance: Number((0.11 + Math.random() * 0.48).toFixed(4)),
-    amplitude: Number((18 + Math.random() * 12).toFixed(2)),
-    cv: Number((0.01 + Math.random() * 0.1).toFixed(4)),
-    rssi: Math.round(-34 - Math.random() * 16),
-    noise_floor: Math.round(-92 + Math.random() * 8),
-    packet_count: 40 + (globalHistory.length % 80),
-    sample_count: 40 + (globalHistory.length % 80),
-    updated_at_ms: now,
+    type: 'csi_fusion',
+    schema_version: 'mock-csi-fusion-v1',
+    device_id: 'S3',
+    gateway_id: 'S3',
+    tick_id: tickId,
+    timestamp_ms: now,
+    link_states: linkStates,
+    fused_state: {
+      state: fusedState,
+      motion_score: Number(motionScore.toFixed(3)),
+      confidence: Number((0.72 + Math.random() * 0.2).toFixed(3)),
+    },
   };
 }
 
 function jsonToCsv(rows) {
-  if (!rows.length) {
-    return 'received_at_iso,device_id,room_id,state,motion_state,motion_score,rssi,noise_floor,packet_count,variance,amplitude_variance,cv,source_format\n';
-  }
+  const telemetry = buildTelemetryUiModel(rows);
+  const telemetryRows = telemetry.telemetry_events || [];
   const preferred = [
+    'timestamp',
+    'link_id',
+    'source',
+    'target',
+    'motion_score',
+    'energy',
+    'variance',
+    'quality',
+    'rssi',
+    'state',
+    'confidence',
+    'tick_id',
+    'frame_seq',
+    'source_format',
+    'schema_path',
+    'device_id',
+    'trace_id',
+  ];
+  const escapeCsv = (value) => {
+    if (value === undefined || value === null) {
+      return '';
+    }
+    const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  };
+  if (telemetryRows.length) {
+    return `${preferred.join(',')}\n${telemetryRows.map((row) => preferred.map((header) => escapeCsv(row[header])).join(',')).join('\n')}\n`;
+  }
+  if (!rows.length) {
+    return `${preferred.join(',')}\n`;
+  }
+  const fallbackPreferred = [
     'received_at_iso',
     'device_id',
     'room_id',
@@ -668,7 +778,7 @@ function jsonToCsv(rows) {
     'updated_at_ms',
     'source_format',
   ];
-  const seen = new Set(preferred);
+  const seen = new Set(fallbackPreferred);
   rows.forEach((row) => {
     Object.keys(row).forEach((key) => {
       if (!seen.has(key) && key !== 'raw_line') {
@@ -677,13 +787,6 @@ function jsonToCsv(rows) {
     });
   });
   const headers = Array.from(seen);
-  const escapeCsv = (value) => {
-    if (value === undefined || value === null) {
-      return '';
-    }
-    const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
-    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-  };
   return `${headers.join(',')}\n${rows.map((row) => headers.map((header) => escapeCsv(row[header])).join(',')).join('\n')}\n`;
 }
 
@@ -808,6 +911,11 @@ async function handleApi(req, res, url) {
       count: globalHistory.length,
       history: getHistory(deviceId, limit),
     });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/csi/telemetry') {
+    sendJson(res, 200, getTelemetryPayload(url));
     return;
   }
 

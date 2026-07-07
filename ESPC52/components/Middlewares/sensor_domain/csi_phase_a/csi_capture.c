@@ -1,9 +1,9 @@
 /**
  * @file csi_capture.c
- * @brief C5 CSI I/Q-to-amplitude conversion.
+ * @brief C5 CSI I/Q 到幅值帧转换。
  *
- * This module does not keep raw CSI. It converts the caller-owned I/Q buffer into
- * an amplitude-only frame bounded by CSI_PHASE_A_MAX_RAW_SUBCARRIERS.
+ * 本模块不保存 raw CSI，只把调用方持有的 I/Q buffer 转成 amplitude-only frame，
+ * 输出长度受 CSI_PHASE_A_MAX_RAW_SUBCARRIERS 限制。
  */
 
 #include "csi_capture.h"

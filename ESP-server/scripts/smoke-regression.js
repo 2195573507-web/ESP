@@ -2456,16 +2456,45 @@ async function run() {
         assert.equal(result.body.data.csi.available, false);
 
         const csiUpdatedAt = Date.now() - 5;
-        const csiMotionEnvelope = {
+        const canonicalCsiEvent = {
+            schema_version: "v2",
+            trace_id: "s3-csi-smoke-201",
+            tick_id: 201,
+            fused_state: "MOTION",
+            confidence: 0.73,
+            links: ["link_0"],
+            timestamp_ms: csiUpdatedAt
+        };
+        result = await request(baseUrl, "POST", "/kernel/csi_event", canonicalCsiEvent);
+        assert.equal(result.response.status, 202);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.data.device_id, "sensair_s3_gateway_01");
+        assert.equal(result.body.data.payload_type, "csi.motion");
+        assert.equal(result.body.data.link_id, "fused");
+        assert.equal(result.body.data.state, "MOTION");
+        assert.equal(result.body.data.frame_energy, null);
+        assert.equal(result.body.data.variance, null);
+        assert.equal(result.body.data.motion_score, 0.73);
+
+        result = await request(baseUrl, "POST", "/kernel/csi_event", {
+            ...canonicalCsiEvent,
+            trace_id: "s3-csi-smoke-202",
+            tick_id: 202,
+            fused_state: "HOLD",
+            confidence: 0.11,
+            links: ["link_0"],
+            timestamp_ms: csiUpdatedAt + 1
+        });
+        assert.equal(result.response.status, 202);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.data.device_id, "sensair_s3_gateway_01");
+        assert.equal(result.body.data.state, "HOLD");
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
             schema_version: 1,
             device_id: "sensair_s3_gateway_01",
-            device_type: "S3",
-            request_seq: 201,
-            esp_uptime_ms: 988001,
             payload_type: "csi.motion",
-            room_id: "living_room",
             payload: {
-                device_id: "sensair_s3_gateway_01",
                 link_id: "fused",
                 state: "MOTION",
                 frame_energy: 12.75,
@@ -2474,35 +2503,9 @@ async function run() {
                 motion_score: 0.73,
                 timestamp: csiUpdatedAt
             }
-        };
-        result = await request(baseUrl, "POST", "/api/device/v1/ingest", csiMotionEnvelope);
-        assert.equal(result.response.status, 202);
-        assert.equal(result.body.ok, true);
-        assert.equal(result.body.data.device_id, "sensair_s3_gateway_01");
-        assert.equal(result.body.data.payload_type, "csi.motion");
-        assert.equal(result.body.data.link_id, "fused");
-        assert.equal(result.body.data.state, "MOTION");
-        assert.equal(result.body.data.frame_energy, 12.75);
-        assert.equal(result.body.data.variance, 0.0182);
-        assert.equal(result.body.data.motion_score, 0.73);
-
-        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
-            ...csiMotionEnvelope,
-            request_seq: 202,
-            payload: {
-                ...csiMotionEnvelope.payload,
-                state: "HOLD",
-                frame_energy: 5.25,
-                variance: 0.0021,
-                rssi: -62,
-                motion_score: 0.11,
-                timestamp: csiUpdatedAt + 1
-            }
         });
-        assert.equal(result.response.status, 202);
-        assert.equal(result.body.ok, true);
-        assert.equal(result.body.data.device_id, "sensair_s3_gateway_01");
-        assert.equal(result.body.data.state, "HOLD");
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.error.code, "UNSUPPORTED_PAYLOAD_TYPE");
 
         sensorRows = await dbAll(dbPath, "SELECT * FROM sensor_records WHERE payload_type='csi.motion'");
         assert.equal(sensorRows.length, 0);
@@ -2511,9 +2514,9 @@ async function run() {
         assert.equal(csiRows.length, 2);
         assert.equal(csiRows[0].state, "MOTION");
         assert.equal(csiRows[0].link_id, "fused");
-        assert.equal(csiRows[0].frame_energy, 12.75);
+        assert.equal(csiRows[0].frame_energy, null);
         assert.equal(csiRows[1].state, "HOLD");
-        assert.ok(csiRows[0].raw_json.includes("\"csi.motion\""));
+        assert.ok(csiRows[0].raw_json.includes("\"schema_version\":\"v2\""));
 
         result = await request(baseUrl, "GET", `/api/device/v1/modules/status?${new URLSearchParams({
             device_id: "sensair_s3_gateway_01"
@@ -2534,7 +2537,7 @@ async function run() {
         assert.equal(result.body.data.csi.state, "HOLD");
         assert.equal(result.body.data.csi.available, true);
         assert.equal(result.body.data.csi.motion_score, 0.11);
-        assert.equal(result.body.data.csi.frame_energy, 5.25);
+        assert.equal(result.body.data.csi.frame_energy, null);
 
         result = await request(baseUrl, "GET", "/api/dashboard/v1/csi/history?limit=5");
         assert.equal(result.response.status, 200);
@@ -2544,43 +2547,35 @@ async function run() {
         assert.equal(result.body.data.events[1].state, "HOLD");
         assert.equal(result.body.data.events[1].motion_score, 0.11);
 
-        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
-            ...csiMotionEnvelope,
-            request_seq: 203,
-            payload: {
-                ...csiMotionEnvelope.payload,
-                occupancy: {
-                    state: "occupied"
-                }
-            }
+        result = await request(baseUrl, "POST", "/kernel/csi_event", {
+            ...canonicalCsiEvent,
+            trace_id: "s3-csi-smoke-device-specific",
+            tick_id: 203,
+            device_id: "C51"
         });
         assert.equal(result.response.status, 400);
         assert.equal(result.body.ok, false);
-        assert.equal(result.body.error.code, "LEGACY_CSI_MODEL_NOT_ACCEPTED");
+        assert.equal(result.body.error.code, "INVALID_CANONICAL_CSI_EVENT");
 
-        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
-            ...csiMotionEnvelope,
-            request_seq: 204,
-            payload: {
-                ...csiMotionEnvelope.payload,
-                raw_csi: [1, 2, 3]
-            }
+        result = await request(baseUrl, "POST", "/kernel/csi_event", {
+            ...canonicalCsiEvent,
+            trace_id: "s3-csi-smoke-raw",
+            tick_id: 204,
+            links: ["C51"]
         });
         assert.equal(result.response.status, 400);
         assert.equal(result.body.ok, false);
-        assert.equal(result.body.error.code, "RAW_CSI_NOT_ACCEPTED");
+        assert.equal(result.body.error.code, "INVALID_CSI_LINK");
 
-        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
-            ...csiMotionEnvelope,
-            request_seq: 205,
-            payload: {
-                ...csiMotionEnvelope.payload,
-                state: "occupied"
-            }
+        result = await request(baseUrl, "POST", "/kernel/csi_event", {
+            ...canonicalCsiEvent,
+            trace_id: "s3-csi-smoke-state",
+            tick_id: 205,
+            fused_state: "occupied"
         });
         assert.equal(result.response.status, 400);
         assert.equal(result.body.ok, false);
-        assert.equal(result.body.error.code, "INVALID_CSI_STATE");
+        assert.equal(result.body.error.code, "INVALID_FUSED_STATE");
 
         result = await request(baseUrl, "GET", `/api/device/v1/sensors/latest?${new URLSearchParams({
             device_id: bmeDeviceId
@@ -2767,17 +2762,6 @@ async function run() {
                 last_error: "",
                 timestamp: Date.now()
             },
-            csi: {
-                device_id: "sensair_s3_gateway_01",
-                link_id: "fused",
-                state: "IDLE",
-                available: true,
-                frame_energy: 3.5,
-                variance: 0.004,
-                rssi: -61,
-                motion_score: 0.21,
-                timestamp: Date.now() + 1000
-            },
             devices: [{
                 device_id: bmeDeviceId,
                 local_id: 1,
@@ -2922,7 +2906,7 @@ async function run() {
         assert.equal(result.body.data.csi.state, "HOLD");
         assert.equal(result.body.data.csi.available, true);
         assert.equal(result.body.data.csi.motion_score, 0.11);
-        assert.equal(result.body.data.csi.frame_energy, 5.25);
+        assert.equal(result.body.data.csi.frame_energy, null);
         assert.equal(result.body.data.devices[0].appliances.air_conditioner.source, "mock");
         assert.equal(result.body.data.devices[0].appliances.fan.mock, true);
         assert.equal(result.body.data.home_summary.online_device_count, 1);

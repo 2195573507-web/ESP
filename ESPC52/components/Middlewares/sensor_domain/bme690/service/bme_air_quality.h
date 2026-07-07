@@ -5,8 +5,8 @@
  * @file bme_air_quality.h
  * @brief C5 终端 BME690 空气质量计算接口。
  *
- * BME service 在每次 bme690_read() 成功后调用本模块，输出结果随后由 bme_server_client
- * 放入固定顺序的轻量 v 数组。
+ * BME service 在每次 bme690_read() 成功后调用本模块，输出结果随后由
+ * bme_server_client 放入统一设备流 sensor 帧的 v3。
  */
 
 #include <stdbool.h>

@@ -13,7 +13,7 @@ const {
     readModuleStatuses
 } = require("../services/deviceStatusService");
 const {
-    ingestCsiMotion
+    ingestCanonicalCsiEventV2
 } = require("../services/csiMotionService");
 const {
     ingestBme690
@@ -112,13 +112,13 @@ function createDeviceRouter(options) {
     router.post("/api/device/v1/ingest", gatewayOnly, async (req, res) => {
         const serverRecvMs = Date.now();
         const payloadType = trimText(req.body?.payload_type, 80);
-        if (payloadType !== "sensor.bme690" && payloadType !== "csi.motion") {
+        if (payloadType !== "sensor.bme690") {
             return res.status(400).json(makeDeviceEnvelope({
                 ok: false,
                 serverRecvMs,
                 error: {
                     code: "UNSUPPORTED_PAYLOAD_TYPE",
-                    message: "payload_type must be sensor.bme690 or csi.motion"
+                    message: "payload_type must be sensor.bme690; CSI uses /kernel/csi_event"
                 }
             }));
         }
@@ -134,8 +134,7 @@ function createDeviceRouter(options) {
         }
 
         try {
-            const ingest = payloadType === "csi.motion" ? ingestCsiMotion : ingestBme690;
-            const result = await ingest(dbRun, dbAll, req.body, {
+            const result = await ingestBme690(dbRun, dbAll, req.body, {
                 headers: req.headers,
                 query: req.query,
                 serverRecvMs,
@@ -177,6 +176,62 @@ function createDeviceRouter(options) {
                 error: {
                     code: "DEVICE_INGEST_FAILED",
                     message: "device ingest failed"
+                }
+            }));
+        }
+    });
+
+    router.post("/kernel/csi_event", gatewayOnly, async (req, res) => {
+        const serverRecvMs = Date.now();
+        const gatewayId = req.gatewayAuth?.gateway_id || "";
+        const boundGateway = await requireBoundDevice(req, res, gatewayContext, {
+            source: "kernel.csi_event",
+            deviceId: gatewayId,
+            allowNewBinding: true,
+            serverRecvMs
+        });
+        if (!boundGateway.ok) {
+            return boundGateway.response;
+        }
+
+        try {
+            const result = await ingestCanonicalCsiEventV2(dbRun, dbAll, req.body, {
+                headers: req.headers,
+                query: req.query,
+                serverRecvMs,
+                trustedGatewayId: boundGateway.gateway_id
+            });
+            if (!result.ok) {
+                logger.warn(
+                    `[kernel-csi] dropped invalid canonical event code=${result.code || "INVALID_PAYLOAD"} gateway_id=${boundGateway.gateway_id}`
+                );
+                return res.status(result.status || 400).json(makeDeviceEnvelope({
+                    ok: false,
+                    serverRecvMs,
+                    error: {
+                        code: result.code || "INVALID_PAYLOAD",
+                        message: result.error || "invalid canonical csi event"
+                    }
+                }));
+            }
+
+            logger.log(
+                `[kernel-csi] accepted trace_id=${result.data.trace_id} tick_id=${result.data.tick_id} state=${result.data.state} gateway_id=${boundGateway.gateway_id}`
+            );
+
+            return res.status(result.status).json(makeDeviceEnvelope({
+                ok: true,
+                serverRecvMs,
+                data: result.data
+            }));
+        } catch (error) {
+            logger.error(`[kernel-csi] ingest failed ${error?.message || error}`);
+            return res.status(500).json(makeDeviceEnvelope({
+                ok: false,
+                serverRecvMs,
+                error: {
+                    code: "CANONICAL_CSI_EVENT_FAILED",
+                    message: "canonical csi event ingest failed"
                 }
             }));
         }

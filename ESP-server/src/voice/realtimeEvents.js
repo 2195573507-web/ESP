@@ -26,6 +26,43 @@ function readRealtimeEventName(payload) {
         : (typeof payload?.event === "string" ? payload.event : "");
 }
 
+const ASR_IGNORED_EVENT_NAMES = new Set([
+    "session.updated",
+    "input_audio_buffer.committed",
+    "input_audio_buffer.cleared",
+    "response.created",
+    "response.done"
+]);
+
+function isAsrTranscriptionCompletedEvent(lowerName) {
+    return lowerName === "conversation.item.input_audio_transcription.completed" ||
+        lowerName === "input_audio_transcription.completed" ||
+        lowerName === "transcription.completed" ||
+        lowerName === "transcription.done" ||
+        (lowerName.includes("transcription") && (
+            lowerName.endsWith(".completed") ||
+            lowerName.endsWith(".done")
+        ));
+}
+
+function isAckLikeEvent(lowerName) {
+    return lowerName.includes("ack") ||
+        lowerName.endsWith(".committed") ||
+        lowerName.endsWith(".cleared");
+}
+
+function isIgnoredAsrRealtimeEvent(lowerName, hasTranscriptOrText) {
+    if (ASR_IGNORED_EVENT_NAMES.has(lowerName)) {
+        return true;
+    }
+
+    return !hasTranscriptOrText && (
+        lowerName.includes("completed") ||
+        lowerName.endsWith(".done") ||
+        isAckLikeEvent(lowerName)
+    );
+}
+
 function extractRealtimeErrorMessage(payload) {
     const errorValue = payload?.error;
     if (typeof errorValue === "string" && errorValue.trim()) {
@@ -43,31 +80,36 @@ function parseAsrRealtimeEvent(message) {
     const payload = parseRealtimeJsonMessage(message, "asr");
     const eventName = readRealtimeEventName(payload);
     const lowerName = eventName.toLowerCase();
-    const text = findStringField(payload, [
-        "text",
-        "asr_text",
-        "transcript",
-        "utterance",
-        "result_text",
-        "final_text",
-        "content",
-        "delta"
-    ]);
+    const transcript = findStringField(payload, ["transcript"]);
+    const directText = findStringField(payload, ["text"]);
+    const transcriptOrText = transcript || directText;
+    const ignored = isIgnoredAsrRealtimeEvent(lowerName, Boolean(transcriptOrText));
+    const text = ignored
+        ? ""
+        : (transcriptOrText || findStringField(payload, [
+            "asr_text",
+            "utterance",
+            "result_text",
+            "final_text",
+            "content",
+            "delta"
+        ]));
+    const isTranscriptionCompleted = isAsrTranscriptionCompletedEvent(lowerName);
 
     return {
         eventName,
         text,
+        hasTranscript: Boolean(transcript),
+        hasText: Boolean(directText),
         isError: lowerName.includes("error") || Boolean(payload?.error),
         errorMessage: extractRealtimeErrorMessage(payload),
-        isFinal: lowerName.includes("final") ||
-            lowerName.includes("completed") ||
-            lowerName.includes("conversation.item.input_audio_transcription.completed") ||
-            lowerName.includes("transcription.done") ||
-            payload?.final === true,
-        isPartial: lowerName.includes("partial") ||
+        isFinal: !ignored && isTranscriptionCompleted && Boolean(transcriptOrText),
+        isPartial: !ignored && (
+            lowerName.includes("partial") ||
             lowerName.includes("conversation.item.input_audio_transcription.result") ||
             lowerName.includes("delta") ||
             lowerName.includes("transcription.delta")
+        )
     };
 }
 

@@ -9,7 +9,8 @@
  * 路径、类型码、错误码、默认身份和音频格式，不实现解析、转发或业务处理。
  *
  * 协议边界：
- * - C5 <-> S3 使用 /local/v1 和轻量 JSON 字段 p/id/t/u/q/v/cid/c/a/ok/e/cmds；
+ * - C5 -> S3 telemetry 使用 UDP/33434 或 /local/v1/stream 的扁平设备流 JSON；
+ * - C5 <-> S3 控制/语音使用 /local/v1 和轻量 JSON 字段 p/id/t/u/q/v/cid/c/a/ok/e/cmds；
  * - S3 的 protocol_adapter/server_client 负责两层协议转换和所有 Server 路径；
  * - C5 只保留 /local/v1 轻量边界，不直接构造 Server 完整 envelope。
  */
@@ -87,6 +88,20 @@ extern "C" {
 #define ESP111_PROTOCOL_LOCAL_JSON_ERROR "e"
 #define ESP111_PROTOCOL_LOCAL_JSON_COMMANDS "cmds"
 
+#define ESP111_PROTOCOL_DEVICE_STREAM_MAX_BYTES 128U
+#define ESP111_PROTOCOL_DEVICE_STREAM_UDP_PORT 33434U
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_TIMESTAMP "t"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_DEVICE_ID "did"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_TYPE "type"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_LINK_ID "lid"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_VALUE1 "v1"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_VALUE2 "v2"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_VALUE3 "v3"
+#define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_CSI "csi"
+#define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_SENSOR "sensor"
+#define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_STATUS "status"
+#define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_EVENT "event"
+
 #define ESP111_PROTOCOL_LOCAL_TYPE_REGISTER "reg"
 #define ESP111_PROTOCOL_LOCAL_TYPE_HEARTBEAT "hb"
 #define ESP111_PROTOCOL_LOCAL_TYPE_STATUS "st"
@@ -140,6 +155,7 @@ extern "C" {
 #define ESP111_PROTOCOL_ROUTE_STATUS "/local/v1/status"
 #define ESP111_PROTOCOL_ROUTE_SENSOR "/local/v1/sensor"
 #define ESP111_PROTOCOL_ROUTE_CSI_RESULT "/local/v1/csi/result"
+#define ESP111_PROTOCOL_ROUTE_DEVICE_STREAM "/local/v1/stream"
 #define ESP111_PROTOCOL_ROUTE_VOICE_TURN "/local/v1/voice/turn"
 #define ESP111_PROTOCOL_ROUTE_VOICE_PROMPT_CACHE "/local/v1/voice/prompt-cache"
 #define ESP111_PROTOCOL_ROUTE_WAKE_PROMPT_AUDIO "/local/v1/audio/wake-prompt"

@@ -76,34 +76,40 @@ static const char *find_json_value(const char *json, const char *key)
     return skip_json_spaces(value_start + 1);
 }
 
-static esp_err_t build_time_now_url(const char *server_time_url, char *url, size_t url_size)
+static esp_err_t build_time_now_endpoint(const char *server_time_url, char *endpoint, size_t endpoint_size)
 {
     if (server_time_url == NULL || server_time_url[0] == '\0' ||
-        url == NULL || url_size == 0) {
+        endpoint == NULL || endpoint_size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    const char *path = NULL;
     const char *scheme_end = strstr(server_time_url, "://");
-    if (scheme_end == NULL) {
-        return ESP_ERR_INVALID_ARG;
+    if (scheme_end != NULL) {
+        const char *host_start = scheme_end + 3;
+        path = strchr(host_start, '/');
+        if (path == NULL || path[0] == '\0') {
+            path = APP_TIME_SYNC_TIME_NOW_PATH;
+        }
+    } else {
+        path = server_time_url;
     }
 
-    const char *host_start = scheme_end + 3;
-    const char *path_start = strchr(host_start, '/');
-    size_t base_len = path_start != NULL ? (size_t)(path_start - server_time_url)
-                                         : strlen(server_time_url);
-
-    while (base_len > 0 && server_time_url[base_len - 1] == '/') {
-        base_len--;
+    size_t local_base_len = strlen(ESP111_PROTOCOL_LOCAL_BASE);
+    if (strncmp(path, ESP111_PROTOCOL_LOCAL_BASE, local_base_len) != 0 ||
+        (path[local_base_len] != '\0' &&
+         path[local_base_len] != '/' &&
+         path[local_base_len] != '?' &&
+         path[local_base_len] != '#')) {
+        return ESP_ERR_NOT_ALLOWED;
     }
 
-    size_t path_len = strlen(APP_TIME_SYNC_TIME_NOW_PATH);
-    if (base_len == 0 || base_len + path_len + 1 > url_size) {
+    size_t path_len = strlen(path);
+    if (path_len + 1 > endpoint_size) {
         return ESP_ERR_INVALID_SIZE;
     }
 
-    memcpy(url, server_time_url, base_len);
-    memcpy(url + base_len, APP_TIME_SYNC_TIME_NOW_PATH, path_len + 1);
+    memcpy(endpoint, path, path_len + 1);
 
     return ESP_OK;
 }
@@ -145,10 +151,10 @@ esp_err_t app_time_sync_once(const char *server_time_url)
         return ESP_ERR_INVALID_ARG;
     }
 
-    char *url = (char *)heap_caps_calloc(1, APP_TIME_SYNC_URL_BUFFER_SIZE, MALLOC_CAP_8BIT);
-    if (url == NULL) {
+    char *endpoint = (char *)heap_caps_calloc(1, APP_TIME_SYNC_URL_BUFFER_SIZE, MALLOC_CAP_8BIT);
+    if (endpoint == NULL) {
         ESP_LOGE(TAG,
-                 "time sync url buffer alloc failed bytes=%u",
+                 "time sync endpoint buffer alloc failed bytes=%u",
                  (unsigned int)APP_TIME_SYNC_URL_BUFFER_SIZE);
         return ESP_ERR_NO_MEM;
     }
@@ -158,21 +164,21 @@ esp_err_t app_time_sync_once(const char *server_time_url)
         ESP_LOGE(TAG,
                  "time sync response buffer alloc failed bytes=%u",
                  (unsigned int)APP_TIME_SYNC_RESPONSE_BUFFER_SIZE);
-        heap_caps_free(url);
+        heap_caps_free(endpoint);
         return ESP_ERR_NO_MEM;
     }
 
-    esp_err_t ret = build_time_now_url(server_time_url, url, APP_TIME_SYNC_URL_BUFFER_SIZE);
+    esp_err_t ret = build_time_now_endpoint(server_time_url, endpoint, APP_TIME_SYNC_URL_BUFFER_SIZE);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "invalid server time url: %s", server_time_url);
+        ESP_LOGE(TAG, "invalid local time endpoint: %s", server_time_url);
         goto cleanup;
     }
 
-    ESP_LOGI(TAG, "GET time url=%s", url);
+    ESP_LOGI(TAG, "GET time endpoint=%s", endpoint);
 
     int64_t t0_ms = app_time_sync_get_uptime_ms();
     server_comm_http_response_t response = {0};
-    ret = server_comm_http_get_json(url,
+    ret = server_comm_http_get_json(endpoint,
                                     APP_TIME_SYNC_HTTP_TIMEOUT_MS,
                                     body,
                                     APP_TIME_SYNC_RESPONSE_BUFFER_SIZE,
@@ -221,6 +227,6 @@ esp_err_t app_time_sync_once(const char *server_time_url)
 
 cleanup:
     heap_caps_free(body);
-    heap_caps_free(url);
+    heap_caps_free(endpoint);
     return ret;
 }

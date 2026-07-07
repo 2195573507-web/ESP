@@ -7,6 +7,7 @@
  * 不连接公网 Server，也不处理 /local/v1 HTTP；HTTP 请求由 server_comm_http 发起。
  */
 
+#include <stdint.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -27,6 +28,7 @@ static const char *TAG = "wifi_manager";
 static EventGroupHandle_t s_wifi_event_group;
 static TaskHandle_t s_wifi_reconnect_task_handle = NULL;
 static TickType_t s_wifi_connected_tick;
+static TickType_t s_wifi_disconnected_tick;
 
 enum {
     WIFI_CONNECTED_BIT = BIT0,
@@ -79,9 +81,22 @@ static esp_err_t connect_gateway_softap(void)
     return ESP_OK;
 }
 
+static uint32_t wifi_reconnect_backoff_ms(uint32_t failures)
+{
+    uint32_t delay_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+    if (failures > 0U) {
+        delay_ms += failures * WIFI_RECONNECT_BACKOFF_STEP_MS;
+    }
+    if (delay_ms > WIFI_RECONNECT_BACKOFF_MAX_MS) {
+        delay_ms = WIFI_RECONNECT_BACKOFF_MAX_MS;
+    }
+    return delay_ms;
+}
+
 static void wifi_reconnect_task(void *arg)
 {
     (void)arg;
+    uint32_t consecutive_failures = 0;
 
     while (1) {
         xEventGroupWaitBits(s_wifi_event_group,
@@ -91,11 +106,22 @@ static void wifi_reconnect_task(void *arg)
                             portMAX_DELAY);
 
         while (!wifi_is_connected()) {
+            uint32_t backoff_ms = wifi_reconnect_backoff_ms(consecutive_failures);
+            ESP_LOGI(TAG,
+                     "S3 gateway SoftAP reconnect backoff %u ms",
+                     (unsigned int)backoff_ms);
+            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+            if (wifi_is_connected()) {
+                break;
+            }
+
             xEventGroupClearBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT);
 
             esp_err_t ret = connect_gateway_softap();
             if (ret != ESP_OK) {
-                vTaskDelay(pdMS_TO_TICKS(WIFI_RESCAN_DELAY_MS));
+                if (consecutive_failures < UINT32_MAX) {
+                    consecutive_failures++;
+                }
                 continue;
             }
 
@@ -107,21 +133,23 @@ static void wifi_reconnect_task(void *arg)
 
             if (bits & WIFI_CONNECTED_BIT) {
                 ESP_LOGI(TAG, "S3 gateway SoftAP connected");
+                consecutive_failures = 0;
                 break;
             }
 
+            if (consecutive_failures < UINT32_MAX) {
+                consecutive_failures++;
+            }
             if (bits & WIFI_DISCONNECTED_BIT) {
                 ESP_LOGI(TAG,
-                         "S3 gateway SoftAP connection failed, retry in %d ms",
-                         WIFI_RESCAN_DELAY_MS);
+                         "S3 gateway SoftAP connection failed, failures=%u",
+                         (unsigned int)consecutive_failures);
             } else {
                 ESP_LOGI(TAG,
-                         "S3 gateway SoftAP connection timeout, retry in %d ms",
-                         WIFI_RESCAN_DELAY_MS);
+                         "S3 gateway SoftAP connection timeout, failures=%u",
+                         (unsigned int)consecutive_failures);
                 esp_wifi_disconnect();
             }
-
-            vTaskDelay(pdMS_TO_TICKS(WIFI_RESCAN_DELAY_MS));
         }
     }
 }
@@ -144,6 +172,7 @@ static void event_handler(void *arg,
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         xEventGroupSetBits(s_wifi_event_group, WIFI_RECONNECT_BIT | WIFI_DISCONNECTED_BIT);
         s_wifi_connected_tick = 0;
+        s_wifi_disconnected_tick = xTaskGetTickCount();
         gateway_link_notify_wifi_down();
         ESP_LOGI(TAG, "S3 gateway SoftAP disconnected: reason=%d", reason);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -151,6 +180,7 @@ static void event_handler(void *arg,
         ESP_LOGI(TAG, "Gateway SoftAP IP address: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupClearBits(s_wifi_event_group, WIFI_RECONNECT_BIT | WIFI_DISCONNECTED_BIT);
         s_wifi_connected_tick = xTaskGetTickCount();
+        s_wifi_disconnected_tick = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         gateway_link_notify_wifi_got_ip();
     }
@@ -239,6 +269,16 @@ bool wifi_is_stable(void)
 
     TickType_t connected_ticks = xTaskGetTickCount() - s_wifi_connected_tick;
     return connected_ticks >= pdMS_TO_TICKS(WIFI_STABLE_REQUIRED_MS);
+}
+
+bool wifi_is_down_stable(void)
+{
+    if (wifi_is_connected() || s_wifi_disconnected_tick == 0) {
+        return false;
+    }
+
+    TickType_t disconnected_ticks = xTaskGetTickCount() - s_wifi_disconnected_tick;
+    return disconnected_ticks >= pdMS_TO_TICKS(WIFI_DOWN_STABLE_REQUIRED_MS);
 }
 
 bool wifi_get_connected_ssid(char *ssid, size_t ssid_len)

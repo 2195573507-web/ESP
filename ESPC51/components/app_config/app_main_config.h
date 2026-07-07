@@ -62,14 +62,14 @@
 #define CSI_ALGORITHM_VERSION "edge_feature_v2"
 #endif
 
-#ifndef CSI_SERVICE_TASK_STACK
-/* CSI 低优先级上报任务栈，HTTP 上传和算法摘要在任务中执行，不在 WiFi callback 中执行。 */
-#define CSI_SERVICE_TASK_STACK 4096U
+#ifndef C5_SCHEDULER_TASK_STACK
+/* C5 scheduler 调用 system/BME/CSI tick，栈需覆盖 HTTP/JSON/传感器路径。 */
+#define C5_SCHEDULER_TASK_STACK 12288U
 #endif
 
-#ifndef CSI_SERVICE_TASK_PRIORITY
-/* CSI 任务优先级低于启动、语音和 WiFi 主链路，避免抢占 BME/voice/command。 */
-#define CSI_SERVICE_TASK_PRIORITY 2U
+#ifndef C5_SCHEDULER_TASK_PRIORITY
+/* Scheduler 低于 voice/audio/wifi/gateway_link，高于普通空闲启动任务。 */
+#define C5_SCHEDULER_TASK_PRIORITY 2U
 #endif
 
 #ifndef MAIN_SPEAKER_SELF_TEST_DURATION_MS
@@ -128,12 +128,12 @@
 #error "CSI_SERVICE_REPORT_INTERVAL_MS must be at least 1000"
 #endif
 
-#if CSI_SERVICE_TASK_STACK < 3072
-#error "CSI_SERVICE_TASK_STACK must be at least 3072"
+#if C5_SCHEDULER_TASK_STACK < 8192
+#error "C5_SCHEDULER_TASK_STACK must be at least 8192"
 #endif
 
-#if CSI_SERVICE_TASK_PRIORITY <= 0
-#error "CSI_SERVICE_TASK_PRIORITY must be greater than 0"
+#if C5_SCHEDULER_TASK_PRIORITY <= 0
+#error "C5_SCHEDULER_TASK_PRIORITY must be greater than 0"
 #endif
 
 #if APP_STARTUP_TASK_STACK < 8192

@@ -69,6 +69,18 @@ static const char *TAG = "gateway_link";
 #define GATEWAY_LINK_RETRY_MAX_MS 30000U
 #endif
 
+#ifndef GATEWAY_LINK_WIFI_STABILITY_POLL_MS
+#define GATEWAY_LINK_WIFI_STABILITY_POLL_MS 500U
+#endif
+
+#ifndef GATEWAY_LINK_WIFI_UP_STABLE_REQUIRED_MS
+#define GATEWAY_LINK_WIFI_UP_STABLE_REQUIRED_MS 3000U
+#endif
+
+#ifndef GATEWAY_LINK_WIFI_DOWN_STABLE_REQUIRED_MS
+#define GATEWAY_LINK_WIFI_DOWN_STABLE_REQUIRED_MS 1000U
+#endif
+
 #ifndef GATEWAY_LINK_HEALTH_BODY_SIZE
 #define GATEWAY_LINK_HEALTH_BODY_SIZE 256U
 #endif
@@ -85,8 +97,10 @@ typedef struct {
     gateway_link_voice_abort_cb_t voice_abort_cb;
     uint32_t consecutive_failures;
     uint32_t reconnect_failures;
-    int64_t last_skip_log_ms;
     int64_t last_voice_skip_log_ms;
+    TickType_t wifi_got_ip_tick;
+    TickType_t wifi_down_tick;
+    bool wifi_has_ip;
     bool ever_ready;
 } gateway_link_context_t;
 
@@ -229,15 +243,57 @@ void gateway_link_notify_wifi_down(void)
 {
     portENTER_CRITICAL(&s_link_lock);
     s_link.consecutive_failures = 0;
+    s_link.wifi_has_ip = false;
+    s_link.wifi_got_ip_tick = 0;
+    s_link.wifi_down_tick = xTaskGetTickCount();
     portEXIT_CRITICAL(&s_link_lock);
-    gateway_link_set_state(LINK_DOWN, "wifi_disconnected");
     gateway_link_request_reconnect();
 }
 
 void gateway_link_notify_wifi_got_ip(void)
 {
-    gateway_link_set_state(LINK_WIFI_CONNECTED, "wifi_got_ip");
+    portENTER_CRITICAL(&s_link_lock);
+    s_link.wifi_has_ip = true;
+    s_link.wifi_got_ip_tick = xTaskGetTickCount();
+    s_link.wifi_down_tick = 0;
+    portEXIT_CRITICAL(&s_link_lock);
     gateway_link_request_reconnect();
+}
+
+bool gateway_link_wifi_is_stable(void)
+{
+    bool wifi_has_ip = false;
+    TickType_t got_ip_tick = 0;
+
+    portENTER_CRITICAL(&s_link_lock);
+    wifi_has_ip = s_link.wifi_has_ip;
+    got_ip_tick = s_link.wifi_got_ip_tick;
+    portEXIT_CRITICAL(&s_link_lock);
+
+    if (!wifi_has_ip || got_ip_tick == 0) {
+        return false;
+    }
+
+    TickType_t connected_ticks = xTaskGetTickCount() - got_ip_tick;
+    return connected_ticks >= pdMS_TO_TICKS(GATEWAY_LINK_WIFI_UP_STABLE_REQUIRED_MS);
+}
+
+bool gateway_link_wifi_is_down_stable(void)
+{
+    bool wifi_has_ip = false;
+    TickType_t down_tick = 0;
+
+    portENTER_CRITICAL(&s_link_lock);
+    wifi_has_ip = s_link.wifi_has_ip;
+    down_tick = s_link.wifi_down_tick;
+    portEXIT_CRITICAL(&s_link_lock);
+
+    if (wifi_has_ip || down_tick == 0) {
+        return false;
+    }
+
+    TickType_t disconnected_ticks = xTaskGetTickCount() - down_tick;
+    return disconnected_ticks >= pdMS_TO_TICKS(GATEWAY_LINK_WIFI_DOWN_STABLE_REQUIRED_MS);
 }
 
 static bool gateway_link_should_log(int64_t *last_log_ms)
@@ -258,21 +314,6 @@ static bool gateway_link_should_log(int64_t *last_log_ms)
     portEXIT_CRITICAL(&s_link_lock);
 
     return should_log;
-}
-
-bool gateway_link_can_run_non_voice_task(const char *task_name)
-{
-    if (gateway_link_is_ready()) {
-        return true;
-    }
-
-    if (gateway_link_should_log(&s_link.last_skip_log_ms)) {
-        ESP_LOGI(TAG,
-                 "gateway link down, reconnecting, skip non-voice task%s%s",
-                 task_name != NULL && task_name[0] != '\0' ? ": " : "",
-                 task_name != NULL && task_name[0] != '\0' ? task_name : "");
-    }
-    return false;
 }
 
 bool gateway_link_can_start_voice_turn(void)
@@ -484,20 +525,23 @@ static void gateway_link_reconnect_task(void *arg)
                                       pdMS_TO_TICKS(gateway_link_retry_delay_ms()));
         }
 
+        if (!gateway_link_wifi_is_stable()) {
+            if (gateway_link_wifi_is_down_stable()) {
+                gateway_link_set_state(LINK_DOWN, "wifi_down_stable");
+                gateway_link_note_reconnect_failure();
+            }
+            vTaskDelay(pdMS_TO_TICKS(GATEWAY_LINK_WIFI_STABILITY_POLL_MS));
+            gateway_link_request_reconnect();
+            continue;
+        }
+
         gateway_link_state_t state = gateway_link_get_state();
         if (state == LINK_READY) {
             continue;
         }
 
-        if (!server_comm_wifi_is_ready()) {
-            gateway_link_set_state(LINK_DOWN, "wifi_not_ready");
-            gateway_link_note_reconnect_failure();
-            vTaskDelay(pdMS_TO_TICKS(gateway_link_retry_delay_ms()));
-            continue;
-        }
-
         if (state == LINK_DOWN || state == LINK_LOST) {
-            gateway_link_set_state(LINK_WIFI_CONNECTED, "wifi_ready");
+            gateway_link_set_state(LINK_WIFI_CONNECTED, "wifi_stable");
         }
 
         esp_err_t ret = gateway_link_health_probe();

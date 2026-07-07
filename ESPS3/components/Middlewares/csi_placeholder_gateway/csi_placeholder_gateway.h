@@ -5,13 +5,15 @@
  * @file csi_placeholder_gateway.h
  * @brief S3 网关 CSI 轻量结果接收和触发接口。
  *
- * 本模块保留 C5 /local/v1/csi/result 的 feature 接口。它只接收
- * frame_energy/variance/rssi 等低维特征，并由 S3 融合状态机输出 csi.motion fact。
+ * 本模块保留 C5 /local/v1/csi/result 的 canonical ingress 接口。它只接收
+ * C5 已解释的 confidence/quality/link/timestamp 观测，并由 S3 融合状态机输出
+ * CanonicalEvent v2。
  * 按 child registry 在线状态向 C5 发 UDP 小包触发 WiFi 交互仍由独立 trigger 开关控制。
  * 它不解析 raw CSI。
  */
 
 #include "esp_err.h"
+#include "csi_fusion.h"
 #include "protocol_adapter.h"
 
 #ifdef __cplusplus
@@ -20,17 +22,28 @@ extern "C" {
 
 /** @brief 初始化 CSI gateway；只有显式打开 trigger 时才创建触发任务。 */
 void csi_placeholder_gateway_init(void);
-/** @brief 低频打印每条 link_id 的 latest CSI feature 状态；不读取或上传 raw CSI。 */
+/** @brief 启动 CSI feature gateway；周期 trigger/fusion 由 s3_scheduler 驱动。 */
+esp_err_t csi_placeholder_gateway_start(void);
+/** @brief 暂停 CSI feature gateway。 */
+void csi_placeholder_gateway_stop(void);
+bool csi_placeholder_gateway_is_running(void);
+/** @brief 兼容 scheduler 调用；旧 latest-feature 调试输出已移除。 */
 void csi_placeholder_gateway_log_latest_diagnostics(void);
+/** @brief scheduler tick 调用：flush 一次 CSI fusion 输出。 */
+esp_err_t csi_placeholder_gateway_flush_fusion(void);
+/** @brief scheduler tick 调用：向在线 C5 发送一次 CSI trigger。 */
+esp_err_t csi_placeholder_gateway_send_triggers(void);
 /**
  * @brief 处理一条 CSI result envelope。
  *
  * 调用位置：local_http_server 的 /local/v1/csi/result handler。
  * @param envelope 已由 protocol_adapter 解析的 envelope，不能为空。
- * @return ESP_OK 表示本地已接收；只会上报 summary，不上传 raw CSI。
+ * @return ESP_OK 表示本地已接收；只会上报 CanonicalEvent v2，不上传 raw CSI。
  * 失败处理：local_http_server 映射为本地 CSI 错误响应。
  */
 esp_err_t csi_placeholder_gateway_handle_result(const protocol_adapter_envelope_t *envelope);
+/** @brief 处理已解析的 C5 stream CSI feature；device_stream_gateway 调用。 */
+esp_err_t csi_placeholder_gateway_handle_feature(const csi_fusion_feature_t *feature);
 
 #ifdef __cplusplus
 }

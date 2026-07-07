@@ -24,6 +24,8 @@ esp_err_t command_router_enqueue(const char *target_device_id,
                                  const char *command_type,
                                  const char *params_json,
                                  const char *source);
+/** @brief scheduler 调用：从 Server 拉取 pending commands 并写入本地命令队列。 */
+void command_router_poll_server_pending(void);
 /**
  * @brief 为 C5 构造 pending commands 轻量 JSON。
  *

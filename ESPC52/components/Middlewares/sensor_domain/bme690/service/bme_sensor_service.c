@@ -4,7 +4,7 @@
  *
  * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用），负责启动 BME690 后台任务、
  * 调用 bme690 driver 读取数据、调用 bme_air_quality 计算空气质量，并通过
- * bme_server_client 上传到 S3。本文件不实现 I2C 底层、不改变 /local/v1/sensor 协议，
+ * bme_server_client 上传到 S3。本文件不实现 I2C 底层、不改变统一设备流协议，
  * 也不参与 voice PCM 代理；语音活跃时只按 runtime gate 暂停/恢复本服务。
  */
 

@@ -160,6 +160,7 @@ function writeVoiceTurnHeaders(res) {
 
 function sendVoiceTurnPcm(res, pcmBuffer) {
     writeVoiceTurnHeaders(res);
+    res.set("Content-Length", String(pcmBuffer.length));
     res.end(pcmBuffer);
 }
 

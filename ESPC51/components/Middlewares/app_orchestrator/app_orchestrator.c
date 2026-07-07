@@ -22,6 +22,7 @@
 #include "app_main_config.h"
 #include "app_stack_monitor.h"
 #include "bme_sensor_service.h"
+#include "c5_backpressure_controller.h"
 #include "gateway_link.h"
 #if MAIN_ENABLE_CSI_SERVICE
 #include "csi_service.h"
@@ -140,6 +141,12 @@ void app_orchestrator_start(void)
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_bme_service_start");
 
+    esp_err_t scheduler_ret = c5_scheduler_start();
+    if (scheduler_ret != ESP_OK) {
+        ESP_LOGE(TAG, "C5 scheduler start failed: %s", esp_err_to_name(scheduler_ret));
+    }
+    app_stack_monitor_log(TAG, "app_startup_task", "after_c5_scheduler_start");
+
     if (MAIN_ENABLE_MIC_CHAIN) {
         /*
          * WiFi 稳定后启动完整本地网关半双工语音链路：
@@ -154,7 +161,7 @@ void app_orchestrator_start(void)
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_voice_chain_start");
 
-    // WiFi 重连、Mic ADC/VAD、本地 voice turn、speaker PCM 播放和 BME 服务都在后台任务中运行。
+    // WiFi 重连、Mic ADC/VAD、本地 voice turn、speaker PCM 播放和 C5 scheduler 都在后台任务中运行。
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(MAIN_IDLE_DELAY_MS));
     }

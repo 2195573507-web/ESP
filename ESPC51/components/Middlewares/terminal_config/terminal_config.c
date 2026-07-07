@@ -2,10 +2,10 @@
  * @file terminal_config.c
  * @brief C5 终端运行配置加载。
  *
- * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用），负责从默认宏和 NVS 读取
- * device_id、gateway_id、SoftAP 连接信息和上报周期。本文件不负责发起 HTTP、
- * 不负责协议字段映射，也不保存公网 Server 地址；server_comm_config、wifi_manager、
- * BME/voice/command 模块只通过本模块读取终端身份和 S3 网关地址。
+ * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用），负责从编译期默认宏固定
+ * device_id/local_id，并从 NVS 读取 S3 SoftAP 连接信息和上报周期。本文件不负责
+ * 发起 HTTP、不负责协议字段映射，也不保存公网 Server 地址；server_comm_config、
+ * wifi_manager、BME/voice/command 模块只通过本模块读取终端身份和 S3 网关地址。
  */
 
 #include "terminal_config.h"
@@ -96,10 +96,8 @@ esp_err_t terminal_config_load(void)
         return ret;
     }
 
-    terminal_config_load_string(nvs, "device_id", s_config.device_id, sizeof(s_config.device_id));
-    terminal_config_load_string(nvs, "gateway_id", s_config.gateway_id, sizeof(s_config.gateway_id));
-    terminal_config_load_string(nvs, "room_id", s_config.room_id, sizeof(s_config.room_id));
-    terminal_config_load_string(nvs, "alias", s_config.alias, sizeof(s_config.alias));
+    /* Identity is firmware-defined. Do not let stale NVS keys from another
+     * flashed image override device_id/local_id-derived behavior. */
     terminal_config_load_string(nvs,
                                 "gateway_ssid",
                                 s_config.gateway_ssid,

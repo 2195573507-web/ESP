@@ -38,9 +38,21 @@ const {
     parseTtsRealtimeEvent
 } = require("./realtimeEvents");
 
-async function requestVoiceAsr(audioBuffer, config, voiceConfig, signal) {
+function logAsrRealtimeDebug(logger, event, finalTextSet, loopWillEnd) {
+    const writer = typeof logger?.debug === "function"
+        ? logger.debug.bind(logger)
+        : logger?.log?.bind(logger);
+    if (!writer) {
+        return;
+    }
+
+    writer(
+        `[voice-turn] asr_realtime_debug websocket_event_type=${JSON.stringify(event.eventName || "")} has_transcript=${event.hasTranscript ? "1" : "0"} has_text=${event.hasText ? "1" : "0"} final_text_set=${finalTextSet ? "1" : "0"} asr_loop_end=${loopWillEnd ? "1" : "0"}`
+    );
+}
+
+async function requestVoiceAsr(audioBuffer, config, voiceConfig, signal, logger = console) {
     let ws = null;
-    let latestText = "";
     let finalText = "";
 
     try {
@@ -66,25 +78,29 @@ async function requestVoiceAsr(audioBuffer, config, voiceConfig, signal) {
         while (!signal?.aborted) {
             const event = parseAsrRealtimeEvent(await ws.nextMessage(signal));
             if (event.isError) {
+                logAsrRealtimeDebug(logger, event, false, true);
                 throw createVoiceStageError("asr", "VOICE_ASR_FAILED", event.errorMessage || "ASR Realtime WebSocket returned an error", 502, {
                     endpoint: config.asr.url,
                     model: config.asr.model
                 });
             }
 
+            let finalTextSet = false;
             if (event.text) {
-                latestText = event.text;
                 if (event.isFinal) {
                     finalText = event.text;
+                    finalTextSet = true;
                 }
             }
+
+            logAsrRealtimeDebug(logger, event, finalTextSet, event.isFinal);
 
             if (event.isFinal) {
                 break;
             }
         }
 
-        const text = (finalText || latestText).trim();
+        const text = finalText.trim();
         if (!text) {
             throw createVoiceStageError("asr", "VOICE_ASR_FAILED", "ASR Realtime response did not contain text", 502, {
                 endpoint: config.asr.url,
@@ -316,7 +332,7 @@ async function requestVoiceTts(text, config, deviceId, signal) {
 
 async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConfig, signal, metrics, logger = console, options = {}) {
     let stageStartedAt = Date.now();
-    const asrResult = await requestVoiceAsr(audioBuffer, gatewayConfig, voiceConfig, signal);
+    const asrResult = await requestVoiceAsr(audioBuffer, gatewayConfig, voiceConfig, signal, logger);
     metrics.asrMs = Date.now() - stageStartedAt;
     metrics.asrTextLength = asrResult.text.length;
     metrics.asrTextPreview = normalizeLogPreview(asrResult.text, 60);

@@ -1,7 +1,4 @@
-# C5 terminal 只上传 PCM 到 ESPS3 local gateway 并播放 S3 回传的裸 PCM。
-# 这里保留 TLS 与 HTTP 接收缓冲余量，避免服务器响应读取中途失败。
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
-CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
+# C5 terminal 只访问 ESPS3 local gateway；Server-facing TLS/HTTP 上传由 ESPS3 处理。
 # CONFIG_WS_TRANSPORT is not set
 
 CONFIG_PARTITION_TABLE_CUSTOM=y

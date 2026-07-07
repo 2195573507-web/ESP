@@ -9,11 +9,10 @@
 
 /**
  * @file local_wake_word.h
- * @brief Local wake-word abstraction for the voice chain.
+ * @brief voice_chain 使用的本地唤醒词抽象。
  *
- * This module owns the local offline WakeNet detector for the fixed phrase
- * "你好小智". The server remains silent while idle; only a WakeNet hit opens
- * the local prompt/recording window used by the existing server voice chain.
+ * 本模块负责固定唤醒词“你好小智”的离线 WakeNet 检测。空闲时 Server 保持静默，
+ * 只有 WakeNet 命中后才打开本地提示音和录音窗口，再进入现有 server voice chain。
  */
 
 /* 本地唤醒确认音配置：只影响提示音和提示音后录音窗口延迟。 */

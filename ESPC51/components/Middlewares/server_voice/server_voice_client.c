@@ -17,6 +17,7 @@
 #include "app_stack_monitor.h"
 #include "device_protocol_metadata.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -408,6 +409,13 @@ static void server_voice_response_task(void *arg)
              (long long)(s_voice.fetch_headers_end_ms - s_voice.fetch_headers_begin_ms),
              esp_err_to_name(ret),
              response.status_code);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "response received timestamp=%lld status=%d content_length=%lld",
+                 (long long)s_voice.fetch_headers_end_ms,
+                 response.status_code,
+                 (long long)response.content_length);
+    }
     app_stack_monitor_log(TAG, "server_voice_rx", "after_fetch_headers");
 
     int status = response.status_code;
@@ -480,12 +488,20 @@ static void server_voice_response_task(void *arg)
                  (unsigned int)s_voice.response_bytes);
     } else {
         ESP_LOGE(TAG,
-                 "server voice turn failed status=%d ret=%s aborted=%d upload_bytes=%u response_bytes=%u",
+                 "server voice turn failed status=%d ret=%s aborted=%d upload_bytes=%u response_bytes=%u http error reason=%s",
                  status,
                  esp_err_to_name(ret),
                  aborted ? 1 : 0,
                  (unsigned int)upload_bytes,
-                 (unsigned int)s_voice.response_bytes);
+                 (unsigned int)s_voice.response_bytes,
+                 status != 0 && !server_comm_http_status_is_success(status) ?
+                     "bad_status" :
+                 ret == ESP_ERR_TIMEOUT ? "timeout" :
+                 ret == ESP_ERR_HTTP_EAGAIN ? "eagain" :
+                 ret == ESP_ERR_HTTP_CONNECTION_CLOSED ? "connection_closed" :
+                 ret == ESP_ERR_HTTP_FETCH_HEADER ? "fetch_header_failed" :
+                 ret == ESP_ERR_INVALID_STATE ? "invalid_state" :
+                 "transport_error");
         server_voice_emit_error((int)ret, "server voice turn failed");
     }
 
@@ -648,6 +664,13 @@ esp_err_t server_voice_client_finish_turn(void)
      * 误拦截本轮语音长连接。
      */
     server_comm_http_set_voice_request_active(true);
+    int64_t request_start_ms = server_voice_now_ms();
+    ESP_LOGI(TAG,
+             "request start timestamp=%lld endpoint=%s timeout_ms=%u upload pcm bytes=%u",
+             (long long)request_start_ms,
+             SERVER_VOICE_TURN_ENDPOINT,
+             (unsigned int)SERVER_VOICE_HTTP_TURN_TIMEOUT_MS,
+             (unsigned int)s_voice.upload_bytes);
     esp_err_t ret = server_comm_http_post_raw_fixed_stream_begin(&stream_config,
                                                                  s_voice.upload_buf,
                                                                  s_voice.upload_bytes,
@@ -655,13 +678,25 @@ esp_err_t server_voice_client_finish_turn(void)
     server_comm_http_set_voice_request_active(false);
     server_voice_log_heap("local voice fixed POST after");
     if (ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "http error reason=%s endpoint=%s ret=%s elapsed_ms=%lld upload pcm bytes=%u",
+                 ret == ESP_ERR_TIMEOUT ? "timeout" :
+                 ret == ESP_ERR_HTTP_EAGAIN ? "eagain" :
+                 ret == ESP_ERR_HTTP_CONNECTION_CLOSED ? "connection_closed" :
+                 ret == ESP_ERR_HTTP_CONNECT ? "connect_failed" :
+                 ret == ESP_ERR_INVALID_STATE ? "invalid_state" :
+                 "request_failed",
+                 SERVER_VOICE_TURN_ENDPOINT,
+                 esp_err_to_name(ret),
+                 (long long)(server_voice_now_ms() - request_start_ms),
+                 (unsigned int)s_voice.upload_bytes);
         server_voice_cleanup_client();
         server_voice_set_state(SERVER_VOICE_STATE_IDLE);
         return ret;
     }
     s_voice.upload_finished_ms = server_voice_now_ms();
     ESP_LOGI(TAG,
-             "upload finished timestamp=%lld bytes=%u",
+             "upload finished timestamp=%lld upload pcm bytes=%u",
              (long long)s_voice.upload_finished_ms,
              (unsigned int)s_voice.upload_bytes);
     heap_caps_free(s_voice.upload_buf);

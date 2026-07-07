@@ -79,10 +79,11 @@ uint32_t server_comm_get_default_timeout_ms(void);
  *
  * 调用位置：server_comm_http 内部。
  * 调用时机：每次发起 GET/POST/stream 前。
- * @param endpoint /local/v1 相对路径或完整 http(s) URL，不能为空。
+ * @param endpoint /local/v1 相对路径，不能为空；C5 不接受完整 http(s) URL 或 Server API 路径。
  * @param url 输出缓冲区。
  * @param url_size 输出缓冲区长度。
- * @return ESP_OK 表示 URL 已写入；参数错误返回 ESP_ERR_INVALID_ARG；缓冲区不足返回 ESP_ERR_INVALID_SIZE。
+ * @return ESP_OK 表示 URL 已写入；参数错误返回 ESP_ERR_INVALID_ARG；禁用路径返回 ESP_ERR_NOT_ALLOWED；
+ * 缓冲区不足返回 ESP_ERR_INVALID_SIZE。
  * 失败处理：上层放弃本次 HTTP 请求并把错误返回给 BME/voice/command 调用方。
  */
 esp_err_t server_comm_build_url(const char *endpoint, char *url, size_t url_size);

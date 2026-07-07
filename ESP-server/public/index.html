@@ -40,24 +40,24 @@
                 </a>
             </nav>
 
-            <div class="device-card device-online-card" aria-label="在线设备表">
+            <div class="device-card device-online-card" aria-label="设备状态表">
                 <div class="device-status">
-                    <span class="status-dot online"></span>
-                    <strong>设备在线</strong>
+                    <span class="status-dot" data-sidebar-status-dot></span>
+                    <strong data-sidebar-status-label>设备状态未知</strong>
                 </div>
                 <table class="device-online-table">
                     <tbody>
                         <tr>
                             <th scope="row">设备名称</th>
-                            <td>ESP32C5</td>
+                            <td><span data-active-device-name>C51</span></td>
                         </tr>
                         <tr>
                             <th scope="row">在线状态</th>
-                            <td><span class="device-online-state"><span class="status-dot online"></span>在线</span></td>
+                            <td><span class="device-online-state"><span class="status-dot" data-device-status-dot></span><span data-device-status-text>未知</span></span></td>
                         </tr>
                         <tr>
                             <th scope="row">最后更新</th>
-                            <td><span data-last-updated>--:--:--</span></td>
+                            <td><span data-last-updated>暂无数据</span></td>
                         </tr>
                     </tbody>
                 </table>
@@ -72,14 +72,19 @@
                 </button>
                 <label class="search">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 4a6.5 6.5 0 0 1 5.1 10.5l4.2 4.2-1.4 1.4-4.2-4.2A6.5 6.5 0 1 1 10.5 4Zm0 2a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9Z"/></svg>
-                    <input type="search" placeholder="搜索设备、数据、日志..." aria-label="搜索设备、数据、日志">
+                    <input type="search" aria-label="搜索设备、数据、日志">
                 </label>
 
+                <div class="live-indicator live-danger" data-live-indicator title="尚未收到实时数据">
+                    <strong><i aria-hidden="true"></i>OFFLINE</strong>
+                    <span>Offline</span>
+                </div>
+
                 <div class="top-status">
-                    <span class="status-dot online"></span>
+                    <span class="status-dot" data-top-status-dot></span>
                     <div>
-                        <strong>ESP32C5 在线</strong>
-                        <small>最后更新：<span id="lastUpdated" data-last-updated>--:--:--</span></small>
+                        <strong data-top-status-label>设备状态未知</strong>
+                        <small>最后更新：<span id="lastUpdated" data-last-updated>暂无数据</span></small>
                     </div>
                 </div>
                 <button class="icon-button bell" type="button" aria-label="报警通知">
@@ -107,9 +112,9 @@
                         <div class="metric-icon" data-metric-icon="temperature"></div>
                         <div>
                             <div class="metric-name">温度</div>
-                            <div class="metric-value"><span id="temperatureValue" data-field="temperature">--</span><small>°C</small></div>
+                            <div class="metric-value"><span id="temperatureValue" data-field="temperature">未连接</span><small data-field="temperatureUnit"></small></div>
                         </div>
-                        <span class="state-badge state-normal" data-field="temperatureStatus">正常</span>
+                        <span class="state-badge state-warning" data-field="temperatureStatus">未知</span>
                     </div>
                     <div class="metric-change" data-field="temperatureChange">等待数据</div>
                     <div class="sparkline" data-sparkline="temperature"></div>
@@ -119,9 +124,9 @@
                         <div class="metric-icon" data-metric-icon="humidity"></div>
                         <div>
                             <div class="metric-name">湿度</div>
-                            <div class="metric-value"><span id="humidityValue" data-field="humidity">--</span><small>%</small></div>
+                            <div class="metric-value"><span id="humidityValue" data-field="humidity">未连接</span><small data-field="humidityUnit"></small></div>
                         </div>
-                        <span class="state-badge state-normal" data-field="humidityStatus">正常</span>
+                        <span class="state-badge state-warning" data-field="humidityStatus">未知</span>
                     </div>
                     <div class="metric-change" data-field="humidityChange">等待数据</div>
                     <div class="sparkline" data-sparkline="humidity"></div>
@@ -130,8 +135,8 @@
                     <div class="metric-top">
                         <div class="metric-icon" data-metric-icon="air"></div>
                         <div>
-                            <div class="metric-name" id="airQualityLabel">空气质量 (AQI)</div>
-                            <div class="metric-value"><span id="airQualityValue" data-field="airQuality">--</span><small id="airQualityUnit"></small></div>
+                            <div class="metric-name" id="airQualityLabel">空气质量</div>
+                            <div class="metric-value"><span id="airQualityValue" data-field="airQuality">未连接</span><small id="airQualityUnit"></small></div>
                         </div>
                         <span class="state-badge is-empty" data-field="airStatus"></span>
                     </div>
@@ -143,9 +148,9 @@
                         <div class="metric-icon" data-metric-icon="esp"></div>
                         <div>
                             <div class="metric-name">ESP 状态</div>
-                            <div class="metric-value"><span id="espStatusValue" data-field="espStatus">--</span></div>
+                            <div class="metric-value"><span id="espStatusValue" data-field="espStatus">未知</span></div>
                         </div>
-                        <span class="state-badge state-normal" data-field="espStatusBadge">正常</span>
+                        <span class="state-badge state-warning" data-field="espStatusBadge">未知</span>
                     </div>
                     <div class="metric-change" data-field="espLatency">等待数据</div>
                     <div class="sparkline" data-sparkline="esp"></div>
@@ -172,7 +177,8 @@
                     <div class="legend">
                         <span><i class="legend-dot blue"></i>温度 (°C)</span>
                         <span><i class="legend-dot green"></i>湿度 (%)</span>
-                        <span><i class="legend-dot purple"></i>空气质量(AQI)</span>
+                        <span><i class="legend-dot orange"></i>气压 (hPa)</span>
+                        <span><i class="legend-dot purple"></i>空气质量历史</span>
                     </div>
                     <div class="chart-wrap">
                         <canvas id="mainChart" width="860" height="320" aria-label="温度、湿度、空气质量趋势图"></canvas>
@@ -187,7 +193,7 @@
                     <div class="alert-summary" data-alert-summary></div>
                     <div class="latest-alert" data-latest-alert>
                         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 2 20h20L12 2Zm1 15h-2v-2h2v2Zm0-4h-2V8h2v5Z"/></svg>
-                        <span>最近报警：暂无异常</span>
+                        <span>最近报警：暂无数据</span>
                         <svg class="arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6 1.4-1.4 7.4 7.4-7.4 7.4L9 18Z"/></svg>
                     </div>
                 </article>
@@ -291,7 +297,7 @@
                         <div class="operation-log-header">
                             <div>
                                 <strong>页面操作记录</strong>
-                                <span>本页面临时日志，刷新后会丢失</span>
+                                <span>后端返回的真实命令历史</span>
                             </div>
                             <button class="link-button" type="button" data-open-operation-log>查看更多 <span aria-hidden="true">›</span></button>
                         </div>
@@ -313,9 +319,9 @@
         </main>
     </div>
     <div class="data-source-panel" id="dataSourcePanel" aria-live="polite">
-        <span>Sensor: <strong data-source="sensor">--</strong></span>
-        <span>ASR: <strong data-source="asr">--</strong></span>
-        <span>LLM: <strong data-source="llm">--</strong></span>
+        <span>Sensor: <strong data-source="sensor">暂无数据</strong></span>
+        <span>ASR: <strong data-source="asr">暂无数据</strong></span>
+        <span>LLM: <strong data-source="llm">暂无数据</strong></span>
     </div>
 
     <div class="log-modal-overlay" data-log-modal hidden>
@@ -340,7 +346,7 @@
             </header>
             <form class="custom-command-form" data-custom-command-form>
                 <label for="customCommandInput">请求内容</label>
-                <textarea id="customCommandInput" data-custom-command-input maxlength="500" rows="6" placeholder="输入要发送给服务的请求内容"></textarea>
+                <textarea id="customCommandInput" data-custom-command-input maxlength="500" rows="6" aria-label="输入要发送给服务的请求内容"></textarea>
                 <div class="custom-command-footer">
                     <span data-custom-command-count>0 / 500</span>
                     <span class="command-form-error" data-custom-command-error></span>

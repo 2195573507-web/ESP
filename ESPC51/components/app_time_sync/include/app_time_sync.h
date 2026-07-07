@@ -13,7 +13,7 @@
  * 调用方法：
  * 1. 如果只改 ESPS3 gateway IP，优先修改 APP_TIME_SYNC_SERVER_BASE_URL。
  * 2. 如果本地时间接口路径变了，修改 APP_TIME_SYNC_TIME_NOW_PATH。
- * 3. APP_TIME_SYNC_SERVER_URL 会自动把 base URL 和 path 拼成完整请求地址。
+ * 3. app_time_sync_once() 只会把 /local/v1 endpoint 交给 C5 公共 HTTP 层。
  */
 #ifndef APP_TIME_SYNC_SERVER_BASE_URL
 // 本地网关基础地址，只包含协议、IP 和端口，不要在末尾加接口路径。
@@ -26,7 +26,7 @@
 #endif
 
 #ifndef APP_TIME_SYNC_SERVER_URL
-// 完整时间同步 URL，app_main 默认把这个宏传给 app_time_sync_once()。
+// 兼容旧调用方的完整 URL；app_time_sync_once() 会提取 /local/v1 endpoint。
 #define APP_TIME_SYNC_SERVER_URL APP_TIME_SYNC_SERVER_BASE_URL APP_TIME_SYNC_TIME_NOW_PATH
 #endif
 
@@ -50,7 +50,7 @@
 #endif
 
 #ifndef APP_TIME_SYNC_URL_BUFFER_SIZE
-// 内部拼接完整 URL 的缓存大小，单位字节；base URL 很长时需要同步调大。
+// 内部保存 /local/v1 endpoint 的缓存大小，单位字节。
 #define APP_TIME_SYNC_URL_BUFFER_SIZE 256
 #endif
 
@@ -84,10 +84,10 @@ extern "C" {
 /**
  * @brief WiFi 已连接后，对本地网关时间接口执行一次 HTTP 时间校准。
  *
- * 调用方法：外部在 WiFi connected 之后传入本地 gateway base URL 或完整时间接口 URL。
+ * 调用方法：外部在 WiFi connected 之后传入本地 /local/v1 endpoint 或兼容旧完整 URL。
  * 本函数只执行一次请求，不创建后台任务。
  *
- * @param server_time_url 本地时间接口 URL，返回 JSON: {"ok":true,"server_time_ms":1719999999999}
+ * @param server_time_url 本地时间接口 URL 或 /local/v1 endpoint；公共 HTTP 层只接收 endpoint。
  * @return 成功返回 ESP_OK；失败返回 ESP_FAIL 或 ESP-IDF 具体错误码。
  */
 esp_err_t app_time_sync_once(const char *server_time_url);

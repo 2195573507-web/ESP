@@ -75,6 +75,13 @@ const gateway_runtime_config_t *gateway_config_get(void)
     return &s_config;
 }
 
+static size_t child_allowlist_count_bounded(void)
+{
+    return s_config.children_allowlist_count <= GATEWAY_CONFIG_MAX_CHILDREN ?
+               s_config.children_allowlist_count :
+               GATEWAY_CONFIG_MAX_CHILDREN;
+}
+
 bool gateway_config_sta_credentials_configured(void)
 {
     return sta_configured_credential_count() > 0U;
@@ -86,7 +93,7 @@ bool gateway_config_child_allowed(const char *device_id)
         return false;
     }
 
-    for (size_t i = 0; i < s_config.children_allowlist_count; i++) {
+    for (size_t i = 0; i < child_allowlist_count_bounded(); i++) {
         if (s_config.children_allowlist[i] != NULL &&
             strcmp(device_id, s_config.children_allowlist[i]) == 0) {
             return true;
@@ -135,6 +142,18 @@ void gateway_config_log_boot_profile(void)
 
     if (configured_sta_count == 0U) {
         ESP_LOGW(TAG, "STA credentials are empty; SoftAP/local HTTP will start, server uplink remains offline");
+    }
+    if (s_config.children_allowlist_count > GATEWAY_CONFIG_MAX_CHILDREN) {
+        ESP_LOGE(TAG,
+                 "children_allowlist_count=%u exceeds max_children=%u; clamping registry scans",
+                 (unsigned int)s_config.children_allowlist_count,
+                 (unsigned int)GATEWAY_CONFIG_MAX_CHILDREN);
+    }
+    if (s_config.softap_max_connection > GATEWAY_CONFIG_MAX_CHILDREN) {
+        ESP_LOGW(TAG,
+                 "softap_max_connection=%u exceeds max_children=%u; extra stations may not map to registry slots",
+                 (unsigned int)s_config.softap_max_connection,
+                 (unsigned int)GATEWAY_CONFIG_MAX_CHILDREN);
     }
     ESP_LOGI(TAG,
              "CSI trigger enabled=%d result_ingest=%d interval_ms=%u udp_port=%u target=%s",

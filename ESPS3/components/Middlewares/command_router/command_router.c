@@ -20,11 +20,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "gateway_config.h"
+#include "network_worker.h"
 #include "offline_policy.h"
 #include "protocol_adapter.h"
 #include "sensor_aggregator.h"
 #include "server_client.h"
-#include "voice_proxy.h"
 
 static const char *TAG = "command_router";
 
@@ -51,7 +51,10 @@ typedef struct {
 
 static command_entry_t s_queue[GATEWAY_CONFIG_COMMAND_QUEUE_SIZE];
 static SemaphoreHandle_t s_lock;
+static SemaphoreHandle_t s_poll_lock;
 static uint32_t s_command_seq;
+static child_registry_entry_t s_poll_entries[GATEWAY_CONFIG_MAX_CHILDREN];
+static char s_poll_server_body[SERVER_CLIENT_SMALL_BODY_BYTES];
 
 static int64_t now_ms(void)
 {
@@ -251,13 +254,21 @@ static esp_err_t command_router_ingest_server_pending(const char *device_id, con
 
 esp_err_t command_router_init(void)
 {
-    if (s_lock != NULL) {
+    if (s_lock != NULL && s_poll_lock != NULL) {
         return ESP_OK;
     }
 
-    s_lock = xSemaphoreCreateMutex();
     if (s_lock == NULL) {
-        return ESP_ERR_NO_MEM;
+        s_lock = xSemaphoreCreateMutex();
+        if (s_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_poll_lock == NULL) {
+        s_poll_lock = xSemaphoreCreateMutex();
+        if (s_poll_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
     }
     memset(s_queue, 0, sizeof(s_queue));
     s_command_seq = 0;
@@ -287,6 +298,57 @@ esp_err_t command_router_enqueue(const char *target_device_id,
     return ESP_OK;
 }
 
+static void command_router_poll_server_pending_for_device(const char *device_id)
+{
+    if (device_id == NULL || device_id[0] == '\0') {
+        return;
+    }
+
+    s_poll_server_body[0] = '\0';
+    int server_status = 0;
+    esp_err_t server_ret = server_client_get_pending_commands(device_id,
+                                                              s_poll_server_body,
+                                                              sizeof(s_poll_server_body),
+                                                              &server_status);
+    offline_policy_record_server_result(server_ret, server_status);
+    if (server_ret != ESP_OK) {
+        ESP_LOGD(TAG,
+                 "server pending command poll failed target=%s status=%d ret=%s",
+                 device_id,
+                 server_status,
+                 esp_err_to_name(server_ret));
+        return;
+    }
+
+    esp_err_t ingest_ret = command_router_ingest_server_pending(device_id,
+                                                                s_poll_server_body);
+    if (ingest_ret != ESP_OK && ingest_ret != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG,
+                 "server pending command ingest failed target=%s ret=%s",
+                 device_id,
+                 esp_err_to_name(ingest_ret));
+    }
+}
+
+void command_router_poll_server_pending(void)
+{
+    if (s_poll_lock == NULL) {
+        return;
+    }
+
+    xSemaphoreTake(s_poll_lock, portMAX_DELAY);
+    size_t count = child_registry_snapshot(s_poll_entries, GATEWAY_CONFIG_MAX_CHILDREN);
+    for (size_t i = 0; i < count; ++i) {
+        if (!s_poll_entries[i].registered || !s_poll_entries[i].online ||
+            s_poll_entries[i].device_id[0] == '\0') {
+            continue;
+        }
+
+        command_router_poll_server_pending_for_device(s_poll_entries[i].device_id);
+    }
+    xSemaphoreGive(s_poll_lock);
+}
+
 esp_err_t command_router_build_pending_json(const char *device_id, char *out, size_t out_size)
 {
     if (!child_registry_is_allowed(device_id) || out == NULL || out_size == 0) {
@@ -296,30 +358,6 @@ esp_err_t command_router_build_pending_json(const char *device_id, char *out, si
     uint8_t local_id = protocol_adapter_device_id_to_local_id(device_id);
     if (local_id == 0) {
         return ESP_ERR_INVALID_ARG;
-    }
-
-    if (voice_proxy_should_skip_non_voice_task("command dispatch")) {
-        int written = snprintf(out,
-                               out_size,
-                               "{\"" ESP111_PROTOCOL_LOCAL_JSON_OK "\":1,"
-                               "\"" ESP111_PROTOCOL_LOCAL_JSON_ID "\":%u,"
-                               "\"" ESP111_PROTOCOL_LOCAL_JSON_COMMANDS "\":[]}",
-                               (unsigned int)local_id);
-        return written > 0 && written < (int)out_size ? ESP_OK : ESP_ERR_INVALID_SIZE;
-    }
-
-    char server_body[SERVER_CLIENT_SMALL_BODY_BYTES];
-    int server_status = 0;
-    esp_err_t server_ret = server_client_get_pending_commands(device_id,
-                                                              server_body,
-                                                              sizeof(server_body),
-                                                              &server_status);
-    offline_policy_record_server_result(server_ret, server_status);
-    if (server_ret == ESP_OK) {
-        esp_err_t ingest_ret = command_router_ingest_server_pending(device_id, server_body);
-        if (ingest_ret != ESP_OK && ingest_ret != ESP_ERR_NOT_FOUND) {
-            ESP_LOGW(TAG, "server pending command ingest failed: %s", esp_err_to_name(ingest_ret));
-        }
     }
 
     size_t len = 0;
@@ -380,6 +418,7 @@ esp_err_t command_router_ack(const char *command_id, const char *ack_body)
 
     char ack_device_id[CHILD_REGISTRY_DEVICE_ID_LEN] = {0};
     unsigned int command_code = ESP111_PROTOCOL_LOCAL_COMMAND_UNSUPPORTED;
+    bool found = false;
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     command_entry_t *entry = find_locked(command_id);
@@ -387,10 +426,11 @@ esp_err_t command_router_ack(const char *command_id, const char *ack_body)
         entry->state = COMMAND_STATE_ACKED;
         strlcpy(ack_device_id, entry->target_device_id, sizeof(ack_device_id));
         command_code = map_local_command_code(entry->command_type);
+        found = true;
     }
     xSemaphoreGive(s_lock);
 
-    if (entry == NULL) {
+    if (!found) {
         ESP_LOGW(TAG, "ack for unknown local command id=%s", command_id);
     }
 
@@ -452,33 +492,20 @@ esp_err_t command_router_ack(const char *command_id, const char *ack_body)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    if (voice_proxy_should_skip_non_voice_task("command ack upload")) {
-        if (ack_device_id[0] != '\0') {
-            sensor_aggregator_record_command_ack(ack_device_id,
-                                                 command_id,
-                                                 command_code,
-                                                 strcmp(ack_status, "completed") == 0);
-        }
-        return ESP_OK;
-    }
-
-    char response[SERVER_CLIENT_SMALL_BODY_BYTES];
     int http_status = 0;
-    esp_err_t ret = server_client_ack_command(command_id,
-                                             server_ack,
-                                             response,
-                                             sizeof(response),
-                                             &http_status);
-    offline_policy_record_server_result(ret, http_status);
+    esp_err_t ret = network_worker_enqueue_command_ack(command_id, server_ack);
+    if (ret != ESP_OK) {
+        offline_policy_record_server_result(ret, http_status);
+    }
     if (ack_device_id[0] != '\0') {
         sensor_aggregator_record_command_ack(ack_device_id,
                                              command_id,
                                              command_code,
                                              strcmp(ack_status, "completed") == 0);
     }
-    ESP_LOGI(TAG, "command ack id=%s local_known=%d server_status=%d",
+    ESP_LOGI(TAG, "command ack id=%s local_known=%d queued=%d",
              command_id,
-             entry != NULL ? 1 : 0,
-             http_status);
+             found ? 1 : 0,
+             ret == ESP_OK ? 1 : 0);
     return ESP_OK;
 }

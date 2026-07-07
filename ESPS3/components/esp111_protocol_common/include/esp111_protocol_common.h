@@ -9,8 +9,10 @@
  * 路径、类型码、错误码、默认身份和音频格式，不实现解析、转发或业务处理。
  *
  * 协议边界：
- * - C5 <-> S3 使用 /local/v1 和轻量 JSON 字段 p/id/t/u/q/v/cid/c/a/ok/e/cmds；
+ * - C5 -> S3 telemetry 使用 UDP/33434 或 /local/v1/stream 的扁平设备流 JSON；
+ * - C5 <-> S3 控制/语音使用 /local/v1 和轻量 JSON 字段 p/id/t/u/q/v/cid/c/a/ok/e/cmds；
  * - S3 <-> Server 使用完整 v1 JSON 和 /api/device/v1、/api/voice、/api/commands 路径；
+ *   CSI 只使用 /kernel/csi_event canonical event v2；
  * - S3 的 protocol_adapter/server_client 负责两层协议转换，C5 不直接构造 Server 完整 envelope。
  */
 
@@ -20,6 +22,7 @@ extern "C" {
 
 #define ESP111_PROTOCOL_SCHEMA_VERSION 1
 #define ESP111_PROTOCOL_SCHEMA_VERSION_STRING "1"
+#define ESP111_PROTOCOL_CSI_EVENT_SCHEMA_VERSION_STRING "v2"
 #define ESP111_PROTOCOL_LOCAL_SCHEMA_VERSION 2
 #define ESP111_PROTOCOL_LOCAL_SCHEMA_VERSION_STRING "2"
 #define ESP111_PROTOCOL_DASHBOARD_SNAPSHOT_SCHEMA_VERSION 2
@@ -87,6 +90,20 @@ extern "C" {
 #define ESP111_PROTOCOL_LOCAL_JSON_ERROR "e"
 #define ESP111_PROTOCOL_LOCAL_JSON_COMMANDS "cmds"
 
+#define ESP111_PROTOCOL_DEVICE_STREAM_MAX_BYTES 128U
+#define ESP111_PROTOCOL_DEVICE_STREAM_UDP_PORT 33434U
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_TIMESTAMP "t"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_DEVICE_ID "did"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_TYPE "type"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_LINK_ID "lid"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_VALUE1 "v1"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_VALUE2 "v2"
+#define ESP111_PROTOCOL_DEVICE_STREAM_JSON_VALUE3 "v3"
+#define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_CSI "csi"
+#define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_SENSOR "sensor"
+#define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_STATUS "status"
+#define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_EVENT "event"
+
 #define ESP111_PROTOCOL_LOCAL_TYPE_REGISTER "reg"
 #define ESP111_PROTOCOL_LOCAL_TYPE_HEARTBEAT "hb"
 #define ESP111_PROTOCOL_LOCAL_TYPE_STATUS "st"
@@ -140,6 +157,7 @@ extern "C" {
 #define ESP111_PROTOCOL_ROUTE_STATUS "/local/v1/status"
 #define ESP111_PROTOCOL_ROUTE_SENSOR "/local/v1/sensor"
 #define ESP111_PROTOCOL_ROUTE_CSI_RESULT "/local/v1/csi/result"
+#define ESP111_PROTOCOL_ROUTE_DEVICE_STREAM "/local/v1/stream"
 #define ESP111_PROTOCOL_ROUTE_VOICE_TURN "/local/v1/voice/turn"
 #define ESP111_PROTOCOL_ROUTE_VOICE_PROMPT_CACHE "/local/v1/voice/prompt-cache"
 #define ESP111_PROTOCOL_ROUTE_WAKE_PROMPT_AUDIO "/local/v1/audio/wake-prompt"
@@ -150,6 +168,7 @@ extern "C" {
 
 /* S3 <-> ESP-server 路径，只由 ESPS3/server_client 使用。 */
 #define ESP111_PROTOCOL_SERVER_ROUTE_DEVICE_INGEST "/api/device/v1/ingest"
+#define ESP111_PROTOCOL_SERVER_ROUTE_CSI_EVENT "/kernel/csi_event"
 #define ESP111_PROTOCOL_SERVER_ROUTE_GATEWAY_STATE "/api/device/v1/gateway-state"
 #define ESP111_PROTOCOL_SERVER_ROUTE_LOGS_SYSTEM "/api/logs/v1/system"
 #define ESP111_PROTOCOL_SERVER_ROUTE_LOGS_ALARMS "/api/logs/v1/alarms"
@@ -160,7 +179,7 @@ extern "C" {
 #define ESP111_PROTOCOL_SERVER_ROUTE_COMMANDS_PREFIX "/api/commands/"
 #define ESP111_PROTOCOL_SERVER_ROUTE_COMMAND_ACK_SUFFIX "/ack"
 #define ESP111_PROTOCOL_SERVER_DEFAULT_TIMEOUT_MS 8000
-#define ESP111_PROTOCOL_SERVER_VOICE_TIMEOUT_MS 20000
+#define ESP111_PROTOCOL_SERVER_VOICE_TIMEOUT_MS 30000
 
 /* 语音边界：C5 上传/接收 PCM，S3 只代理，ASR/LLM/TTS 具体实现位于 Server 侧。 */
 #define ESP111_PROTOCOL_AUDIO_CONTENT_TYPE_L16_16K_MONO \

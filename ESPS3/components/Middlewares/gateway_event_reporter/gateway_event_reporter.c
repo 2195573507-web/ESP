@@ -14,8 +14,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "gateway_config.h"
+#include "network_worker.h"
 #include "offline_policy.h"
-#include "server_client.h"
 
 static const char *TAG = "gateway_event";
 
@@ -48,19 +48,18 @@ static bool event_rate_limited(void)
     return false;
 }
 
-static esp_err_t post_json(bool alarm, const char *json)
+static esp_err_t post_json(bool alarm, char *json)
 {
-    char response[SERVER_CLIENT_SMALL_BODY_BYTES];
-    int status = 0;
-    esp_err_t ret = alarm ?
-        server_client_post_alarm_json(json, response, sizeof(response), &status) :
-        server_client_post_system_log_json(json, response, sizeof(response), &status);
-    offline_policy_record_server_result(ret, status);
-    if (ret != ESP_OK || status < 200 || status >= 300) {
+    esp_err_t ret = network_worker_submit_server_json(alarm ?
+                                                          NETWORK_WORKER_SERVER_JSON_ALARM :
+                                                          NETWORK_WORKER_SERVER_JSON_SYSTEM_LOG,
+                                                      json,
+                                                      alarm ? "gateway_alarm" : "gateway_event");
+    if (ret != ESP_OK) {
+        offline_policy_record_server_result(ret, 0);
         ESP_LOGW(TAG,
-                 "%s upload failed status=%d ret=%s",
+                 "%s upload enqueue failed ret=%s",
                  alarm ? "alarm" : "system log",
-                 status,
                  esp_err_to_name(ret));
     }
     return ret;
@@ -99,7 +98,9 @@ esp_err_t gateway_event_reporter_system(const char *device_id,
         return ESP_ERR_NO_MEM;
     }
     esp_err_t ret = post_json(false, json);
-    cJSON_free(json);
+    if (ret != ESP_OK) {
+        cJSON_free(json);
+    }
     return ret;
 }
 
@@ -141,7 +142,9 @@ esp_err_t gateway_event_reporter_alarm(const char *device_id,
         return ESP_ERR_NO_MEM;
     }
     esp_err_t ret = post_json(true, json);
-    cJSON_free(json);
+    if (ret != ESP_OK) {
+        cJSON_free(json);
+    }
     return ret;
 }
 

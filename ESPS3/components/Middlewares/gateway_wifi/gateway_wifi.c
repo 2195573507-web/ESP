@@ -10,7 +10,6 @@
 
 #include <string.h>
 
-#include "child_registry.h"
 #include "esp_event.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -19,19 +18,140 @@
 #include "freertos/FreeRTOS.h"
 #include "gateway_config.h"
 #include "lwip/ip4_addr.h"
+#include "network_worker.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "gateway_wifi";
+
+volatile bool g_net_ready = false;
 
 static esp_netif_t *s_ap_netif;
 static esp_netif_t *s_sta_netif;
 static bool s_started;
 static bool s_softap_ready;
+static bool s_sta_started;
 static bool s_sta_connected;
+static uint8_t s_ap_sta_connected_count;
 static size_t s_sta_credential_index;
 
-static void handle_sta_start(void);
-static void handle_sta_disconnected(void);
+void gateway_wifi_set_net_ready_gate(bool ready, const char *reason)
+{
+    if (g_net_ready == ready) {
+        return;
+    }
+
+    g_net_ready = ready;
+    ESP_LOGI(TAG,
+             "NET_READY transition ready=%d reason=%s softap=%d sta=%d",
+             g_net_ready ? 1 : 0,
+             reason != NULL ? reason : "unknown",
+             s_softap_ready ? 1 : 0,
+             s_sta_connected ? 1 : 0);
+}
+
+static void post_network_event(network_worker_event_t event,
+                               network_worker_event_source_t source,
+                               uint32_t ip_addr)
+{
+    esp_err_t ret = network_worker_post_event(event, source, ip_addr);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "network event post failed event=%d source=%d ret=%s",
+                 (int)event,
+                 (int)source,
+                 esp_err_to_name(ret));
+    }
+}
+
+static void log_ap_station_connected(const void *event_data)
+{
+    const gateway_runtime_config_t *config = gateway_config_get();
+    uint8_t max_connection = config->softap_max_connection;
+
+    if (event_data == NULL) {
+        ESP_LOGW(TAG,
+                 "SoftAP station connected event missing data count=%u/%u",
+                 (unsigned int)s_ap_sta_connected_count,
+                 (unsigned int)max_connection);
+        return;
+    }
+
+    const wifi_event_ap_staconnected_t *event =
+        (const wifi_event_ap_staconnected_t *)event_data;
+    if (max_connection == 0U || event->aid == 0U || event->aid > max_connection) {
+        ESP_LOGW(TAG,
+                 "SoftAP station connected boundary aid=%u max=%u",
+                 (unsigned int)event->aid,
+                 (unsigned int)max_connection);
+    }
+    if (max_connection > 0U && s_ap_sta_connected_count >= max_connection) {
+        ESP_LOGW(TAG,
+                 "SoftAP station connected over capacity count=%u max=%u",
+                 (unsigned int)s_ap_sta_connected_count,
+                 (unsigned int)max_connection);
+    } else if (s_ap_sta_connected_count < UINT8_MAX) {
+        ++s_ap_sta_connected_count;
+    }
+
+    ESP_LOGI(TAG,
+             "SoftAP station connected mac=%02x:%02x:%02x:%02x:%02x:%02x aid=%u mesh=%d count=%u/%u",
+             event->mac[0],
+             event->mac[1],
+             event->mac[2],
+             event->mac[3],
+             event->mac[4],
+             event->mac[5],
+             (unsigned int)event->aid,
+             event->is_mesh_child ? 1 : 0,
+             (unsigned int)s_ap_sta_connected_count,
+             (unsigned int)max_connection);
+}
+
+static void log_ap_station_disconnected(const void *event_data)
+{
+    const gateway_runtime_config_t *config = gateway_config_get();
+    uint8_t max_connection = config->softap_max_connection;
+
+    if (event_data == NULL) {
+        ESP_LOGW(TAG,
+                 "SoftAP station disconnected event missing data count=%u/%u",
+                 (unsigned int)s_ap_sta_connected_count,
+                 (unsigned int)max_connection);
+        return;
+    }
+
+    const wifi_event_ap_stadisconnected_t *event =
+        (const wifi_event_ap_stadisconnected_t *)event_data;
+    if (s_ap_sta_connected_count == 0U) {
+        ESP_LOGW(TAG,
+                 "SoftAP station disconnect underflow aid=%u reason=%u",
+                 (unsigned int)event->aid,
+                 (unsigned int)event->reason);
+    } else {
+        --s_ap_sta_connected_count;
+    }
+    if (max_connection == 0U || event->aid == 0U || event->aid > max_connection) {
+        ESP_LOGW(TAG,
+                 "SoftAP station disconnected boundary aid=%u max=%u reason=%u",
+                 (unsigned int)event->aid,
+                 (unsigned int)max_connection,
+                 (unsigned int)event->reason);
+    }
+
+    ESP_LOGI(TAG,
+             "SoftAP station disconnected mac=%02x:%02x:%02x:%02x:%02x:%02x aid=%u mesh=%d reason=%u count=%u/%u",
+             event->mac[0],
+             event->mac[1],
+             event->mac[2],
+             event->mac[3],
+             event->mac[4],
+             event->mac[5],
+             (unsigned int)event->aid,
+             event->is_mesh_child ? 1 : 0,
+             (unsigned int)event->reason,
+             (unsigned int)s_ap_sta_connected_count,
+             (unsigned int)max_connection);
+}
 
 static esp_err_t ensure_nvs(void)
 {
@@ -52,22 +172,47 @@ static void wifi_event_handler(void *arg,
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
         s_softap_ready = true;
-        ESP_LOGI(TAG, "SoftAP started at %s", gateway_config_get()->softap_ip);
+        post_network_event(NETWORK_WORKER_EVENT_LINK_UP,
+                           NETWORK_WORKER_SOURCE_SOFTAP_START,
+                           0U);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STOP) {
+        s_softap_ready = false;
+        s_ap_sta_connected_count = 0U;
+        post_network_event(NETWORK_WORKER_EVENT_LINK_DOWN,
+                           NETWORK_WORKER_SOURCE_SOFTAP_STOP,
+                           0U);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
-        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
-        ESP_LOGI(TAG, "child station connected aid=%u", (unsigned int)event->aid);
+        log_ap_station_connected(event_data);
+        post_network_event(NETWORK_WORKER_EVENT_LINK_UP,
+                           NETWORK_WORKER_SOURCE_AP_STA_CONNECTED,
+                           0U);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
-        ESP_LOGI(TAG, "child station disconnected aid=%u", (unsigned int)event->aid);
-        child_registry_mark_all_link_lost("ap_sta_disconnected");
+        log_ap_station_disconnected(event_data);
+        post_network_event(NETWORK_WORKER_EVENT_LINK_DOWN,
+                           NETWORK_WORKER_SOURCE_AP_STA_DISCONNECTED,
+                           0U);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        handle_sta_start();
+        s_sta_started = true;
+        post_network_event(NETWORK_WORKER_EVENT_LINK_UP,
+                           NETWORK_WORKER_SOURCE_STA_START,
+                           0U);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        handle_sta_disconnected();
+        s_sta_connected = false;
+        post_network_event(NETWORK_WORKER_EVENT_LINK_DOWN,
+                           NETWORK_WORKER_SOURCE_STA_DISCONNECTED,
+                           0U);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_STOP) {
+        s_sta_started = false;
+        s_sta_connected = false;
+        post_network_event(NETWORK_WORKER_EVENT_LINK_DOWN,
+                           NETWORK_WORKER_SOURCE_STA_STOP,
+                           0U);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         s_sta_connected = true;
-        ESP_LOGI(TAG, "STA got IP " IPSTR, IP2STR(&event->ip_info.ip));
+        post_network_event(NETWORK_WORKER_EVENT_IP_READY,
+                           NETWORK_WORKER_SOURCE_STA_GOT_IP,
+                           event != NULL ? event->ip_info.ip.addr : 0U);
     }
 }
 
@@ -165,12 +310,12 @@ static esp_err_t configure_next_sta_credential(void)
     return configure_sta_credential(next_index);
 }
 
-static void connect_current_sta(void)
+esp_err_t gateway_wifi_connect_sta_current(void)
 {
     const gateway_wifi_credential_t *credential = current_sta_credential();
     if (credential == NULL) {
         ESP_LOGW(TAG, "STA connect skipped: no configured credential");
-        return;
+        return ESP_ERR_NOT_FOUND;
     }
 
     esp_err_t ret = esp_wifi_connect();
@@ -180,34 +325,18 @@ static void connect_current_sta(void)
                  credential->ssid,
                  esp_err_to_name(ret));
     }
+    return ret;
 }
 
-static void reconnect_next_sta(void)
+esp_err_t gateway_wifi_reconnect_sta_next(void)
 {
     esp_err_t ret = configure_next_sta_credential();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "STA reconnect skipped: %s", esp_err_to_name(ret));
-        return;
+        return ret;
     }
 
-    connect_current_sta();
-}
-
-static void handle_sta_start(void)
-{
-    if (gateway_config_sta_credentials_configured()) {
-        connect_current_sta();
-    }
-}
-
-static void handle_sta_disconnected(void)
-{
-    s_sta_connected = false;
-
-    if (gateway_config_sta_credentials_configured()) {
-        ESP_LOGW(TAG, "STA disconnected, trying next configured WiFi");
-        reconnect_next_sta();
-    }
+    return gateway_wifi_connect_sta_current();
 }
 
 esp_err_t gateway_wifi_start(void)
@@ -259,6 +388,12 @@ esp_err_t gateway_wifi_start(void)
     ap_config.ap.ssid_len = strlen(config->softap_ssid);
     ap_config.ap.channel = config->softap_channel;
     ap_config.ap.max_connection = config->softap_max_connection;
+    if (ap_config.ap.max_connection > GATEWAY_CONFIG_MAX_CHILDREN) {
+        ESP_LOGW(TAG,
+                 "SoftAP max_connection=%u exceeds registry max_children=%u",
+                 (unsigned int)ap_config.ap.max_connection,
+                 (unsigned int)GATEWAY_CONFIG_MAX_CHILDREN);
+    }
     ap_config.ap.authmode = strlen(config->softap_password) > 0 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     ap_config.ap.pmf_cfg.required = false;
 
@@ -287,7 +422,17 @@ bool gateway_wifi_is_softap_ready(void)
     return s_softap_ready;
 }
 
+bool gateway_wifi_is_sta_started(void)
+{
+    return s_sta_started;
+}
+
 bool gateway_wifi_is_sta_connected(void)
 {
     return s_sta_connected;
+}
+
+bool gateway_wifi_is_net_ready(void)
+{
+    return g_net_ready;
 }

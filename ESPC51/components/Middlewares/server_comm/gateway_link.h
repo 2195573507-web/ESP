@@ -49,6 +49,12 @@ void gateway_link_notify_wifi_down(void);
 /** @brief WiFi STA 拿到 IP 后调用：进入 LINK_WIFI_CONNECTED 并触发 health/register。 */
 void gateway_link_notify_wifi_got_ip(void);
 
+/** @brief WiFi GOT_IP 已持续稳定一段时间后返回 true。 */
+bool gateway_link_wifi_is_stable(void);
+
+/** @brief WiFi DISCONNECTED 已持续稳定一段时间后返回 true。 */
+bool gateway_link_wifi_is_down_stable(void);
+
 /** @brief 业务或语音清理层注册断联中止回调；状态从 READY 掉出时触发。 */
 void gateway_link_set_voice_abort_callback(gateway_link_voice_abort_cb_t callback);
 
@@ -63,9 +69,6 @@ bool gateway_link_is_ready(void);
 
 /** @brief 状态非 READY 时即为 reconnect mode。 */
 bool gateway_link_in_reconnect_mode(void);
-
-/** @brief 普通任务门控：READY 才返回 true；否则限频打印 reconnect skip 日志。 */
-bool gateway_link_can_run_non_voice_task(const char *task_name);
 
 /** @brief 语音启动门控：READY 才返回 true；否则限频提示 gateway offline。 */
 bool gateway_link_can_start_voice_turn(void);

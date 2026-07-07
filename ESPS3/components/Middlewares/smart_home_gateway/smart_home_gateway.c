@@ -18,7 +18,6 @@
 #include "offline_policy.h"
 #include "sensor_aggregator.h"
 #include "server_client.h"
-#include "voice_proxy.h"
 
 static const char *TAG = "smart_home_gateway";
 
@@ -108,10 +107,6 @@ static esp_err_t ack_failed_command(const char *command_id, const char *target_i
 
 void smart_home_gateway_poll_once(void)
 {
-    if (voice_proxy_should_skip_non_voice_task("smart-home pending poll")) {
-        return;
-    }
-
     char body[SERVER_CLIENT_SMALL_BODY_BYTES];
     int status = 0;
     esp_err_t ret = server_client_get_smart_home_pending(body, sizeof(body), &status);

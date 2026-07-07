@@ -32,6 +32,8 @@ typedef struct {
 void sensor_aggregator_init(void);
 /** @brief 构造并上传一次 dashboard snapshot；gateway periodic task 调用。 */
 void sensor_aggregator_upload_snapshot(void);
+/** @brief worker 线程内立即构造并上传一次 dashboard snapshot。 */
+void sensor_aggregator_upload_snapshot_now(void);
 /**
  * @brief 处理一条 status 或 sensor envelope。
  *
@@ -43,8 +45,24 @@ void sensor_aggregator_upload_snapshot(void);
  */
 esp_err_t sensor_aggregator_handle_envelope(const protocol_adapter_envelope_t *envelope,
                                             sensor_aggregator_result_t *result);
-/** @brief Forward an S3-owned canonical CSI fact to ESP-server and update snapshots. */
+/** @brief 处理统一设备流 sensor frame：v1=sensor_value_1，v2=sensor_value_2，v3=quality。 */
+esp_err_t sensor_aggregator_handle_stream_sensor(const char *device_id,
+                                                 int64_t timestamp_ms,
+                                                 const char *link_id,
+                                                 double sensor_value_1,
+                                                 double sensor_value_2,
+                                                 double quality,
+                                                 sensor_aggregator_result_t *result);
+/** @brief 处理统一设备流 status frame：v1=heap，v2=uptime，v3=wifi_rssi。 */
+esp_err_t sensor_aggregator_handle_stream_status(const char *device_id,
+                                                 int64_t timestamp_ms,
+                                                 double heap,
+                                                 double uptime,
+                                                 double wifi_rssi,
+                                                 sensor_aggregator_result_t *result);
+/** @brief 转发 S3 生成的 canonical CSI event v2 到 ESP-server，并刷新 snapshot。 */
 esp_err_t sensor_aggregator_handle_csi_fact(const csi_fusion_fact_t *fact,
+                                            const csi_fusion_telemetry_t *telemetry,
                                             sensor_aggregator_result_t *result);
 /** @brief 记录一次 voice turn 事件并尝试上传 dashboard snapshot。 */
 void sensor_aggregator_record_voice_event(const char *device_id,

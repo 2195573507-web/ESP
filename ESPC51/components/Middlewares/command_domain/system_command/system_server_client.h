@@ -35,7 +35,7 @@ esp_err_t system_server_client_send_status(const char *device_id);
 /**
  * @brief 拉取并处理一条待执行命令。
  *
- * 调用位置：system_service_command_task()。
+ * 调用位置：system_service_tick_command_poll()。
  * 调用时机：按 SYSTEM_SERVICE_COMMAND_POLL_INTERVAL_MS 周期调用。
  * @param device_id 完整终端 device_id，不能为空。
  * @return ESP_OK 表示拉取/执行/ack 成功；ESP_ERR_NOT_FOUND 表示无命令；其他值表示本轮失败。

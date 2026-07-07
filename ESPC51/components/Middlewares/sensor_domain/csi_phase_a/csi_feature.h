@@ -5,7 +5,7 @@
  * @file csi_feature.h
  * @brief C5 calibration and low-dimensional CSI feature extraction.
  *
- * Active output is csi_feature_result_t only. The processor keeps bounded
+ * Active output is csi_feature_frame_t only. The processor keeps bounded
  * calibration aggregates and EWMA state, never raw CSI history or uploadable
  * subcarrier arrays.
  */
@@ -50,8 +50,6 @@ typedef struct {
     float energy_sigma;
     float noise_floor;
     float delta_noise_estimate;
-    uint16_t processed_samples;
-    uint32_t frame_seq;
     uint64_t last_timestamp_ms;
     bool has_previous_clean;
 } csi_feature_processor_t;
@@ -65,7 +63,7 @@ uint16_t csi_feature_amplitude_from_iq(int16_t i, int16_t q);
 
 bool csi_feature_processor_push(csi_feature_processor_t *processor,
                                 const csi_frame_sample_t *frame,
-                                csi_feature_result_t *out_feature);
+                                csi_feature_frame_t *out_feature);
 
 bool csi_feature_processor_ready(const csi_feature_processor_t *processor);
 

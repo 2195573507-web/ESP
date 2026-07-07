@@ -61,6 +61,11 @@ static child_registry_entry_t *find_locked(const char *device_id)
 
 static child_registry_entry_t *find_or_allocate_locked(const char *device_id)
 {
+    if (device_id == NULL || strlen(device_id) >= CHILD_REGISTRY_DEVICE_ID_LEN) {
+        ESP_LOGW(TAG, "child registry rejected invalid device_id length");
+        return NULL;
+    }
+
     child_registry_entry_t *entry = find_locked(device_id);
     if (entry != NULL) {
         return entry;
@@ -73,6 +78,10 @@ static child_registry_entry_t *find_or_allocate_locked(const char *device_id)
         }
     }
 
+    ESP_LOGE(TAG,
+             "child registry full device_id=%s max_children=%u",
+             device_id,
+             (unsigned int)GATEWAY_CONFIG_MAX_CHILDREN);
     return NULL;
 }
 
@@ -106,10 +115,14 @@ esp_err_t child_registry_register_or_update(const char *device_id,
                                             uint32_t seq)
 {
     if (!child_registry_is_allowed(device_id)) {
+        ESP_LOGW(TAG,
+                 "child register rejected device_id=%s reason=not_allowed",
+                 device_id != NULL ? device_id : "<null>");
         return ESP_ERR_NOT_ALLOWED;
     }
 
     if (s_lock == NULL) {
+        ESP_LOGW(TAG, "child register rejected device_id=%s reason=not_initialized", device_id);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -152,6 +165,9 @@ esp_err_t child_registry_register_or_update(const char *device_id,
 esp_err_t child_registry_touch(const char *device_id, uint32_t seq)
 {
     if (!child_registry_is_allowed(device_id)) {
+        ESP_LOGW(TAG,
+                 "child touch rejected device_id=%s reason=not_allowed",
+                 device_id != NULL ? device_id : "<null>");
         return ESP_ERR_NOT_ALLOWED;
     }
 
@@ -180,10 +196,20 @@ esp_err_t child_registry_touch(const char *device_id, uint32_t seq)
 esp_err_t child_registry_update_peer_ip(const char *device_id, const char *peer_ip)
 {
     if (!child_registry_is_allowed(device_id)) {
+        ESP_LOGW(TAG,
+                 "peer ip update rejected device_id=%s reason=not_allowed",
+                 device_id != NULL ? device_id : "<null>");
         return ESP_ERR_NOT_ALLOWED;
     }
     if (peer_ip == NULL || peer_ip[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (strlen(peer_ip) >= sizeof(((child_registry_entry_t *)0)->peer_ip)) {
+        ESP_LOGW(TAG,
+                 "peer ip update rejected device_id=%s peer_ip=%s",
+                 device_id,
+                 peer_ip);
+        return ESP_ERR_INVALID_SIZE;
     }
     if (s_lock == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -195,7 +221,10 @@ esp_err_t child_registry_update_peer_ip(const char *device_id, const char *peer_
         xSemaphoreGive(s_lock);
         return ESP_ERR_NO_MEM;
     }
-    strlcpy(entry->peer_ip, peer_ip, sizeof(entry->peer_ip));
+    if (strcmp(entry->peer_ip, peer_ip) != 0) {
+        ESP_LOGI(TAG, "child peer mapped device_id=%s peer_ip=%s", device_id, peer_ip);
+        strlcpy(entry->peer_ip, peer_ip, sizeof(entry->peer_ip));
+    }
     xSemaphoreGive(s_lock);
     return ESP_OK;
 }

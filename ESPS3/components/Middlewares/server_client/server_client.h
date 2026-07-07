@@ -6,7 +6,8 @@
  * @brief S3 网关到 ESP-server 的 HTTP 客户端接口。
  *
  * C5 从不直接调用本模块；local_http_server/protocol_adapter 结束 C5<->S3 轻量协议后，
- * S3 通过本模块访问完整 /api/device/v1/ingest、logs、smart-home、/api/voice/turn。
+ * S3 通过本模块访问完整 /api/device/v1/ingest、/kernel/csi_event、logs、
+ * smart-home、/api/voice/turn。本层只做 HTTP transport，不推断或改写 schema。
  */
 
 #include <stddef.h>
@@ -28,6 +29,11 @@ esp_err_t server_client_post_ingest_json(const char *json_body,
                                          char *response_body,
                                          size_t response_body_size,
                                          int *http_status);
+/** @brief POST S3 canonical CSI event v2 到 Server；payload 已由 protocol_adapter 严格校验。 */
+esp_err_t server_client_post_csi_event_json(const char *json_body,
+                                            char *response_body,
+                                            size_t response_body_size,
+                                            int *http_status);
 /** @brief POST S3 dashboard snapshot 到 Server；sensor_aggregator 调用，失败由 offline_policy 记录。 */
 esp_err_t server_client_post_gateway_state_json(const char *json_body,
                                                 char *response_body,

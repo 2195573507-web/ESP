@@ -21,10 +21,6 @@ extern "C" {
 esp_err_t voice_proxy_init(void);
 /** @brief 查询当前是否有 voice turn 正在代理；health/heartbeat 日志调用。 */
 bool voice_proxy_is_busy(void);
-/** @brief 语音独占期间普通任务是否应跳过；内部做 30 秒 info 限频。 */
-bool voice_proxy_should_skip_non_voice_task(const char *task_name);
-/** @brief 仅打印一次限频 skip 日志；已确认 busy 的调用方使用。 */
-void voice_proxy_log_busy_skip(const char *task_name);
 /**
  * @brief 处理 /local/v1/voice/turn 请求。
  *

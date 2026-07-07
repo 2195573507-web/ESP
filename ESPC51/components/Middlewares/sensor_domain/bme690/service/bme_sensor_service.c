@@ -2,9 +2,9 @@
  * @file bme_sensor_service.c
  * @brief C5 终端 BME690 后台读取与上报服务。
  *
- * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用），负责启动 BME690 后台任务、
- * 调用 bme690 driver 读取数据、调用 bme_air_quality 计算空气质量，并通过
- * bme_server_client 上传到 S3。本文件不实现 I2C 底层、不改变 /local/v1/sensor 协议，
+ * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用），负责注册 BME690 scheduler
+ * tick，调用 bme690 driver 读取数据、调用 bme_air_quality 计算空气质量，并通过
+ * bme_server_client 上传到 S3。本文件不实现 I2C 底层、不改变统一设备流协议，
  * 也不参与 voice PCM 代理；语音活跃时只按 runtime gate 暂停/恢复本服务。
  */
 
@@ -19,17 +19,15 @@
 #include "bme_air_quality.h"
 #include "bme690.h"
 #include "bme_server_client.h"
-#include "gateway_link.h"
+#include "c5_backpressure_controller.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "terminal_config.h"
 
 static const char *TAG = "bme_sensor_service";
 
 typedef struct {
-    TaskHandle_t task;
     bool running;
     bool paused;
     bool busy;
@@ -97,7 +95,6 @@ static void bme_sensor_service_mark_initialized(bool initialized)
 static void bme_sensor_service_mark_stopped(void)
 {
     portENTER_CRITICAL(&s_bme_service_lock);
-    s_bme_service.task = NULL;
     s_bme_service.running = false;
     s_bme_service.paused = false;
     s_bme_service.busy = false;
@@ -144,112 +141,90 @@ static void bme_sensor_service_delay_ms(uint32_t delay_ms)
     vTaskDelay(ticks);
 }
 
-static uint32_t bme_sensor_service_upload_period_ms(void)
+static void bme_sensor_service_mark_stopped_if_requested(void)
 {
-    uint32_t period_ms = terminal_config_get_upload_period_ms();
-    return period_ms > 0 ? period_ms : BME_SENSOR_READ_UPLOAD_PERIOD_MS;
+    bool stop_requested = false;
+    bool busy = false;
+    bool running = bme_sensor_service_snapshot(NULL, &busy, NULL, &stop_requested);
+    if (running && stop_requested && !busy) {
+        bme_sensor_service_mark_stopped();
+    }
 }
 
-static void bme_sensor_task(void *arg)
+esp_err_t bme_sensor_service_tick(void)
 {
-    (void)arg;
-    app_stack_monitor_log(TAG, "bme_sensor_task", "entry");
-
-    while (1) {
-        bool paused = false;
-        bool stop_requested = false;
-        bool running = bme_sensor_service_snapshot(&paused, NULL, NULL, &stop_requested);
-        if (!running || stop_requested) {
-            break;
-        }
-
-        if (paused) {
-            bme_sensor_service_mark_busy(false);
-            bme_sensor_service_delay_ms(BME_SENSOR_PAUSED_DELAY_MS);
-            continue;
-        }
-
-        bme_sensor_service_mark_busy(true);
-        esp_err_t ret = bme_sensor_service_init_once();
-        if (ret != ESP_OK) {
-            bme_sensor_service_mark_busy(false);
-            bme_sensor_service_delay_ms(bme_sensor_service_upload_period_ms());
-            continue;
-        }
-
-        paused = false;
-        stop_requested = false;
-        (void)bme_sensor_service_snapshot(&paused, NULL, NULL, &stop_requested);
-        if (paused || stop_requested) {
-            bme_sensor_service_mark_busy(false);
-            bme_sensor_service_delay_ms(BME_SENSOR_PAUSED_DELAY_MS);
-            continue;
-        }
-
-        bme690_data_t sensor_data = {0};
-        ret = bme690_read(&sensor_data);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "BME read fail: %s", esp_err_to_name(ret));
-            bme_sensor_service_mark_busy(false);
-            bme_sensor_service_delay_ms(bme_sensor_service_upload_period_ms());
-            continue;
-        }
-
-        ESP_LOGD(TAG,
-                 "BME read success temp=%.2fC hum=%.2f%% pressure=%.2fhPa gas=%luOhm",
-                 sensor_data.temperature_c,
-                 sensor_data.humidity_percent,
-                 sensor_data.pressure_hpa,
-                 (unsigned long)sensor_data.gas_resistance_ohm);
-
-        paused = false;
-        stop_requested = false;
-        (void)bme_sensor_service_snapshot(&paused, NULL, NULL, &stop_requested);
-        if (paused || stop_requested) {
-            bme_sensor_service_mark_busy(false);
-            bme_sensor_service_delay_ms(BME_SENSOR_PAUSED_DELAY_MS);
-            continue;
-        }
-
-        bme_air_quality_result_t air_quality = {0};
-        ret = bme_air_quality_update(&sensor_data, &air_quality);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "BME air quality calc fail: %s", esp_err_to_name(ret));
-            bme_sensor_service_mark_busy(false);
-            bme_sensor_service_delay_ms(bme_sensor_service_upload_period_ms());
-            continue;
-        }
-
-        if (!gateway_link_can_run_non_voice_task("BME upload")) {
-            bme_sensor_service_mark_busy(false);
-            bme_sensor_service_delay_ms(bme_sensor_service_upload_period_ms());
-            continue;
-        }
-
-        ret = bme_server_client_upload_reading(BME_SENSOR_DEVICE_ID,
-                                               &sensor_data,
-                                               &air_quality);
-        if (ret == ESP_OK) {
-            ESP_LOGD(TAG, "BME upload success");
-        } else if (ret == ESP_ERR_INVALID_STATE && app_runtime_non_voice_is_paused()) {
-            app_runtime_log_voice_busy_skip("BME upload");
-        } else if (gateway_link_in_reconnect_mode()) {
-            gateway_link_can_run_non_voice_task("BME upload");
-        } else {
-            ESP_LOGW(TAG, "BME upload fail: %s", esp_err_to_name(ret));
-            app_stack_monitor_log(TAG, "bme_sensor_task", "upload_error");
-            bme_sensor_service_log_heap("BME upload fail heap");
-        }
-
-        bme_sensor_service_mark_busy(false);
-        bme_sensor_service_delay_ms(bme_sensor_service_upload_period_ms());
+    if (!c5_should_run(C5_TASK_TYPE_BME_SENSOR)) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGD(TAG, "BME service stop");
-    app_stack_monitor_log(TAG, "bme_sensor_task", "exit");
-    bme_sensor_service_log_heap("BME stop heap");
-    bme_sensor_service_mark_stopped();
-    vTaskDelete(NULL);
+    bool paused = false;
+    bool stop_requested = false;
+    bool running = bme_sensor_service_snapshot(&paused, NULL, NULL, &stop_requested);
+    if (!running || paused || stop_requested) {
+        bme_sensor_service_mark_stopped_if_requested();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bme_sensor_service_mark_busy(true);
+    esp_err_t ret = bme_sensor_service_init_once();
+    if (ret != ESP_OK) {
+        goto done;
+    }
+
+    paused = false;
+    stop_requested = false;
+    (void)bme_sensor_service_snapshot(&paused, NULL, NULL, &stop_requested);
+    if (paused || stop_requested) {
+        ret = ESP_ERR_INVALID_STATE;
+        goto done;
+    }
+
+    bme690_data_t sensor_data = {0};
+    ret = bme690_read(&sensor_data);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BME read fail: %s", esp_err_to_name(ret));
+        goto done;
+    }
+
+    ESP_LOGD(TAG,
+             "BME read success temp=%.2fC hum=%.2f%% pressure=%.2fhPa gas=%luOhm",
+             sensor_data.temperature_c,
+             sensor_data.humidity_percent,
+             sensor_data.pressure_hpa,
+             (unsigned long)sensor_data.gas_resistance_ohm);
+
+    paused = false;
+    stop_requested = false;
+    (void)bme_sensor_service_snapshot(&paused, NULL, NULL, &stop_requested);
+    if (paused || stop_requested) {
+        ret = ESP_ERR_INVALID_STATE;
+        goto done;
+    }
+
+    bme_air_quality_result_t air_quality = {0};
+    ret = bme_air_quality_update(&sensor_data, &air_quality);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BME air quality calc fail: %s", esp_err_to_name(ret));
+        goto done;
+    }
+
+    ret = bme_server_client_upload_reading(BME_SENSOR_DEVICE_ID,
+                                           &sensor_data,
+                                           &air_quality);
+    if (ret == ESP_OK) {
+        ESP_LOGD(TAG, "BME upload success");
+    } else if (ret == ESP_ERR_INVALID_STATE && app_runtime_non_voice_is_paused()) {
+        app_runtime_log_voice_busy_skip("BME upload");
+    } else {
+        ESP_LOGW(TAG, "BME upload fail: %s", esp_err_to_name(ret));
+        app_stack_monitor_log(TAG, "bme_sensor_tick", "upload_error");
+        bme_sensor_service_log_heap("BME upload fail heap");
+    }
+
+done:
+    bme_sensor_service_mark_busy(false);
+    bme_sensor_service_mark_stopped_if_requested();
+    return ret;
 }
 
 esp_err_t bme_sensor_service_start(void)
@@ -267,28 +242,8 @@ esp_err_t bme_sensor_service_start(void)
     s_bme_service.stop_requested = false;
     portEXIT_CRITICAL(&s_bme_service_lock);
 
-    ESP_LOGD(TAG, "BME service start");
+    ESP_LOGD(TAG, "BME service registered with C5 scheduler");
     bme_sensor_service_log_heap("BME start heap");
-
-    BaseType_t created = xTaskCreate(bme_sensor_task,
-                                     "bme_sensor_task",
-                                     BME_SENSOR_TASK_STACK,
-                                     NULL,
-                                     BME_SENSOR_TASK_PRIORITY,
-                                     &s_bme_service.task);
-    if (created != pdPASS) {
-        portENTER_CRITICAL(&s_bme_service_lock);
-        s_bme_service.task = NULL;
-        s_bme_service.running = false;
-        s_bme_service.paused = false;
-        s_bme_service.busy = false;
-        s_bme_service.stop_requested = false;
-        portEXIT_CRITICAL(&s_bme_service_lock);
-        ESP_LOGE(TAG, "BME service task create fail");
-        bme_sensor_service_log_heap("BME start task create fail heap");
-        return ESP_ERR_NO_MEM;
-    }
-
     return ESP_OK;
 }
 
@@ -352,20 +307,18 @@ void bme_sensor_service_resume(void)
 
 void bme_sensor_service_stop(void)
 {
-    TaskHandle_t task = NULL;
-
     portENTER_CRITICAL(&s_bme_service_lock);
     if (s_bme_service.running) {
         s_bme_service.stop_requested = true;
-        task = s_bme_service.task;
     }
     portEXIT_CRITICAL(&s_bme_service_lock);
 
-    if (task == NULL) {
+    if (!bme_sensor_service_is_running()) {
         return;
     }
 
     ESP_LOGD(TAG, "BME service stop requested");
+    bme_sensor_service_mark_stopped_if_requested();
 
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(BME_SENSOR_STOP_JOIN_TIMEOUT_MS);
     while (bme_sensor_service_is_running()) {
