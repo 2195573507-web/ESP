@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif; margin: 0; background: #edf0f2; color: #1f272d; }
+  main { padding: 28px; max-width: 1500px; margin: 0 auto; }
+  h1 { margin: 0; font-size: 27px; } p { color: #50606b; }
+  .overview { display:grid; grid-template-columns: 1.6fr repeat(3, 1fr); gap: 10px; margin: 20px 0; }
+  .summary,.card { background:white; border:1px solid #d7dfe2; border-radius:8px; }
+  .summary { padding:13px; } .summary strong { display:block; font-size:20px; margin-top:4px; }
+  .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
+  .card { overflow:hidden; } .card-head { padding:14px 15px; border-bottom:1px solid #e0e6e9; display:flex; justify-content:space-between; align-items:flex-start; }
+  .card h2 { font-size:16px; margin:0 0 4px; }.link { font-size:12px; color:#566870; }.online { color:#087443; font-size:12px; font-weight:600; }
+  .plot { height:210px; margin:12px; background:#f3f8f6; border:1px solid #cfddd7; position:relative; overflow:hidden; }
+  .axisx,.axisy { position:absolute; background:#cbd8d3; }.axisx { height:1px; left:8%;right:8%;bottom:27%; }.axisy { width:1px; top:8%;bottom:11%;left:50%; }
+  .dot { position:absolute; width:12px;height:12px;border:2px solid white;border-radius:50%;background:#087443;box-shadow:0 0 0 1px #087443; }.d1{left:39%;top:42%}.d2{left:57%;top:31%}.d3{left:67%;top:55%}
+  .trail { position:absolute; height:2px; background:#6da58d; transform-origin:left center; opacity:.75; }.t1{left:30%;top:58%;width:74px;transform:rotate(-25deg)}.t2{left:45%;top:68%;width:92px;transform:rotate(-47deg)}
+  .metrics { padding:0 14px 14px; display:grid; grid-template-columns:1fr 1fr;gap:7px; font-size:12px; }.metric { background:#f4f6f7;padding:8px; }.metric span { display:block;color:#60717a;margin-bottom:3px; }
+  .unknown { margin-top:15px;padding:13px 15px;background:#fff9e9;border:1px solid #ebd389;border-radius:8px;display:flex;justify-content:space-between;gap:15px; }.unknown b{color:#8a5a00}
+  .mobile { margin-top:25px;display:flex;gap:12px;align-items:stretch; }.phone { width:250px;background:#1f272d;border:8px solid #1f272d;border-radius:22px;padding:8px; }.phone-main{background:#fbfcfc;border-radius:15px;min-height:340px;padding:10px}.tabs{display:flex;gap:5px}.tab{font-size:10px;flex:1;padding:6px 2px;text-align:center;background:#e5ebea;border-radius:5px}.tab.active{background:#087443;color:white}.phone-plot{height:150px;margin:12px 0;background:#f3f8f6;border:1px solid #cfddd7;position:relative}.phone-plot:after{content:"C51 独立坐标图与轨迹";position:absolute;left:18px;top:66px;font-size:12px;color:#53665e}.note{max-width:550px;padding:15px;background:white;border:1px solid #d7dfe2;border-radius:8px;font-size:14px;line-height:1.6}.note ul{padding-left:20px;margin-bottom:0}.label{font-size:11px;color:#60717a;text-transform:uppercase;letter-spacing:.4px}
+  @media(max-width:900px){.grid{grid-template-columns:1fr}.overview{grid-template-columns:1fr 1fr}.mobile{display:none}}
+</style>
+</head>
+<body><main>
+  <div class="label">Design checkpoint · isolation first</div><h1>三房间雷达调试界面</h1><p>每块面板消费自己的 source state；总览只显示汇总文字，不接收任何坐标、轨迹或跨房间 tracker。</p>
+  <section class="overview">
+    <div class="summary"><span class="label">系统目标总数</span><strong>6（3 个独立房间之和）</strong></div>
+    <div class="summary"><span class="label">S3 本地</span><strong>2 · fresh</strong></div>
+    <div class="summary"><span class="label">C51 房间</span><strong>1 · reconnecting</strong></div>
+    <div class="summary"><span class="label">C52 房间</span><strong>3 · fresh</strong></div>
+  </section>
+  <section class="grid">
+    <article class="card"><div class="card-head"><div><h2>S3 本地雷达 · 本地房间</h2><div class="link">UART / LD2450 本地雷达</div></div><div class="online">在线 · 120 ms</div></div><div class="plot"><i class="axisx"></i><i class="axisy"></i><i class="trail t1"></i><i class="dot d1"></i><i class="dot d2"></i></div><div class="metrics"><div class="metric"><span>目标 / Presence</span>2 · motion</div><div class="metric"><span>诊断</span>错误 0 · 拒绝 0</div></div></article>
+    <article class="card"><div class="card-head"><div><h2>C51 房间雷达 · 房间 A</h2><div class="link">LD2450 BLE → C51 → S3</div></div><div class="online">恢复中 · 860 ms</div></div><div class="plot"><i class="axisx"></i><i class="axisy"></i><i class="trail t2"></i><i class="dot d1"></i></div><div class="metrics"><div class="metric"><span>目标 / Presence</span>1 · hold</div><div class="metric"><span>诊断</span>重连 1 · 拒绝 0</div></div></article>
+    <article class="card"><div class="card-head"><div><h2>C52 房间雷达 · 房间 B</h2><div class="link">LD2450 BLE → C52 → S3</div></div><div class="online">在线 · 90 ms</div></div><div class="plot"><i class="axisx"></i><i class="axisy"></i><i class="trail t1"></i><i class="trail t2"></i><i class="dot d1"></i><i class="dot d2"></i><i class="dot d3"></i></div><div class="metrics"><div class="metric"><span>目标 / Presence</span>3 · motion</div><div class="metric"><span>诊断</span>解析错误 1 · 拒绝 0</div></div></article>
+  </section>
+  <section class="unknown"><div><b>UNKNOWN 诊断区 · 1 条</b><br><small>原始摘要、候选 source/device_id、无法判定原因、时间。此处永不写入任意房间状态。</small></div><div>source=legacy_bridge<br>device_id=-</div></section>
+  <section class="mobile"><div class="phone"><div class="phone-main"><b style="font-size:13px">三房间实时状态</b><div class="tabs"><span class="tab">S3 本地</span><span class="tab active">C51</span><span class="tab">C52</span></div><div class="phone-plot"></div><small>切换标签只改变可见面板；其他两路继续接收、解析与保存。</small></div></div><div class="note"><b>推荐：独立状态存储 + 复用画布</b><ul><li>每个 source 具有自己的 frame、目标、轨迹、序列、配置与 freshness。</li><li>画布接收单一路径数据和单路 coordinateConfig，禁止全局对象。</li><li>串口、导入和回放都先做来源识别，再生成 source-scoped event。</li><li>UNKNOWN 仅进入诊断 ring buffer。</li></ul></div></section>
+</main></body></html>

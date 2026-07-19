@@ -1,0 +1,26 @@
+Command: ninja all
+[1/17] Performing build step for 'bootloader'
+[1/1] cd "/Users/zhiqin/ESP 雷达/build-radar-c51/bootloader/esp-idf/esptool_py" && /Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x2000 /Users/zhiqin/ESP\ 雷达/build-radar-c51/bootloader/bootloader.bin
+Bootloader binary size 0x5670 bytes. 0x990 bytes (10%) free.
+[2/17] No install step for 'bootloader'
+[3/17] Completed 'bootloader'
+[4/17] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/command_domain/system_command/system_service.c.obj
+[5/17] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/app_orchestrator/app_orchestrator.c.obj
+[6/17] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/sensor_domain/bme690/service/bme_sensor_service.c.obj
+[7/17] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/runtime/c5_backpressure_controller.c.obj
+[8/17] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/wake/wake_prompt_cache.c.obj
+[9/17] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/voice_domain/voice_chain.c.obj
+[10/17] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/speaker/speaker_player.c.obj
+[11/17] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/server_voice/server_voice_client.c.obj
+[12/17] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/mic/mic_adc_test.c.obj
+[13/17] Linking C static library esp-idf/Middlewares/libMiddlewares.a
+[14/17] Generating esp-idf/esp_system/ld/sections.ld
+[15/17] Linking CXX executable 00_Learn.elf
+[16/17] Generating binary image from built executable
+esptool.py v4.12.dev2
+Creating esp32c5 image...
+Merged 1 ELF section
+Successfully created esp32c5 image.
+Generated /Users/zhiqin/ESP 雷达/build-radar-c51/00_Learn.bin
+[17/17] cd "/Users/zhiqin/ESP 雷达/build-radar-c51/esp-idf/esptool_py" && /Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /Users/zhiqin/ESP\ 雷达/build-radar-c51/partition_table/partition-table.bin /Users/zhiqin/ESP\ 雷达/build-radar-c51/00_Learn.bin
+00_Learn.bin binary size 0x1aacd0 bytes. Smallest app partition is 0x500000 bytes. 0x355330 bytes (67%) free.

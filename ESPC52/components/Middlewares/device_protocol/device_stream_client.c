@@ -3,8 +3,7 @@
  * @brief C5 -> S3 统一轻量 telemetry stream 客户端。
  *
  * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用）。它负责把本地 sensor/status/event
- * 压成短 JSON frame，然后发给 ESPS3 本地网关。CSI feature 由 csi_server_client
- * 直接 POST 到 /local/v1/csi/result，不再走 UDP stream。
+ * 压成短 JSON frame，然后发给 ESPS3 本地网关。
  */
 
 #include "device_stream_client.h"
@@ -130,7 +129,7 @@ static esp_err_t send_udp_frame(const char *json_body)
     }
 
     size_t body_len = strlen(json_body);
-    /* UDP 发送保持一次性 best-effort；不在 C5 上缓存重试，避免断联时占用语音/CSI资源。 */
+    /* UDP 发送保持一次性 best-effort；不在 C5 上缓存重试，避免断联时占用语音资源。 */
     int sent = sendto(sock,
                       json_body,
                       body_len,
@@ -192,7 +191,7 @@ esp_err_t device_stream_client_publish(const char *type,
         return ESP_OK;
     }
 
-    /* 普通 stream 允许 HTTP fallback；CSI feature 不走本模块，避免和 UDP stream 协议混用。 */
+    /* Normal stream traffic may use the local HTTP fallback. */
     device_protocol_metadata_t metadata = {0};
     device_protocol_prepare_metadata(&metadata, type);
     server_comm_http_response_t response = {0};

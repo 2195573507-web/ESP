@@ -2,7 +2,7 @@
  * @file c5_backpressure_controller.c
  * @brief C5 终端统一回压控制器和事件调度器。
  *
- * 本文件属于 ESP32-C5 终端调度层（当前 ESPC51 侧实现）。它把 CSI feature、本地 BME
+ * 本文件属于 ESP32-C5 终端调度层。它把本地 BME
  * 上报、heartbeat/status/command poll 转成 runtime event，按语音独占、S3 local
  * gateway 连接状态、待运行任务比例和 CPU 空闲估算放慢普通事件。业务函数只由
  * worker 执行；本模块不构造 Server API，也不绕过 ESPS3。
@@ -22,6 +22,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 #include "freertos/task.h"
+#include "radar_resource_adapter.h"
 #include "system_service.h"
 #include "terminal_config.h"
 
@@ -61,7 +62,6 @@ static c5_backpressure_state_t s_backpressure_state = {
     .cpu_idle_estimate = 100,
 };
 static c5_scheduled_task_t s_scheduler_timers[] = {
-    {C5_TASK_TYPE_CSI_PROCESS, C5_EVENT_CSI_READY, 0},
     {C5_TASK_TYPE_BME_SENSOR, C5_EVENT_BME_SAMPLE, 0},
     {C5_TASK_TYPE_SYSTEM_HEARTBEAT, C5_EVENT_HEARTBEAT, 0},
     {C5_TASK_TYPE_SYSTEM_STATUS, C5_EVENT_STATUS, 0},
@@ -112,8 +112,6 @@ static c5_task_priority_t c5_task_priority(c5_task_type_t task_type)
     switch (task_type) {
     case C5_TASK_TYPE_VOICE_HIGH:
         return C5_TASK_PRIORITY_HIGH;
-    case C5_TASK_TYPE_CSI_PROCESS:
-    case C5_TASK_TYPE_CSI_REPORT:
     case C5_TASK_TYPE_LOW:
         return C5_TASK_PRIORITY_LOW;
     case C5_TASK_TYPE_SYSTEM_HEARTBEAT:
@@ -143,10 +141,6 @@ const char *c5_task_type_name(c5_task_type_t task_type)
         return "system_command_poll";
     case C5_TASK_TYPE_BME_SENSOR:
         return "bme_sensor";
-    case C5_TASK_TYPE_CSI_PROCESS:
-        return "csi_process";
-    case C5_TASK_TYPE_CSI_REPORT:
-        return "csi_report";
     default:
         return "unknown";
     }
@@ -226,13 +220,18 @@ bool c5_should_run(c5_task_type_t task_type)
 static uint32_t c5_base_interval_ms(c5_task_type_t task_type)
 {
     switch (task_type) {
-    case C5_TASK_TYPE_CSI_PROCESS:
-        return C5_CSI_PROCESS_INTERVAL_MS;
-    case C5_TASK_TYPE_CSI_REPORT:
-        return CSI_SERVICE_REPORT_INTERVAL_MS;
     case C5_TASK_TYPE_BME_SENSOR: {
         uint32_t period_ms = terminal_config_get_upload_period_ms();
-        return period_ms > 0U ? period_ms : BME_SENSOR_READ_UPLOAD_PERIOD_MS;
+        const uint32_t base_period_ms = period_ms > 0U ? period_ms :
+                                                        BME_SENSOR_READ_UPLOAD_PERIOD_MS;
+#if CONFIG_C5_BME_ADAPTIVE_REPORT
+        const uint32_t adaptive_period_ms =
+            radar_resource_adapter_bme_event_period_ms(c5_scheduler_now_ms());
+        /* Sampling keeps its established cadence; only post-voice recovery needs an earlier tick. */
+        return adaptive_period_ms < base_period_ms ? adaptive_period_ms : base_period_ms;
+#else
+        return base_period_ms;
+#endif
     }
     case C5_TASK_TYPE_SYSTEM_HEARTBEAT:
         return SYSTEM_SERVICE_HEARTBEAT_INTERVAL_MS;
@@ -243,7 +242,7 @@ static uint32_t c5_base_interval_ms(c5_task_type_t task_type)
     case C5_TASK_TYPE_VOICE_HIGH:
         return C5_SCHEDULER_MIN_SLEEP_MS;
     case C5_TASK_TYPE_LOW:
-        return C5_CSI_PROCESS_INTERVAL_MS;
+        return SYSTEM_SERVICE_COMMAND_POLL_INTERVAL_MS;
     case C5_TASK_TYPE_NORMAL:
     default:
         return SYSTEM_SERVICE_COMMAND_POLL_INTERVAL_MS;

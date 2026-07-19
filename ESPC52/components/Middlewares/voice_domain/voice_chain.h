@@ -18,7 +18,7 @@
 #endif
 
 #ifndef VOICE_CHAIN_TASK_STACK
-#define VOICE_CHAIN_TASK_STACK 8192U // voice_chain 任务栈，单位字节。
+#define VOICE_CHAIN_TASK_STACK 4096U // high_water=7952 bytes on 8 KiB; retain 3.8 KiB headroom.
 #endif
 
 #ifndef VOICE_CHAIN_TASK_PRIORITY

@@ -21,7 +21,6 @@ extern "C" {
 #endif
 
 #define S3_EVENT_BUS_DEVICE_ID_LEN 48U
-#define S3_EVENT_BUS_LINK_ID_LEN 32U
 
 typedef enum {
     S3_EVENT_BUS_LEVEL_CRITICAL = 0,
@@ -38,21 +37,8 @@ typedef enum {
     S3_EVENT_BUS_STATE_BME_LATEST_C52,
     S3_EVENT_BUS_STATE_DEVICE_STATUS_C51,
     S3_EVENT_BUS_STATE_DEVICE_STATUS_C52,
-    S3_EVENT_BUS_STATE_CSI_LATEST_C51,
-    S3_EVENT_BUS_STATE_CSI_LATEST_C52,
     S3_EVENT_BUS_STATE_COUNT,
 } s3_event_bus_state_key_t;
-
-/** @brief CSI 最新摘要只用于诊断日志，不替代 csi_fusion 的正式状态机。 */
-typedef struct {
-    bool valid;
-    char device_id[S3_EVENT_BUS_DEVICE_ID_LEN];
-    char link_id[S3_EVENT_BUS_LINK_ID_LEN];
-    float motion_score;
-    float quality;
-    int64_t timestamp_ms; /**< 兼容诊断展示；不用于 session 生命周期排序。 */
-    int64_t rx_time_us;   /**< S3 单调接收时间；用于与 disconnect cutoff 比较。 */
-} s3_event_bus_csi_latest_t;
 
 /** @brief event bus 诊断快照；队列深度和 drop/coalesce 计数用于判断回压状态。 */
 typedef struct {
@@ -64,9 +50,6 @@ typedef struct {
     uint32_t drop_count;
     uint32_t background_drop_count;
     uint32_t coalesce_count;
-    uint32_t csi_ingress_drop_count;
-    uint32_t csi_ingress_coalesce_count;
-    s3_event_bus_csi_latest_t csi_latest;
 } s3_event_bus_stats_t;
 
 struct s3_scheduler_event;
@@ -87,20 +70,23 @@ void s3_event_bus_reset(void);
  */
 esp_err_t s3_event_bus_push_owned(struct s3_scheduler_event *event);
 
+/**
+ * @brief Push one owned event while bounding only the event-bus mutex wait.
+ *
+ * A non-OK result leaves ownership with the caller. This is for local HTTP
+ * admission paths that must fail promptly; normal scheduler callers retain
+ * the existing unbounded/reliable behavior through s3_event_bus_push_owned().
+ */
+esp_err_t s3_event_bus_push_owned_timed(struct s3_scheduler_event *event,
+                                        uint32_t lock_timeout_ms,
+                                        uint32_t *out_lock_wait_ms,
+                                        s3_event_bus_stats_t *out_stats);
+
 /** @brief 等待 event bus 有可消费事件；timeout_ms 为最长等待时间。 */
 bool s3_event_bus_wait(uint32_t timeout_ms);
 
 /** @brief 按 CRITICAL > REALTIME > STATE > BACKGROUND 顺序取出一个事件。 */
 bool s3_event_bus_dequeue(struct s3_scheduler_event **out_event);
-
-/** @brief 更新 CSI 最新诊断摘要；不参与正式融合决策。 */
-void s3_event_bus_update_csi_latest(const s3_event_bus_csi_latest_t *latest);
-
-/** @brief 清除指定 C5 在 cutoff_us 及以前（或无时间戳）的 CSI ingress/诊断摘要。 */
-void s3_event_bus_clear_csi_before(const char *device_id, int64_t cutoff_us);
-
-/** @brief 清除指定 C5 的 CSI 最新诊断摘要；设备资源释放时调用。 */
-void s3_event_bus_clear_csi_latest(const char *device_id);
 
 /** @brief 读取 event bus 当前诊断快照。 */
 s3_event_bus_stats_t s3_event_bus_get_stats(void);

@@ -38,9 +38,9 @@ extern "C" {
 #define ESP111_PROTOCOL_GATEWAY_PASSWORD "sensaihub123"
 #define ESP111_PROTOCOL_GATEWAY_IP "192.168.4.1"
 
-/* C5 终端能力声明：lcd/csi_placeholder 表示保留上层接口，不代表当前接入真实 LCD 或 CSI 算法。 */
+/* C5 terminal capabilities advertised during local registration. */
 #define ESP111_PROTOCOL_TERMINAL_CAPABILITIES_JSON \
-    "[\"sensor\",\"mic\",\"speaker\",\"lcd\",\"wake\",\"csi_placeholder\"]"
+    "[\"sensor\",\"mic\",\"speaker\",\"lcd\",\"wake\",\"radar\"]"
 
 /* S3 <-> Server 完整 v1 JSON 字段名。C5 本地 body 不直接使用这些长字段。 */
 #define ESP111_PROTOCOL_JSON_SCHEMA_VERSION "schema_version"
@@ -78,7 +78,6 @@ extern "C" {
 #define ESP111_PROTOCOL_LOCAL_JSON_HEALTH_SUBTYPE "h"
 #define ESP111_PROTOCOL_LOCAL_JSON_WIFI_RSSI "r"
 #define ESP111_PROTOCOL_LOCAL_JSON_VOICE_EVENT "e"
-#define ESP111_PROTOCOL_LOCAL_JSON_CSI_KIND "k"
 #define ESP111_PROTOCOL_LOCAL_JSON_AUDIO_FORMAT "f"
 #define ESP111_PROTOCOL_LOCAL_JSON_VALUES "v"
 #define ESP111_PROTOCOL_LOCAL_JSON_COMMAND_ID "cid"
@@ -97,7 +96,6 @@ extern "C" {
 #define ESP111_PROTOCOL_DEVICE_STREAM_JSON_VALUE1 "v1"
 #define ESP111_PROTOCOL_DEVICE_STREAM_JSON_VALUE2 "v2"
 #define ESP111_PROTOCOL_DEVICE_STREAM_JSON_VALUE3 "v3"
-#define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_CSI "csi"
 #define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_SENSOR "sensor"
 #define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_STATUS "status"
 #define ESP111_PROTOCOL_DEVICE_STREAM_TYPE_EVENT "event"
@@ -106,14 +104,13 @@ extern "C" {
 #define ESP111_PROTOCOL_LOCAL_TYPE_HEARTBEAT "hb"
 #define ESP111_PROTOCOL_LOCAL_TYPE_STATUS "st"
 #define ESP111_PROTOCOL_LOCAL_TYPE_BME690 "bme"
-#define ESP111_PROTOCOL_LOCAL_TYPE_CSI_RESULT "csi"
+#define ESP111_PROTOCOL_LOCAL_TYPE_RADAR "radar"
 
 /* Numeric C5 -> S3 packet types. S3 keeps accepting the string constants above during migration. */
 #define ESP111_PROTOCOL_LOCAL_PACKET_SENSOR 1U
 #define ESP111_PROTOCOL_LOCAL_PACKET_HEALTH 2U
 #define ESP111_PROTOCOL_LOCAL_PACKET_VOICE 3U
 #define ESP111_PROTOCOL_LOCAL_PACKET_CMD_ACK 4U
-#define ESP111_PROTOCOL_LOCAL_PACKET_CSI 5U
 
 #define ESP111_PROTOCOL_LOCAL_SENSOR_KIND_BME690 1U
 
@@ -142,8 +139,6 @@ extern "C" {
 #define ESP111_PROTOCOL_MSG_HEARTBEAT "device.heartbeat"
 #define ESP111_PROTOCOL_MSG_STATUS "device.status"
 #define ESP111_PROTOCOL_MSG_SENSOR_BME690 "sensor.bme690"
-#define ESP111_PROTOCOL_MSG_CSI_RESULT "csi.result"
-#define ESP111_PROTOCOL_MSG_CSI_MOTION "csi.motion"
 #define ESP111_PROTOCOL_MSG_COMMAND_ACK "command.ack"
 #define ESP111_PROTOCOL_MSG_DASHBOARD_SNAPSHOT "gateway.dashboard_snapshot"
 
@@ -154,7 +149,9 @@ extern "C" {
 #define ESP111_PROTOCOL_ROUTE_HEARTBEAT "/local/v1/heartbeat"
 #define ESP111_PROTOCOL_ROUTE_STATUS "/local/v1/status"
 #define ESP111_PROTOCOL_ROUTE_SENSOR "/local/v1/sensor"
-#define ESP111_PROTOCOL_ROUTE_CSI_RESULT "/local/v1/csi/result"
+#define ESP111_PROTOCOL_ROUTE_RADAR_STATE "/local/v1/radar/state"
+#define ESP111_PROTOCOL_ROUTE_RADAR_RESULT "/local/v1/radar/result"
+#define ESP111_PROTOCOL_ROUTE_RADAR_DEBUG "/local/v1/radar/debug"
 #define ESP111_PROTOCOL_ROUTE_DEVICE_STREAM "/local/v1/stream"
 #define ESP111_PROTOCOL_ROUTE_VOICE_TURN "/local/v1/voice/turn"
 #define ESP111_PROTOCOL_ROUTE_VOICE_PROMPT_CACHE "/local/v1/voice/prompt-cache"
@@ -176,7 +173,7 @@ extern "C" {
 #define ESP111_PROTOCOL_ERROR_INVALID_ENVELOPE "invalid_envelope"
 #define ESP111_PROTOCOL_ERROR_INVALID_DEVICE_ID "invalid_device_id"
 #define ESP111_PROTOCOL_ERROR_INVALID_HEARTBEAT "invalid_heartbeat"
-#define ESP111_PROTOCOL_ERROR_INVALID_CSI_RESULT "invalid_csi_result"
+#define ESP111_PROTOCOL_ERROR_INVALID_RADAR_STATE "invalid_radar_state"
 #define ESP111_PROTOCOL_ERROR_INVALID_COMMAND_ID "invalid_command_id"
 #define ESP111_PROTOCOL_ERROR_INTERNAL "internal_error"
 #define ESP111_PROTOCOL_ERROR_COMMAND_POLL_FAILED "command_poll_failed"

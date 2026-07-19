@@ -51,7 +51,6 @@ typedef enum {
 
 typedef enum {
     NETWORK_WORKER_SERVER_JSON_INGEST = 0,
-    NETWORK_WORKER_SERVER_JSON_CSI_EVENT,
     NETWORK_WORKER_SERVER_JSON_GATEWAY_STATE,
     NETWORK_WORKER_SERVER_JSON_SYSTEM_LOG,
     NETWORK_WORKER_SERVER_JSON_ALARM,
@@ -82,7 +81,7 @@ esp_err_t network_worker_post_ap_station_event(network_worker_event_t event,
                                                const uint8_t mac[6],
                                                uint8_t aid);
 
-/** @brief 将已经通过 register/heartbeat/sensor/CSI 验证的 C5 identity 绑定到 pending SoftAP station。 */
+/** @brief 将已经通过 register/heartbeat/sensor 验证的 C5 identity 绑定到 pending SoftAP station。 */
 esp_err_t network_worker_bind_ap_station_identity(const char *device_id, const char *peer_ip);
 
 /** @brief 读取当前网关链路状态；诊断日志或 health 路径调用。 */
@@ -130,9 +129,6 @@ esp_err_t network_worker_release_peer_resources(const char *device_id);
 
 /** @brief Wake retained sensor replay after a peer becomes RESTORING or ACTIVE. */
 esp_err_t network_worker_restore_peer_resources(const char *device_id);
-
-/** @brief Invalidate the latest fused CSI upload after link topology changes. */
-void network_worker_clear_latest_csi(const char *reason);
 
 /** @brief 请求上传一次 dashboard/gateway snapshot；scheduler 周期调用。 */
 esp_err_t network_worker_enqueue_snapshot_upload(void);

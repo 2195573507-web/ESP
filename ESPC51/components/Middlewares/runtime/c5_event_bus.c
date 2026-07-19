@@ -3,7 +3,7 @@
  * @brief C5 运行时事件队列和 dispatcher 辅助实现。
  *
  * 本文件只管理事件所有权、队列顺序和诊断计数。具体业务处理由
- * c5_runtime_workers.c 中的 CSI/BME/system worker 完成。
+ * c5_runtime_workers.c 中的 BME/system workers 完成。
  */
 
 #include "c5_event_bus.h"
@@ -36,7 +36,7 @@ static uint64_t c5_event_bus_now_ms(void)
 
 static bool c5_event_type_is_valid(c5_event_type_t type)
 {
-    return type >= C5_EVENT_CSI_READY && type < C5_EVENT_MAX;
+    return type >= C5_EVENT_BME_SAMPLE && type < C5_EVENT_MAX;
 }
 
 esp_err_t c5_event_bus_init(void)
@@ -190,8 +190,6 @@ void c5_event_bus_get_stats(c5_event_bus_stats_t *out_stats)
 const char *c5_event_type_name(c5_event_type_t type)
 {
     switch (type) {
-    case C5_EVENT_CSI_READY:
-        return "C5_EVENT_CSI_READY";
     case C5_EVENT_BME_SAMPLE:
         return "C5_EVENT_BME_SAMPLE";
     case C5_EVENT_HEARTBEAT:

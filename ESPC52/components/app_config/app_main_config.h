@@ -9,7 +9,7 @@
  * 1. MAIN_ENABLE_MIC_CHAIN=1 时启动 C5 -> ESPS3 local gateway 半双工语音链路。
  * 2. MAIN_ENABLE_BME_SERVICE=1 时启动 BME690 周期读取/上传服务。
  * 3. MAIN_ENABLE_SPEAKER_SELF_TEST=1 时启动后播放 1 kHz 自检音，不经过 server voice。
- * 4. MAIN_ENABLE_CSI_SERVICE=1 时在 WiFi 稳定后启动 CSI 本地校准和 feature 输出。
+ * 4. LD2450 runtime is started after the C5 scheduler and remains non-critical.
  */
 
 #ifndef MAIN_ENABLE_MIC_CHAIN
@@ -32,39 +32,17 @@
 #define MAIN_ENABLE_SPEAKER_SELF_TEST 0
 #endif
 
-#ifndef MAIN_ENABLE_CSI_SERVICE
-/* CSI 运行总开关：置 0 时不配置 WiFi CSI、不启动 CSI 任务。 */
-#define MAIN_ENABLE_CSI_SERVICE 1
+/* Adaptive telemetry is additive: disabling each switch restores its legacy cadence. */
+#ifndef CONFIG_C5_RADAR_ADAPTIVE_UPLOAD
+#define CONFIG_C5_RADAR_ADAPTIVE_UPLOAD 1
 #endif
 
-#ifndef CSI_REPORT_INTERVAL_MS
-/* CSI edge feature 输出周期，单位 ms；callback 不执行算法，只投递处理事件。 */
-#define CSI_REPORT_INTERVAL_MS 100U
+#ifndef CONFIG_C5_BME_ADAPTIVE_REPORT
+#define CONFIG_C5_BME_ADAPTIVE_REPORT 1
 #endif
 
-#ifndef CSI_SERVICE_REPORT_INTERVAL_MS
-/* 保留旧宏名；默认跟随 CSI_REPORT_INTERVAL_MS。 */
-#define CSI_SERVICE_REPORT_INTERVAL_MS CSI_REPORT_INTERVAL_MS
-#endif
-
-#ifndef CSI_OUTPUT_ENABLE_LOG
-/* CSI feature 本地日志开关；仅打印轻量 feature JSON，不打印 raw CSI。 */
-#define CSI_OUTPUT_ENABLE_LOG 1
-#endif
-
-#ifndef CSI_OUTPUT_ENABLE_HTTP
-/* CSI feature HTTP 上报开关；只 POST 到 ESPS3 /local/v1/csi/result。 */
-#define CSI_OUTPUT_ENABLE_HTTP 1
-#endif
-
-#ifndef CSI_OUTPUT_ENABLE_DEBUG_METRICS
-/* CSI debug payload 开关：默认 HTTP payload 不携带 energy/variance/cv 或 legacy v。 */
-#define CSI_OUTPUT_ENABLE_DEBUG_METRICS 0
-#endif
-
-#ifndef CSI_ALGORITHM_VERSION
-/* CSI 边缘 feature 算法版本；C5 输出本地 IDLE/MOTION，S3 负责双链路融合。 */
-#define CSI_ALGORITHM_VERSION "edge_feature_v2"
+#ifndef CONFIG_C5_VOICE_TELEMETRY_THROTTLE
+#define CONFIG_C5_VOICE_TELEMETRY_THROTTLE 1
 #endif
 
 #ifndef C5_SCHEDULER_TASK_STACK
@@ -78,12 +56,12 @@
 #endif
 
 #ifndef C5_WORKER_TASK_STACK
-/* C5 CSI/BME/system worker 栈；覆盖各自 HTTP/JSON/传感器业务路径。 */
+/* C5 BME/system worker stack. Radar UART and reporting use isolated tasks. */
 #define C5_WORKER_TASK_STACK 8192U
 #endif
 
 #ifndef C5_WORKER_TASK_PRIORITY
-/* C5 CSI/BME/system worker 优先级，低于 dispatcher 与 voice/audio 链路。 */
+/* C5 BME/system worker priority, below dispatcher and voice/audio. */
 #define C5_WORKER_TASK_PRIORITY 3U
 #endif
 
@@ -123,28 +101,8 @@
 #error "MAIN_ENABLE_SPEAKER_SELF_TEST must be 0 or 1"
 #endif
 
-#if MAIN_ENABLE_CSI_SERVICE != 0 && MAIN_ENABLE_CSI_SERVICE != 1
-#error "MAIN_ENABLE_CSI_SERVICE must be 0 or 1"
-#endif
-
-#if CSI_OUTPUT_ENABLE_LOG != 0 && CSI_OUTPUT_ENABLE_LOG != 1
-#error "CSI_OUTPUT_ENABLE_LOG must be 0 or 1"
-#endif
-
-#if CSI_OUTPUT_ENABLE_HTTP != 0 && CSI_OUTPUT_ENABLE_HTTP != 1
-#error "CSI_OUTPUT_ENABLE_HTTP must be 0 or 1"
-#endif
-
-#if CSI_OUTPUT_ENABLE_DEBUG_METRICS != 0 && CSI_OUTPUT_ENABLE_DEBUG_METRICS != 1
-#error "CSI_OUTPUT_ENABLE_DEBUG_METRICS must be 0 or 1"
-#endif
-
 #if MAIN_SPEAKER_SELF_TEST_DURATION_MS <= 0
 #error "MAIN_SPEAKER_SELF_TEST_DURATION_MS must be greater than 0"
-#endif
-
-#if CSI_SERVICE_REPORT_INTERVAL_MS < 100
-#error "CSI_SERVICE_REPORT_INTERVAL_MS must be at least 100ms"
 #endif
 
 #if C5_SCHEDULER_TASK_STACK < 8192

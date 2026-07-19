@@ -6,7 +6,6 @@
  * @brief S3 侧 C5 扁平 device stream ingress。
  *
  * 本模块只处理 C5 通过 UDP 或 /local/v1/device-stream 发送的短字段 stream frame。
- * CSI v2 envelope 仍走 local_http_server/s3_scheduler/protocol_adapter/csi_fusion 主路径。
  * HTTP/UDP 入口只入队，实际解析由 scheduler stream worker 调用。
  */
 

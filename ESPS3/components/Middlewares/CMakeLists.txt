@@ -17,9 +17,21 @@ set(gateway_srcs
             offline_policy/offline_policy.c
             runtime/s3_event_bus.c
             runtime/s3_scheduler.c
+            radar_domain/radar_protocol.c
+            radar_domain/radar_registry.c
+            radar_domain/radar_remote_ingest.c
+            radar_domain/radar_gateway_ingest.c
+            radar_domain/radar_local_adapter.c
+            radar_domain/radar_rate_manager.c
+            radar_domain/radar_log_manager.c
+            radar_domain/radar_diagnostics.c
+            radar_domain/radar_coordinate_transform.c
+            radar_domain/radar_zone_map.c
+            radar_domain/radar_target_tracker.c
+            radar_domain/radar_spatial_state.c
+            radar_ingest/radar_ingest.c
             device_stream_gateway/device_stream_gateway.c
-            csi_fusion/csi_fusion.c
-            csi_placeholder_gateway/csi_placeholder_gateway.c
+            local_http_server/radar_local_handler.c
             local_http_server/local_http_server.c
             gateway_orchestrator/gateway_orchestrator.c)
 
@@ -44,14 +56,15 @@ set(priv_include_dirs
             command_router
             offline_policy
             runtime
+            radar_ingest
+            radar_domain/include
             device_stream_gateway
-            csi_fusion
-            csi_placeholder_gateway
             local_http_server)
 
 set(requires
             app_config
             esp_event
+            esp_hw_support
             esp_http_client
             esp_http_server
             esp_netif
@@ -65,6 +78,7 @@ set(requires
             log
             lwip
             nvs_flash
+            radar_ld2450
             spiffs
             spi_flash)
 

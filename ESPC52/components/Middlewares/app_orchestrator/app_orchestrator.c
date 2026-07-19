@@ -4,9 +4,9 @@
  *
  * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用），负责把启动链路串起来：
  * app_main -> app_orchestrator_start -> WiFi -> system/register/command -> BME -> voice。
- * 本文件不实现 WiFi 状态机、BME 驱动、Mic/VAD、语音代理、命令协议或 LCD/CSI 逻辑；
+ * 本文件不实现 WiFi 状态机、BME 驱动、Mic/VAD、语音代理、命令协议或 radar 逻辑；
  * 这些职责分别由 wifi_manager、system_service、bme_sensor_service、voice_chain、
- * display_placeholder 和 csi_placeholder 等模块承担。
+ * display_placeholder 和 radar_ld2450 等模块承担。
  */
 
 #include "app_orchestrator.h"
@@ -23,10 +23,10 @@
 #include "app_stack_monitor.h"
 #include "bme_sensor_service.h"
 #include "c5_backpressure_controller.h"
+#include "c5_memory.h"
 #include "gateway_link.h"
-#if MAIN_ENABLE_CSI_SERVICE
-#include "csi_service.h"
-#endif
+#include "radar_service.h"
+#include "radar_ble_runtime.h"
 #include "speaker_player.h"
 #include "system_service.h"
 #include "voice_chain.h"
@@ -40,6 +40,7 @@ void app_orchestrator_start(void)
     char connected_ssid[33] = {0};
 
     app_stack_monitor_log(TAG, "app_startup_task", "orchestrator_enter");
+    c5_mem_log("startup");
 
     /*
      * 启动流程边界：
@@ -70,6 +71,7 @@ void app_orchestrator_start(void)
         ESP_LOGI(TAG, "WiFi connected");
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_wifi_connect");
+    c5_mem_log("after_wifi_connect");
 
     // 等待 WiFi 连续稳定后再探测 S3 local HTTP，避免刚拿到 IP 时就发起业务请求。
     while (!wifi_is_stable()) {
@@ -95,23 +97,6 @@ void app_orchestrator_start(void)
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_system_service_init");
 
-#if MAIN_ENABLE_CSI_SERVICE
-    /*
-     * CSI 运行链路必须显式打开。默认构建不会编译到这里的 init/start 调用，
-     * 避免 C5 在主启动链路中注册 WiFi CSI callback 或上传 CSI 结果。
-     */
-    esp_err_t csi_ret = csi_service_init();
-    if (csi_ret == ESP_OK) {
-        csi_ret = csi_service_start();
-    }
-    if (csi_ret != ESP_OK) {
-        ESP_LOGW(TAG, "CSI service start skipped: %s", esp_err_to_name(csi_ret));
-    }
-#else
-    ESP_LOGI(TAG, "CSI service disabled by MAIN_ENABLE_CSI_SERVICE");
-#endif
-    app_stack_monitor_log(TAG, "app_startup_task", "after_csi_service_gate");
-
     if (MAIN_ENABLE_SPEAKER_SELF_TEST) {
         /*
          * Speaker 自检直接走 speaker_player/IIS，不经过 server voice。
@@ -124,6 +109,13 @@ void app_orchestrator_start(void)
         } else {
             ESP_LOGI(TAG, "Speaker self-test done");
         }
+        esp_err_t speaker_release_ret =
+            audio_player_release_session(AUDIO_PLAYER_DRAIN_TIMEOUT_MS);
+        if (speaker_release_ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "Speaker self-test session release failed: %s",
+                     esp_err_to_name(speaker_release_ret));
+        }
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_speaker_self_test_gate");
 
@@ -135,11 +127,19 @@ void app_orchestrator_start(void)
         esp_err_t bme_ret = bme_sensor_service_start();
         if (bme_ret != ESP_OK) {
             ESP_LOGE(TAG, "BME service start failed: %s", esp_err_to_name(bme_ret));
+        } else {
+            c5_mem_log("after_bme_start");
         }
     } else {
         ESP_LOGI(TAG, "BME service disabled by MAIN_ENABLE_BME_SERVICE");
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_bme_service_start");
+
+    /* Radar allocates its PSRAM queues after BME is ready and never waits on HTTP. */
+    const esp_err_t radar_ble_ret = radar_ble_runtime_start();
+    if (radar_ble_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Radar BLE runtime start failed: %s", esp_err_to_name(radar_ble_ret));
+    }
 
     esp_err_t scheduler_ret = c5_scheduler_start();
     if (scheduler_ret != ESP_OK) {
@@ -147,11 +147,14 @@ void app_orchestrator_start(void)
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_c5_scheduler_start");
 
+    app_stack_monitor_log(TAG, "app_startup_task", "after_radar_start");
+
     if (MAIN_ENABLE_MIC_CHAIN) {
         /*
          * WiFi 稳定后启动完整本地网关半双工语音链路：
          * Mic/VAD -> ESPS3 /local/v1/voice/turn -> speaker 播放 S3 回传 PCM -> 恢复 Mic。
          */
+        c5_mem_log("before_voice_lazy_init");
         esp_err_t voice_ret = voice_chain_start();
         if (voice_ret != ESP_OK) {
             ESP_LOGE(TAG, "Voice chain start failed: %s", esp_err_to_name(voice_ret));

@@ -4,8 +4,7 @@
  *
  * 本文件属于 ESPS3 网关，负责接收 C5 的 UDP/HTTP 短字段 stream frame，并交给
  * scheduler stream worker 解析并重新入 S3 event bus。它只接受固定 7 字段对象，
- * 维护每个 device_id 的单调 timestamp，拒绝 raw CSI/subcarrier 风格 payload；
- * CSI v2 envelope 主路径不在这里解析。
+ * 维护每个 device_id 的单调 timestamp，并拒绝固定 schema 以外的 payload。
  */
 
 #include "device_stream_gateway.h"
@@ -89,7 +88,6 @@ static uint32_t s_udp_invalid_state_suppressed_count;
 static int64_t s_last_stats_log_ms;
 static int64_t s_last_reject_log_ms;
 static int64_t s_last_udp_enqueue_log_ms;
-static int64_t s_last_csi_deprecated_log_ms;
 static int64_t s_last_stack_log_ms;
 static int64_t s_last_heap_log_ms;
 static char s_last_reject_device_id[48];
@@ -227,8 +225,7 @@ static void wait_until_net_ready(const char *task_name, bool wdt_registered)
 static bool stream_type_is_allowed(const char *type)
 {
     return type != NULL &&
-           (strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_CSI) == 0 ||
-            strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_SENSOR) == 0 ||
+           (strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_SENSOR) == 0 ||
             strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_STATUS) == 0 ||
             strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_EVENT) == 0);
 }
@@ -253,7 +250,7 @@ static bool json_is_strict_stream_object(cJSON *root)
     size_t field_count = 0;
     for (cJSON *item = root->child; item != NULL; item = item->next) {
         ++field_count;
-        /* 扁平 stream 只允许 t/did/type/lid/v1/v2/v3，禁止嵌套对象把 envelope/raw CSI 混进来。 */
+        /* 扁平 stream 只允许 t/did/type/lid/v1/v2/v3，禁止嵌套对象混入。 */
         if (!stream_key_is_allowed(item->string) ||
             cJSON_IsArray(item) || cJSON_IsObject(item)) {
             return false;
@@ -279,20 +276,6 @@ static bool json_number(cJSON *root, const char *key, double *out)
     }
     *out = value->valuedouble;
     return isfinite(*out);
-}
-
-static void log_deprecated_csi_stream(const device_stream_frame_t *frame)
-{
-    const int64_t timestamp_ms = now_ms();
-    if (s_last_csi_deprecated_log_ms != 0 &&
-        timestamp_ms - s_last_csi_deprecated_log_ms < DEVICE_STREAM_REJECT_LOG_INTERVAL_MS) {
-        return;
-    }
-    s_last_csi_deprecated_log_ms = timestamp_ms;
-    ESP_LOGW(TAG,
-             "CSI_STREAM_DEPRECATED device_id=%s link_id=%s reason=use_/local/v1/csi/result_v2",
-             frame != NULL ? frame->device_id : "-",
-             frame != NULL ? frame->link_id : "-");
 }
 
 static bool parse_frame(const char *json, device_stream_frame_t *out)
@@ -465,9 +448,6 @@ static s3_runtime_msg_kind_t kind_from_frame_type(const char *type)
     if (type == NULL) {
         return S3_RUNTIME_MSG_UNKNOWN;
     }
-    if (strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_CSI) == 0) {
-        return S3_RUNTIME_MSG_CSI;
-    }
     if (strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_SENSOR) == 0) {
         return S3_RUNTIME_MSG_SENSOR;
     }
@@ -562,11 +542,6 @@ static esp_err_t process_json_at_us(const char *json,
         ESP_LOGD(TAG, "stream frame rejected device_id=%s reason=not_allowed", frame.device_id);
         return ESP_ERR_NOT_ALLOWED;
     }
-    if (strcmp(frame.type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_CSI) == 0) {
-        log_deprecated_csi_stream(&frame);
-        record_stream_reject("deprecated_csi_stream", json_len, ESP_ERR_NOT_SUPPORTED);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
     if (!timestamp_is_monotonic(&frame, peer_ip, json_len)) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -631,7 +606,7 @@ esp_err_t device_stream_gateway_enqueue_udp(const char *peer_ip,
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* UDP trigger/send 也走 scheduler 队列，避免 CSI tick 直接阻塞 socket send。 */
+    /* UDP send 也走 scheduler 队列，避免入口线程直接阻塞 socket send。 */
     esp_err_t ret = s3_scheduler_enqueue_stream_send(peer_ip,
                                                      peer_port,
                                                      payload,

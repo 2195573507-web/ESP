@@ -1,0 +1,2 @@
+source /Users/zhiqin/ESP 雷达/build-radar-c51/bootloader/gdbinit/symbols
+source /Users/zhiqin/ESP 雷达/build-radar-c51/bootloader/gdbinit/connect

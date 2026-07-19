@@ -32,6 +32,11 @@
 #define APP_HEAP_LOW_LARGEST_WARNING_BYTES (8U * 1024U)
 #endif
 
+static inline const char *app_stack_monitor_safe_text(const char *value)
+{
+    return value != NULL ? value : "(null)";
+}
+
 static inline UBaseType_t app_stack_monitor_high_water(void)
 {
 #if (INCLUDE_uxTaskGetStackHighWaterMark == 1)
@@ -52,16 +57,17 @@ static inline void app_stack_monitor_log_free_bytes(const char *tag,
                                                     const char *stage,
                                                     UBaseType_t free_bytes)
 {
-    const char *safe_task = task_name != NULL ? task_name : "task";
-    const char *safe_stage = stage != NULL ? stage : "runtime";
+    const char *safe_tag = app_stack_monitor_safe_text(tag);
+    const char *safe_task = app_stack_monitor_safe_text(task_name);
+    const char *safe_stage = app_stack_monitor_safe_text(stage);
 
-    ESP_LOGI(tag,
+    ESP_LOGI(safe_tag,
              "TASK_STACK_MONITOR task=%s free_bytes=%u stage=%s",
              safe_task,
              (unsigned int)free_bytes,
              safe_stage);
     if (free_bytes > 0 && free_bytes < APP_STACK_LOW_WATER_WARNING_BYTES) {
-        ESP_LOGW(tag,
+        ESP_LOGW(safe_tag,
                  "TASK_STACK_MONITOR task=%s free_bytes=%u warning=low_stack threshold=%u stage=%s",
                  safe_task,
                  (unsigned int)free_bytes,
@@ -102,18 +108,19 @@ static inline UBaseType_t app_stack_monitor_log_periodic(const char *tag,
 
 static inline void app_heap_monitor_log(const char *tag)
 {
+    const char *safe_tag = app_stack_monitor_safe_text(tag);
     const size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     const size_t largest_bytes = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     const size_t minimum_bytes = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
 
-    ESP_LOGI(tag,
+    ESP_LOGI(safe_tag,
              "HEAP_MONITOR free=%u largest=%u min=%u",
              (unsigned int)free_bytes,
              (unsigned int)largest_bytes,
              (unsigned int)minimum_bytes);
     if (free_bytes < APP_HEAP_LOW_FREE_WARNING_BYTES ||
         largest_bytes < APP_HEAP_LOW_LARGEST_WARNING_BYTES) {
-        ESP_LOGW(tag,
+        ESP_LOGW(safe_tag,
                  "HEAP_MONITOR free=%u largest=%u min=%u warning=low_or_fragmented_heap threshold_free=%u threshold_largest=%u",
                  (unsigned int)free_bytes,
                  (unsigned int)largest_bytes,
@@ -146,28 +153,29 @@ static inline void app_heap_monitor_log_periodic(const char *tag,
 
 static inline bool app_task_wdt_add_current(const char *tag, const char *task_name)
 {
-    const char *safe_task = task_name != NULL ? task_name : "task";
+    const char *safe_tag = app_stack_monitor_safe_text(tag);
+    const char *safe_task = app_stack_monitor_safe_text(task_name);
     esp_err_t status = esp_task_wdt_status(NULL);
     if (status == ESP_OK) {
         return true;
     }
     if (status != ESP_ERR_NOT_FOUND) {
-        ESP_LOGW(tag,
+        ESP_LOGW(safe_tag,
                  "task watchdog unavailable task=%s ret=%s",
                  safe_task,
-                 esp_err_to_name(status));
+                 app_stack_monitor_safe_text(esp_err_to_name(status)));
         return false;
     }
 
     esp_err_t ret = esp_task_wdt_add(NULL);
     if (ret != ESP_OK) {
-        ESP_LOGW(tag,
+        ESP_LOGW(safe_tag,
                  "task watchdog add failed task=%s ret=%s",
                  safe_task,
-                 esp_err_to_name(ret));
+                 app_stack_monitor_safe_text(esp_err_to_name(ret)));
         return false;
     }
-    ESP_LOGI(tag, "task watchdog added task=%s", safe_task);
+    ESP_LOGI(safe_tag, "task watchdog added task=%s", safe_task);
     return true;
 }
 

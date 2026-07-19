@@ -5,7 +5,7 @@
  * @file s3_scheduler.h
  * @brief ESPS3 优先级事件总线门面和自适应 runtime scheduler。
  *
- * HTTP、UDP stream、CSI、command、network state 和周期任务都先进入本模块。
+ * HTTP, UDP stream, command, network state, and periodic work enter this module.
  * s3_scheduler.c 保留为兼容入口和 worker 调度壳；实际 backpressure policy 由
  * s3_event_bus 执行：CRITICAL > REALTIME > STATE > BACKGROUND。
  */
@@ -38,7 +38,6 @@ extern "C" {
 
 typedef enum {
     S3_RUNTIME_MSG_UNKNOWN = 0,
-    S3_RUNTIME_MSG_CSI,
     S3_RUNTIME_MSG_SENSOR,
     S3_RUNTIME_MSG_STATUS,
     S3_RUNTIME_MSG_EVENT,
@@ -85,7 +84,6 @@ typedef enum {
     S3_SCHEDULER_EVENT_NETWORK_STATE,
     S3_SCHEDULER_EVENT_VOICE_STATE,
     S3_SCHEDULER_EVENT_COMMAND_PULL,
-    S3_SCHEDULER_EVENT_CSI_FUSION_FLUSH,
     S3_SCHEDULER_EVENT_BACKGROUND_STATS,
 } s3_scheduler_event_type_t;
 
@@ -109,16 +107,19 @@ typedef struct {
     size_t background_depth;
     uint32_t drop_count;
     uint32_t coalesce_count;
-    uint32_t csi_ingress_drop_count;
-    uint32_t csi_ingress_coalesce_count;
-    uint32_t csi_worker_yield_count;
-    s3_event_bus_csi_latest_t csi_latest;
     s3_scheduler_network_state_t network_state;
     bool voice_busy;
-    uint32_t csi_interval_ms;
     uint32_t upload_interval_ms;
     uint32_t smart_home_interval_ms;
 } s3_scheduler_load_t;
+
+/** @brief HTTP ingress admission timings captured without taking the bus lock twice. */
+typedef struct {
+    uint32_t event_bus_lock_wait_ms;
+    uint32_t enqueue_duration_ms;
+    bool event_bus_stats_valid;
+    s3_event_bus_stats_t event_bus;
+} s3_scheduler_enqueue_diagnostics_t;
 
 /** scheduler 事件。入队后 payload/ingress 会被 scheduler 拷贝或接管，调用方不再持有。 */
 typedef struct s3_scheduler_event {
@@ -153,6 +154,18 @@ esp_err_t s3_scheduler_enqueue_ingress(const s3_runtime_ingress_t *ingress,
 esp_err_t s3_scheduler_enqueue_ingress_owned(s3_runtime_ingress_t *ingress,
                                              s3_scheduler_priority_t priority);
 
+/**
+ * @brief Transfer ingress ownership with a bounded event-bus lock wait.
+ *
+ * This is intentionally limited to local HTTP admission. Other scheduler
+ * callers keep their established reliable retry semantics.
+ */
+esp_err_t s3_scheduler_enqueue_ingress_owned_timed(
+    s3_runtime_ingress_t *ingress,
+    s3_scheduler_priority_t priority,
+    uint32_t event_bus_lock_timeout_ms,
+    s3_scheduler_enqueue_diagnostics_t *out_diagnostics);
+
 /** @brief 入队网络状态变化；network_worker/gateway_wifi 事件路径调用。 */
 esp_err_t s3_scheduler_enqueue_network_state(s3_scheduler_network_state_t state);
 
@@ -162,7 +175,7 @@ esp_err_t s3_scheduler_enqueue_stream_frame(const char *json,
                                             const char *peer_ip,
                                             const char *source);
 
-/** @brief 入队一帧需要发回 C5 的 UDP payload；主要用于 CSI trigger。 */
+/** @brief Queue a UDP payload that must be sent to a C5 peer. */
 esp_err_t s3_scheduler_enqueue_stream_send(const char *peer_ip,
                                            uint16_t peer_port,
                                            const void *payload,
@@ -174,14 +187,6 @@ esp_err_t s3_scheduler_enqueue_command_pull(void);
 
 /** @brief 清空 stream worker 队列；网络 gate 关闭或 LINK_STABLE 重新进入时调用。 */
 void s3_scheduler_reset_stream_queue(const char *reason);
-
-/** @brief Drop queued CSI ingress received at/before cutoff_us for one child session. */
-void s3_scheduler_clear_csi_peer_before(const char *device_id,
-                                        int64_t cutoff_us,
-                                        const char *reason);
-
-/** @brief Drop queued CSI ingress for one released child session. */
-void s3_scheduler_clear_csi_peer(const char *device_id, const char *reason);
 
 /** @brief 执行一次周期 tick；由 scheduler task 定期调用。 */
 void s3_scheduler_tick(void);

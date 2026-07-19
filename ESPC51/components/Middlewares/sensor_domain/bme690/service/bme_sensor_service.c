@@ -215,6 +215,8 @@ esp_err_t bme_sensor_service_tick(void)
                                            &air_quality);
     if (ret == ESP_OK) {
         ESP_LOGD(TAG, "BME upload success");
+    } else if (ret == ESP_ERR_NOT_FINISHED) {
+        ESP_LOGD(TAG, "BME upload deferred by resource policy");
     } else if (ret == ESP_ERR_INVALID_STATE && app_runtime_non_voice_is_paused()) {
         app_runtime_log_voice_busy_skip("BME upload");
     } else {

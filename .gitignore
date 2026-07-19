@@ -42,6 +42,7 @@ yarn-error.log*
 # ESP-IDF build outputs
 build/
 **/build/
+archive/builds/
 *.o
 *.a
 *.out

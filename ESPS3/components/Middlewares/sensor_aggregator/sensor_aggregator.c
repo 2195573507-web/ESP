@@ -16,7 +16,6 @@
 #include "bme_cache_manager.h"
 #include "cJSON.h"
 #include "child_registry.h"
-#include "csi_fusion.h"
 #include "esp111_protocol_common.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -115,12 +114,10 @@ static sensor_aggregator_device_t s_devices[GATEWAY_CONFIG_MAX_CHILDREN];
 static sensor_aggregator_history_t s_history[SENSOR_AGGREGATOR_HISTORY_SIZE];
 static sensor_aggregator_voice_event_t s_voice_events[SENSOR_AGGREGATOR_RECENT_SIZE];
 static sensor_aggregator_command_event_t s_command_events[SENSOR_AGGREGATOR_RECENT_SIZE];
-static csi_fusion_fact_t s_latest_csi_fact;
 static SemaphoreHandle_t s_lock;
 static size_t s_history_cursor;
 static size_t s_voice_cursor;
 static size_t s_command_cursor;
-static bool s_has_latest_csi_fact;
 static int64_t s_last_stack_monitor_ms;
 static bool s_peer_active[GATEWAY_CONFIG_MAX_CHILDREN];
 
@@ -317,16 +314,6 @@ static const char *air_quality_level_for_score(int score)
         return "bad";
     }
     return "unknown";
-}
-
-static void update_latest_csi_locked(const csi_fusion_fact_t *fact)
-{
-    if (fact == NULL || !fact->valid) {
-        return;
-    }
-
-    s_latest_csi_fact = *fact;
-    s_has_latest_csi_fact = true;
 }
 
 static bool registry_status_is_onlineish(child_registry_status_t status)
@@ -761,11 +748,9 @@ void sensor_aggregator_init(void)
         memset(s_history, 0, sizeof(s_history));
         memset(s_voice_events, 0, sizeof(s_voice_events));
         memset(s_command_events, 0, sizeof(s_command_events));
-        memset(&s_latest_csi_fact, 0, sizeof(s_latest_csi_fact));
         s_history_cursor = 0;
         s_voice_cursor = 0;
         s_command_cursor = 0;
-        s_has_latest_csi_fact = false;
         memset(s_peer_active, 0, sizeof(s_peer_active));
         xSemaphoreGive(s_lock);
     }
@@ -854,13 +839,6 @@ esp_err_t sensor_aggregator_handle_envelope(const protocol_adapter_envelope_t *e
     esp_err_t ret = ESP_OK;
     int status = 0;
     protocol_adapter_message_kind_t kind = protocol_adapter_message_kind(envelope->message_type);
-    if (kind == PROTOCOL_ADAPTER_MESSAGE_CSI_RESULT) {
-        result->accepted = false;
-        result->server_ret = ESP_ERR_NOT_SUPPORTED;
-        result->error_code = ESP111_PROTOCOL_ERROR_INVALID_CSI_RESULT;
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
     if (kind == PROTOCOL_ADAPTER_MESSAGE_SENSOR_BME690) {
         char *server_json = NULL;
         ret = protocol_adapter_build_server_ingest_json(envelope, &server_json);
@@ -1129,67 +1107,6 @@ esp_err_t sensor_aggregator_handle_stream_sensor(const char *device_id,
         ESP_LOGW(TAG,
                  "stream sensor forward deferred device_id=%s error_code=%s status=%d ret=%s",
                  device_id,
-                 result->error_code,
-                 status,
-                 esp_err_to_name(ret));
-    }
-
-    sensor_aggregator_upload_snapshot();
-    return ESP_OK;
-}
-
-esp_err_t sensor_aggregator_handle_csi_fact(const csi_fusion_fact_t *fact,
-                                            const csi_fusion_telemetry_t *telemetry,
-                                            sensor_aggregator_result_t *result)
-{
-    if (fact == NULL || result == NULL || !fact->valid) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    memset(result, 0, sizeof(*result));
-    result->accepted = true;
-
-    if (s_lock != NULL) {
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        update_latest_csi_locked(fact);
-        xSemaphoreGive(s_lock);
-    }
-
-    char *server_json = NULL;
-    esp_err_t build_ret = protocol_adapter_build_csi_event_v2_json(fact,
-                                                                   telemetry,
-                                                                   &server_json);
-    if (build_ret != ESP_OK) {
-        result->accepted = false;
-        result->server_ret = build_ret;
-        result->server_status = 0;
-        result->forwarded = false;
-        result->error_code = ESP111_PROTOCOL_ERROR_INVALID_CSI_RESULT;
-        ESP_LOGW(TAG,
-                 "CSI canonical event dropped tick_id=%llu ret=%s",
-                 (unsigned long long)fact->tick_id,
-                 esp_err_to_name(build_ret));
-        return ESP_OK;
-    }
-
-    int status = 0;
-    esp_err_t ret = network_worker_submit_server_json(NETWORK_WORKER_SERVER_JSON_CSI_EVENT,
-                                                      server_json,
-                                                      "csi_fact");
-    if (ret != ESP_OK) {
-        protocol_adapter_free_json(server_json);
-        offline_policy_record_server_result(ret, status);
-    }
-
-    result->server_ret = ret;
-    result->server_status = status;
-    result->forwarded = ret == ESP_OK;
-    result->error_code = result->forwarded ? "" : offline_policy_code_for_result(ret, status);
-    if (!result->forwarded && result->server_ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG,
-                 "CSI fact forward deferred state=%s confidence=%.3f error_code=%s status=%d ret=%s",
-                 csi_fusion_state_to_string(fact->fused_state),
-                 (double)fact->confidence,
                  result->error_code,
                  status,
                  esp_err_to_name(ret));

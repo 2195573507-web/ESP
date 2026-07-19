@@ -12,7 +12,6 @@
 #include "bme_cache_manager.h"
 #include "child_registry.h"
 #include "command_router.h"
-#include "csi_placeholder_gateway.h"
 #include "device_stream_gateway.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -22,6 +21,11 @@
 #include "network_replay_worker.h"
 #include "network_worker.h"
 #include "offline_policy.h"
+#include "radar_diagnostics.h"
+#include "radar_gateway_ingest.h"
+#include "radar_ingest.h"
+#include "radar_local_adapter.h"
+#include "radar_registry.h"
 #include "resource_manager.h"
 #include "s3_scheduler.h"
 #include "sensor_aggregator.h"
@@ -54,8 +58,9 @@ void gateway_orchestrator_start(void)
     ESP_ERROR_CHECK(voice_proxy_init());
     ESP_ERROR_CHECK(wake_prompt_cache_gateway_init());
     ESP_ERROR_CHECK(device_stream_gateway_init());
-    csi_placeholder_gateway_init();
     ESP_ERROR_CHECK(resource_manager_init());
+    ESP_ERROR_CHECK(radar_registry_init() ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(radar_ingest_start());
     ESP_ERROR_CHECK(s3_scheduler_init());
     ESP_ERROR_CHECK(network_worker_init());
     ESP_ERROR_CHECK(network_replay_worker_init());
@@ -65,10 +70,11 @@ void gateway_orchestrator_start(void)
     app_stack_monitor_log(TAG, "gateway_orchestrator", "after_gateway_wifi_start");
 
     ESP_ERROR_CHECK(s3_scheduler_start());
+    ESP_ERROR_CHECK(radar_local_adapter_start());
+    ESP_ERROR_CHECK(radar_diagnostics_start());
     /* local HTTP is owned by network_worker after it has observed SoftAP ready. */
     ESP_ERROR_CHECK(network_worker_enable_local_http_server());
     ESP_ERROR_CHECK(device_stream_gateway_start());
-    ESP_ERROR_CHECK(csi_placeholder_gateway_start());
     app_stack_monitor_log(TAG, "gateway_startup_task", "scheduler_started");
     app_stack_monitor_log(TAG, "gateway_orchestrator", "services_started");
 

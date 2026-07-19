@@ -58,11 +58,6 @@ static const gateway_runtime_config_t s_config = {
     .heartbeat_timeout_ms = GATEWAY_CONFIG_HEARTBEAT_TIMEOUT_MS,
     .link_lost_grace_ms = GATEWAY_CONFIG_LINK_LOST_GRACE_MS,
     .sensor_forward_period_ms = GATEWAY_CONFIG_SENSOR_FORWARD_PERIOD_MS,
-    .csi_trigger_enabled = GATEWAY_CONFIG_ENABLE_CSI_TRIGGER != 0,
-    .csi_result_ingest_enabled = GATEWAY_CONFIG_ENABLE_CSI_RESULT_INGEST != 0,
-    .csi_trigger_interval_ms = GATEWAY_CONFIG_CSI_TRIGGER_INTERVAL_MS,
-    .csi_trigger_udp_port = GATEWAY_CONFIG_CSI_TRIGGER_UDP_PORT,
-    .csi_trigger_target_device_id = GATEWAY_CONFIG_CSI_TRIGGER_TARGET_DEVICE_ID,
     .children_allowlist = {
         "sensair_shuttle_01",
         "sensair_shuttle_02",
@@ -155,11 +150,4 @@ void gateway_config_log_boot_profile(void)
                  (unsigned int)s_config.softap_max_connection,
                  (unsigned int)GATEWAY_CONFIG_MAX_CHILDREN);
     }
-    ESP_LOGI(TAG,
-             "CSI trigger enabled=%d result_ingest=%d interval_ms=%u udp_port=%u target=%s",
-             s_config.csi_trigger_enabled ? 1 : 0,
-             s_config.csi_result_ingest_enabled ? 1 : 0,
-             (unsigned int)s_config.csi_trigger_interval_ms,
-             (unsigned int)s_config.csi_trigger_udp_port,
-             s_config.csi_trigger_target_device_id[0] != '\0' ? s_config.csi_trigger_target_device_id : "all");
 }

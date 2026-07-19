@@ -237,7 +237,7 @@ esp_err_t child_registry_touch(const char *device_id, uint32_t seq)
     entry->last_seq = seq;
     entry->last_seen_ms = now_ms();
     entry->link_lost_since_ms = 0;
-    /* A validated heartbeat/sensor/CSI identity is sufficient to own a session. */
+    /* A validated heartbeat or sensor identity is sufficient to own a session. */
     entry->registered = true;
     if (entry->status != CHILD_REGISTRY_STATUS_VOICE_BUSY) {
         entry->status = CHILD_REGISTRY_STATUS_ONLINE;

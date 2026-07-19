@@ -10,7 +10,6 @@
 
 #include "child_registry.h"
 #include "command_router.h"
-#include "csi_placeholder_gateway.h"
 #include "esp111_protocol_common.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -82,8 +81,6 @@ const char *resource_manager_identity_signal_name(resource_manager_identity_sign
         return "status";
     case RESOURCE_MANAGER_SIGNAL_SENSOR:
         return "sensor";
-    case RESOURCE_MANAGER_SIGNAL_CSI:
-        return "csi";
     default:
         return "unknown";
     }
@@ -246,14 +243,13 @@ static void transition_locked(resource_session_t *session,
 static bool signal_valid(resource_manager_identity_signal_t signal)
 {
     return signal >= RESOURCE_MANAGER_SIGNAL_REGISTER &&
-           signal <= RESOURCE_MANAGER_SIGNAL_CSI;
+           signal <= RESOURCE_MANAGER_SIGNAL_SENSOR;
 }
 
 static bool signal_can_activate(resource_manager_identity_signal_t signal)
 {
-    /* A protocol-validated CSI result is a valid C5 liveness/identity event. */
     return signal >= RESOURCE_MANAGER_SIGNAL_REGISTER &&
-           signal <= RESOURCE_MANAGER_SIGNAL_CSI;
+           signal <= RESOURCE_MANAGER_SIGNAL_SENSOR;
 }
 
 static bool session_has_live_resources(const resource_session_t *session)
@@ -310,16 +306,14 @@ static esp_err_t release_live_resources(const char *device_id,
     esp_err_t command_ret = command_router_suspend_peer(device_id);
     esp_err_t sensor_ret = sensor_aggregator_suspend_peer(device_id);
     esp_err_t http_ret = server_client_cancel_peer_requests(device_id);
-    esp_err_t csi_ret = csi_gateway_suspend_peer_at_us(device_id, cutoff_us);
     esp_err_t queue_ret = network_worker_release_peer_resources(device_id);
 
     ESP_LOGI(TAG,
-             "RESOURCE_RELEASE_REASON=%s device=%s reason=%s cutoff_us=%lld csi=%s command=%s sensor=%s http=%s queue=%s",
+             "RESOURCE_RELEASE_REASON=%s device=%s reason=%s cutoff_us=%lld command=%s sensor=%s http=%s queue=%s",
              resource_release_reason_label(reason),
              device_id,
              reason != NULL ? reason : "unknown",
              (long long)cutoff_us,
-             esp_err_to_name(csi_ret),
              esp_err_to_name(command_ret),
              esp_err_to_name(sensor_ret),
              esp_err_to_name(http_ret),
@@ -327,9 +321,6 @@ static esp_err_t release_live_resources(const char *device_id,
 
     if (http_ret != ESP_OK) {
         return http_ret;
-    }
-    if (csi_ret != ESP_OK) {
-        return csi_ret;
     }
     if (command_ret != ESP_OK) {
         return command_ret;
@@ -345,27 +336,23 @@ static esp_err_t restore_live_resources(const char *device_id, const char *reaso
     esp_err_t command_ret = command_router_restore_peer(device_id);
     esp_err_t sensor_ret = command_ret == ESP_OK ? sensor_aggregator_restore_peer(device_id) :
                                                    command_ret;
-    esp_err_t csi_ret = sensor_ret == ESP_OK ? csi_gateway_restore_peer(device_id) : sensor_ret;
-    esp_err_t queue_ret = csi_ret == ESP_OK ? network_worker_restore_peer_resources(device_id) :
-                                             csi_ret;
+    esp_err_t queue_ret = sensor_ret == ESP_OK ? network_worker_restore_peer_resources(device_id) :
+                                                sensor_ret;
 
-    if (command_ret != ESP_OK || sensor_ret != ESP_OK || csi_ret != ESP_OK ||
-        queue_ret != ESP_OK) {
+    if (command_ret != ESP_OK || sensor_ret != ESP_OK || queue_ret != ESP_OK) {
         ESP_LOGE(TAG,
-                 "RESOURCE_RESTORE device_id=%s reason=%s status=failed command=%s sensor=%s csi=%s queue=%s",
+                 "RESOURCE_RESTORE device_id=%s reason=%s status=failed command=%s sensor=%s queue=%s",
                  device_id,
                  reason != NULL ? reason : "unknown",
                  esp_err_to_name(command_ret),
                  esp_err_to_name(sensor_ret),
-                 esp_err_to_name(csi_ret),
                  esp_err_to_name(queue_ret));
         return command_ret != ESP_OK ? command_ret :
-               sensor_ret != ESP_OK ? sensor_ret :
-               csi_ret != ESP_OK ? csi_ret : queue_ret;
+               sensor_ret != ESP_OK ? sensor_ret : queue_ret;
     }
 
     ESP_LOGI(TAG,
-             "RESOURCE_RESTORE device_id=%s reason=%s status=restoring command=restored sensor=restored csi=warmup queue=ready",
+             "RESOURCE_RESTORE device_id=%s reason=%s status=restoring command=restored sensor=restored queue=ready",
              device_id,
              reason != NULL ? reason : "unknown");
     return ESP_OK;
@@ -826,7 +813,7 @@ esp_err_t resource_manager_confirm_peer_at_us(const char *device_id,
                                  restore_generation);
             xSemaphoreGive(s_lock);
             ESP_LOGI(TAG,
-                     "RESOURCE_RESTORE device_id=%s reason=%s status=ok command=active sensor=active csi=ready",
+                     "RESOURCE_RESTORE device_id=%s reason=%s status=ok command=active sensor=active",
                      device_id,
                      signal_name);
             xSemaphoreGive(s_operation_lock);
@@ -834,7 +821,7 @@ esp_err_t resource_manager_confirm_peer_at_us(const char *device_id,
         } else {
             xSemaphoreGive(s_lock);
             ESP_LOGI(TAG,
-                     "RESOURCE_RESTORE device_id=%s reason=%s status=restoring_wait_active csi=trigger_only",
+                     "RESOURCE_RESTORE device_id=%s reason=%s status=restoring_wait_active",
                      device_id,
                      signal_name);
             xSemaphoreGive(s_operation_lock);
@@ -881,7 +868,7 @@ esp_err_t resource_manager_confirm_peer_at_us(const char *device_id,
                                  restore_generation);
         } else {
             ESP_LOGI(TAG,
-                     "RESOURCE_RESTORE device_id=%s reason=%s status=restoring_wait_active csi=trigger_only",
+                     "RESOURCE_RESTORE device_id=%s reason=%s status=restoring_wait_active",
                      device_id,
                      signal_name);
         }
@@ -923,12 +910,11 @@ esp_err_t resource_manager_confirm_peer_at_us(const char *device_id,
     }
 
     ESP_LOGI(TAG,
-             "RESOURCE_RESTORE device_id=%s reason=%s status=ok command=%s sensor=%s csi=%s previous=%s",
+             "RESOURCE_RESTORE device_id=%s reason=%s status=ok command=%s sensor=%s previous=%s",
              device_id,
              signal_name,
              activation_signal ? "active" : "restored",
              activation_signal ? "active" : "restored",
-             activation_signal ? "warmup" : "trigger_only",
              resource_manager_session_state_name(state_before_identity));
     xSemaphoreGive(s_operation_lock);
     return ESP_OK;
@@ -997,76 +983,6 @@ esp_err_t resource_manager_prepare_reconnect_at_us(const char *device_id,
                  (unsigned long)session->generation);
     }
     xSemaphoreGive(s_lock);
-    xSemaphoreGive(s_operation_lock);
-    return ESP_OK;
-}
-
-esp_err_t resource_manager_complete_restore(const char *device_id, const char *reason)
-{
-    if (!gateway_config_child_allowed(device_id) || s_lock == NULL ||
-        s_operation_lock == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    xSemaphoreTake(s_operation_lock, portMAX_DELAY);
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    resource_session_t *session = find_locked(device_id);
-    if (session == NULL) {
-        xSemaphoreGive(s_lock);
-        xSemaphoreGive(s_operation_lock);
-        return ESP_ERR_NOT_FOUND;
-    }
-    if (session->state == RESOURCE_MANAGER_SESSION_ACTIVE) {
-        xSemaphoreGive(s_lock);
-        xSemaphoreGive(s_operation_lock);
-        return ESP_OK;
-    }
-    if (session->state != RESOURCE_MANAGER_SESSION_RESTORING) {
-        xSemaphoreGive(s_lock);
-        xSemaphoreGive(s_operation_lock);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const char *restore_reason = reason != NULL ? reason : "csi_warmup_complete";
-    if (strcmp(restore_reason, "csi_warmup_complete") == 0) {
-        session->live_resources_ready = true;
-        xSemaphoreGive(s_lock);
-        ESP_LOGI(TAG,
-                 "RESOURCE_RESTORE device_id=%s reason=%s status=restoring_wait_active csi=warmup_complete activation=deferred",
-                 device_id,
-                 restore_reason);
-        xSemaphoreGive(s_operation_lock);
-        return ESP_OK;
-    }
-    if (!session->live_resources_ready) {
-        uint32_t generation = session->generation;
-        xSemaphoreGive(s_lock);
-        log_restore_failure(device_id,
-                            restore_reason,
-                            "complete_without_resources",
-                            ESP_ERR_INVALID_STATE,
-                            generation);
-        xSemaphoreGive(s_operation_lock);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    session->grace_started_ms = 0;
-    transition_locked(session,
-                      RESOURCE_MANAGER_SESSION_ACTIVE,
-                      now_ms(),
-                      restore_reason);
-    log_restore_transition(device_id,
-                           RESOURCE_MANAGER_SESSION_RESTORING,
-                           RESOURCE_MANAGER_SESSION_ACTIVE,
-                           restore_reason,
-                           session->generation);
-    xSemaphoreGive(s_lock);
-
-    ESP_LOGI(TAG,
-             "RESOURCE_RESTORE device_id=%s reason=%s status=ok csi=warm command=active sensor=active",
-             device_id,
-             restore_reason);
-    (void)network_worker_restore_peer_resources(device_id);
     xSemaphoreGive(s_operation_lock);
     return ESP_OK;
 }
@@ -1267,15 +1183,22 @@ size_t resource_manager_snapshot_live(
     return count;
 }
 
-bool resource_manager_get_session(const char *device_id,
-                                  resource_manager_session_view_t *out_view)
+static esp_err_t get_session_with_timeout(const char *device_id,
+                                          resource_manager_session_view_t *out_view,
+                                          TickType_t lock_timeout_ticks,
+                                          bool *out_found)
 {
-    if (out_view == NULL || s_lock == NULL) {
-        return false;
+    if (out_view == NULL || out_found == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_found = false;
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
     }
     memset(out_view, 0, sizeof(*out_view));
-    bool found = false;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (xSemaphoreTake(s_lock, lock_timeout_ticks) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     resource_session_t *session = find_locked(device_id);
     if (session != NULL) {
         strlcpy(out_view->device_id, session->device_id, sizeof(out_view->device_id));
@@ -1283,10 +1206,29 @@ bool resource_manager_get_session(const char *device_id,
         out_view->state_since_ms = session->state_since_ms;
         out_view->grace_started_ms = session->grace_started_ms;
         out_view->generation = session->generation;
-        found = true;
+        *out_found = true;
     }
     xSemaphoreGive(s_lock);
-    return found;
+    return ESP_OK;
+}
+
+bool resource_manager_get_session(const char *device_id,
+                                  resource_manager_session_view_t *out_view)
+{
+    bool found = false;
+    return get_session_with_timeout(device_id, out_view, portMAX_DELAY, &found) == ESP_OK && found;
+}
+
+esp_err_t resource_manager_get_session_timed(const char *device_id,
+                                             resource_manager_session_view_t *out_view,
+                                             uint32_t lock_timeout_ms,
+                                             bool *out_found)
+{
+    TickType_t timeout_ticks = pdMS_TO_TICKS(lock_timeout_ms);
+    if (lock_timeout_ms > 0U && timeout_ticks == 0U) {
+        timeout_ticks = 1U;
+    }
+    return get_session_with_timeout(device_id, out_view, timeout_ticks, out_found);
 }
 
 void resource_manager_log_session_diagnostic(const char *device_id,

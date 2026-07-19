@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "app_stack_monitor.h"
+#include "c5_memory.h"
 #include "device_protocol_metadata.h"
 #include "esp111_protocol_common.h"
 #include "esp_err.h"
@@ -154,7 +155,12 @@ static esp_err_t wake_prompt_play_spool_file(FILE *file, size_t expected_bytes, 
         return ESP_ERR_INVALID_ARG;
     }
 
-    int16_t pcm_buf[WAKE_PROMPT_SPOOL_BUFFER_BYTES / sizeof(int16_t)];
+    int16_t *pcm_buf = (int16_t *)c5_mem_alloc(WAKE_PROMPT_SPOOL_BUFFER_BYTES,
+                                                C5_MEM_PSRAM,
+                                                "wake_prompt_spool_pcm");
+    if (pcm_buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     size_t played_bytes = 0;
     uint32_t peak = 0;
     esp_err_t ret = ESP_OK;
@@ -162,13 +168,14 @@ static esp_err_t wake_prompt_play_spool_file(FILE *file, size_t expected_bytes, 
     wake_prompt_log_internal_heap("before_speaker_stream_open");
     ret = audio_player_stream_open();
     if (ret != ESP_OK) {
+        c5_mem_free(pcm_buf, "wake_prompt_spool_pcm");
         return ret;
     }
 
     while (played_bytes < expected_bytes) {
         size_t bytes_to_read = expected_bytes - played_bytes;
-        if (bytes_to_read > sizeof(pcm_buf)) {
-            bytes_to_read = sizeof(pcm_buf);
+        if (bytes_to_read > WAKE_PROMPT_SPOOL_BUFFER_BYTES) {
+            bytes_to_read = WAKE_PROMPT_SPOOL_BUFFER_BYTES;
         }
         size_t bytes_read = fread(pcm_buf, 1, bytes_to_read, file);
         if (bytes_read != bytes_to_read) {
@@ -200,6 +207,7 @@ static esp_err_t wake_prompt_play_spool_file(FILE *file, size_t expected_bytes, 
         ret = ESP_FAIL;
     }
     *out_peak = peak;
+    c5_mem_free(pcm_buf, "wake_prompt_spool_pcm");
     return ret;
 }
 

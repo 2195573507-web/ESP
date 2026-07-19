@@ -28,9 +28,12 @@
 #define SERVER_VOICE_RESPONSE_TASK_PRIORITY 4 // 响应读取/播放任务优先级。
 #endif
 
-typedef esp_err_t (*server_voice_done_cb_t)(void *user_ctx);
+typedef esp_err_t (*server_voice_done_cb_t)(uint32_t lease_generation, void *user_ctx);
 typedef esp_err_t (*server_voice_playback_start_cb_t)(void *user_ctx);
-typedef esp_err_t (*server_voice_error_cb_t)(int code, const char *message, void *user_ctx);
+typedef esp_err_t (*server_voice_error_cb_t)(uint32_t lease_generation,
+                                              int code,
+                                              const char *message,
+                                              void *user_ctx);
 
 typedef struct {
     server_voice_done_cb_t done_cb;
@@ -68,6 +71,9 @@ esp_err_t server_voice_client_cancel_turn(void);
 
 /** @brief 断联中止当前 turn；正在读响应时请求任务自行退出并释放 HTTP/speaker 资源。 */
 esp_err_t server_voice_client_request_abort(const char *reason);
+
+/** @brief Wait for the response receiver to leave the current session. */
+esp_err_t server_voice_client_wait_for_idle(uint32_t timeout_ms);
 
 /** @brief 判断客户端是否空闲；Mic/VAD 开启下一轮 turn 前调用。 */
 bool server_voice_client_is_idle(void);

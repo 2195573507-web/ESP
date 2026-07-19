@@ -17,10 +17,46 @@
 #include "esp111_protocol_common.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "radar_resource_adapter.h"
 #include "server_comm_http.h"
 #include "terminal_config.h"
 
 static const char *TAG = "bme_server_client";
+static TickType_t s_bme_retry_not_before;
+static uint32_t s_bme_failure_count;
+
+static uint64_t bme_server_client_now_ms(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    return now_us > 0 ? (uint64_t)(now_us / 1000) : 0U;
+}
+
+static bool bme_server_client_retry_ready(void)
+{
+    return s_bme_retry_not_before == 0 ||
+           (int32_t)(xTaskGetTickCount() - s_bme_retry_not_before) >= 0;
+}
+
+static void bme_server_client_note_upload_result(esp_err_t ret)
+{
+    if (ret == ESP_OK) {
+        s_bme_failure_count = 0;
+        s_bme_retry_not_before = 0;
+        return;
+    }
+    if (s_bme_failure_count < 6U) {
+        ++s_bme_failure_count;
+    }
+    const uint32_t delay_ms = 1000U << (s_bme_failure_count > 4U ? 4U : s_bme_failure_count);
+    s_bme_retry_not_before = xTaskGetTickCount() + pdMS_TO_TICKS(delay_ms > 30000U ? 30000U : delay_ms);
+    ESP_LOGW(TAG, "BME upload backoff failures=%lu retry_after_ms=%lu ret=%s",
+             (unsigned long)s_bme_failure_count,
+             (unsigned long)(delay_ms > 30000U ? 30000U : delay_ms),
+             esp_err_to_name(ret));
+}
 
 static uint32_t bme_server_client_boot_id(void)
 {
@@ -133,6 +169,15 @@ esp_err_t bme_server_client_upload_reading(const char *sensor_id,
     if (sensor_id == NULL || sensor_id[0] == '\0' || data == NULL || air_quality == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!bme_server_client_retry_ready()) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    const uint64_t now_ms = bme_server_client_now_ms();
+#if CONFIG_C5_BME_ADAPTIVE_REPORT
+    if (!radar_resource_adapter_bme_upload_due(now_ms)) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+#endif
 
     char escaped_sensor_id[64];
     char escaped_level[24];
@@ -303,5 +348,9 @@ esp_err_t bme_server_client_upload_reading(const char *sensor_id,
                  air_quality->air_quality_score,
                  (unsigned long)air_quality->sample_count);
     }
+    bme_server_client_note_upload_result(ret);
+#if CONFIG_C5_BME_ADAPTIVE_REPORT
+    radar_resource_adapter_complete_bme_upload(ret == ESP_OK, bme_server_client_now_ms());
+#endif
     return ret;
 }

@@ -11,6 +11,7 @@
  */
 
 #include "server_client.h"
+#include "server_client_voice_eof.h"
 
 #include <limits.h>
 #include <stdbool.h>
@@ -77,6 +78,7 @@ static uint32_t s_http_telemetry_drop_count;
 static uint32_t s_http_slot_busy_count;
 static int64_t s_last_http_scheduler_log_ms;
 static int64_t s_last_http_request_latency_ms;
+static int64_t s_last_http_queue_wait_ms;
 static StaticSemaphore_t s_active_request_lock_storage;
 static SemaphoreHandle_t s_active_request_lock;
 static portMUX_TYPE s_active_request_lock_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -210,6 +212,7 @@ static void log_http_scheduler_diagnostics(const char *reason,
     uint32_t telemetry_drop_count;
     uint32_t slot_busy_count;
     int64_t request_latency_ms;
+    int64_t queue_wait_ms;
 
     portENTER_CRITICAL(&s_http_scheduler_mux);
     const int64_t interval_ms = force ? SERVER_CLIENT_HTTP_SLOT_BUSY_LOG_MS :
@@ -227,10 +230,11 @@ static void log_http_scheduler_diagnostics(const char *reason,
     telemetry_drop_count = s_http_telemetry_drop_count;
     slot_busy_count = s_http_slot_busy_count;
     request_latency_ms = s_last_http_request_latency_ms;
+    queue_wait_ms = s_last_http_queue_wait_ms;
     portEXIT_CRITICAL(&s_http_scheduler_mux);
 
     ESP_LOGI(TAG,
-             "http scheduler reason=%s channel=%s endpoint=%s http_core_inflight=%lu http_telemetry_inflight=%lu http_snapshot_inflight=%lu core_wait_count=%lu telemetry_drop_count=%lu slot_busy_count=%lu request_latency_ms=%lld max_inflight=%u",
+             "http scheduler reason=%s channel=%s endpoint=%s http_core_inflight=%lu http_telemetry_inflight=%lu http_snapshot_inflight=%lu core_wait_count=%lu telemetry_drop_count=%lu slot_busy_count=%lu request_latency_ms=%lld queue_wait_time=%lld max_inflight=%u",
              reason != NULL ? reason : "-",
              http_channel_name(channel),
              endpoint != NULL ? endpoint : "-",
@@ -241,6 +245,7 @@ static void log_http_scheduler_diagnostics(const char *reason,
              (unsigned long)telemetry_drop_count,
              (unsigned long)slot_busy_count,
              (long long)request_latency_ms,
+             (long long)queue_wait_ms,
              (unsigned int)SERVER_CLIENT_HTTP_MAX_INFLIGHT);
 }
 
@@ -287,6 +292,7 @@ static esp_err_t take_http_channel_slot(server_client_http_channel_t channel,
                                         const char *phase,
                                         uint32_t wait_ms)
 {
+    const int64_t wait_started_ms = now_ms();
     SemaphoreHandle_t slot = http_channel_slot_handle(channel);
     if (slot == NULL) {
         return ESP_ERR_NO_MEM;
@@ -307,6 +313,9 @@ static esp_err_t take_http_channel_slot(server_client_http_channel_t channel,
     }
 
     if (xSemaphoreTake(slot, 0) == pdTRUE) {
+        portENTER_CRITICAL(&s_http_scheduler_mux);
+        s_last_http_queue_wait_ms = now_ms() - wait_started_ms;
+        portEXIT_CRITICAL(&s_http_scheduler_mux);
         const uint32_t active_count = mark_http_channel_acquired(channel);
         ESP_LOGI(TAG,
                  "HTTP_RESOURCE_ACQUIRE request_type=%s priority=%s active_count=%lu",
@@ -348,6 +357,9 @@ static esp_err_t take_http_channel_slot(server_client_http_channel_t channel,
     }
     portEXIT_CRITICAL(&s_http_scheduler_mux);
     if (acquired == pdTRUE) {
+        portENTER_CRITICAL(&s_http_scheduler_mux);
+        s_last_http_queue_wait_ms = now_ms() - wait_started_ms;
+        portEXIT_CRITICAL(&s_http_scheduler_mux);
         const uint32_t active_count = mark_http_channel_acquired(channel);
         ESP_LOGI(TAG,
                  "HTTP_RESOURCE_ACQUIRE request_type=%s priority=%s active_count=%lu",
@@ -1293,30 +1305,6 @@ esp_err_t server_client_cancel_peer_requests(const char *device_id)
     return ret;
 }
 
-esp_err_t server_client_post_csi_event_json(const char *json_body,
-                                            char *response_body,
-                                            size_t response_body_size,
-                                            int *http_status)
-{
-    if (json_body == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* CSI is latest-only telemetry and never shares a slot with snapshots. */
-    bool slot_busy = false;
-    esp_err_t ret = perform_json_once(HTTP_METHOD_POST,
-                                      ESP111_PROTOCOL_SERVER_ROUTE_CSI_EVENT,
-                                      json_body,
-                                      response_body,
-                                      response_body_size,
-                                      http_status,
-                                      &slot_busy,
-                                      SERVER_CLIENT_HTTP_CHANNEL_MEDIUM,
-                                      NULL,
-                                      NULL,
-                                      NULL);
-    return slot_busy ? ESP_ERR_NOT_FINISHED : ret;
-}
-
 esp_err_t server_client_post_gateway_state_json(const char *json_body,
                                                 char *response_body,
                                                 size_t response_body_size,
@@ -1607,17 +1595,17 @@ esp_err_t server_client_ack_command(const char *command_id,
                         http_status);
 }
 
-static bool response_complete(esp_http_client_handle_t client,
-                              int64_t content_length,
-                              size_t total_read)
+static server_client_voice_eof_state_t response_eof_state(esp_http_client_handle_t client,
+                                                           int64_t content_length,
+                                                           size_t total_read,
+                                                           bool zero_read)
 {
-    if (client == NULL) {
-        return true;
-    }
-    if (content_length >= 0) {
-        return total_read >= (size_t)content_length;
-    }
-    return esp_http_client_is_complete_data_received(client);
+    const bool transport_complete = content_length < 0 && client != NULL &&
+                                    esp_http_client_is_complete_data_received(client);
+    return server_client_voice_eof_state(content_length,
+                                         total_read,
+                                         transport_complete,
+                                         zero_read);
 }
 
 static esp_err_t read_voice_response(esp_http_client_handle_t client,
@@ -1625,20 +1613,30 @@ static esp_err_t read_voice_response(esp_http_client_handle_t client,
                                      void *user_ctx,
                                      int64_t request_start_ms,
                                      uint32_t request_epoch,
-                                     size_t *out_total_read)
+                                     size_t *out_total_read,
+                                     bool *out_upstream_closed)
 {
     uint8_t buf[1024];
     size_t total_read = 0;
     int empty_reads = 0;
+    int repeated_zero_reads = 0;
     int64_t content_length = esp_http_client_get_content_length(client);
     bool chunked = esp_http_client_is_chunked_response(client);
-    bool complete = response_complete(client, content_length, total_read);
+    server_client_voice_eof_state_t eof_state =
+        response_eof_state(client, content_length, total_read, false);
+    bool complete = eof_state == SERVER_CLIENT_VOICE_EOF_COMPLETE;
+    bool known_length_mismatch = false;
+    bool downstream_close_requested = false;
+    esp_err_t downstream_close_ret = ESP_OK;
     int64_t first_byte_ms = -1;
     int64_t last_byte_ms = -1;
     esp_err_t ret = ESP_OK;
 
     if (out_total_read != NULL) {
         *out_total_read = 0;
+    }
+    if (out_upstream_closed != NULL) {
+        *out_upstream_closed = false;
     }
     if (request_start_ms <= 0) {
         request_start_ms = now_ms();
@@ -1679,23 +1677,58 @@ static esp_err_t read_voice_response(esp_http_client_handle_t client,
                          read_len,
                          (long long)(response_received_ms - request_start_ms));
             }
+            eof_state = response_eof_state(client, content_length, total_read, false);
+            if (eof_state == SERVER_CLIENT_VOICE_EOF_OVERREAD) {
+                known_length_mismatch = true;
+                ESP_LOGW(TAG,
+                         "voice response content-length overread total=%u content_length=%lld",
+                         (unsigned int)total_read,
+                         (long long)content_length);
+                ret = ESP_ERR_INVALID_SIZE;
+                break;
+            }
             if (on_data != NULL) {
                 ret = on_data(buf, (size_t)read_len, user_ctx);
                 if (ret != ESP_OK) {
+                    downstream_close_requested = true;
+                    downstream_close_ret = esp_http_client_close(client);
+                    if (out_upstream_closed != NULL && downstream_close_ret == ESP_OK) {
+                        *out_upstream_closed = true;
+                    }
+                    ESP_LOGW(TAG,
+                             "voice upstream closed after downstream send failure ret=%s close_ret=%s response_bytes=%u",
+                             esp_err_to_name(ret),
+                             esp_err_to_name(downstream_close_ret),
+                             (unsigned int)total_read);
                     break;
                 }
             }
-            complete = response_complete(client, content_length, total_read);
+            complete = eof_state == SERVER_CLIENT_VOICE_EOF_COMPLETE;
             continue;
         }
 
-        complete = response_complete(client, content_length, total_read);
-        if (read_len == 0 && (complete || content_length < 0)) {
+        eof_state = response_eof_state(client, content_length, total_read, read_len == 0);
+        complete = eof_state == SERVER_CLIENT_VOICE_EOF_COMPLETE;
+        if (complete) {
             complete = true;
+            break;
+        }
+        if (eof_state == SERVER_CLIENT_VOICE_EOF_INCOMPLETE ||
+            eof_state == SERVER_CLIENT_VOICE_EOF_OVERREAD) {
+            known_length_mismatch = true;
+            ESP_LOGW(TAG,
+                     "voice response content-length incomplete total=%u content_length=%lld read_len=%d",
+                     (unsigned int)total_read,
+                     (long long)content_length,
+                     read_len);
+            ret = ESP_ERR_INVALID_SIZE;
             break;
         }
         if (read_len == -ESP_ERR_HTTP_EAGAIN || read_len == 0) {
             empty_reads++;
+            if (read_len == 0) {
+                repeated_zero_reads++;
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -1715,12 +1748,16 @@ static esp_err_t read_voice_response(esp_http_client_handle_t client,
         *out_total_read = total_read;
     }
     ESP_LOGI(TAG,
-             "voice_response: content_length=%lld chunked=%d total_read=%u complete=%d empty_reads=%d first_byte_ms=%lld last_byte_ms=%lld",
+             "voice_response: content_length=%lld chunked=%d total_read=%u complete=%d empty_reads=%d repeated_zero_reads=%d known_length_mismatch=%d downstream_close=%d downstream_close_ret=%s first_byte_ms=%lld last_byte_ms=%lld",
              (long long)content_length,
              chunked ? 1 : 0,
              (unsigned int)total_read,
              complete && ret == ESP_OK ? 1 : 0,
              empty_reads,
+             repeated_zero_reads,
+             known_length_mismatch ? 1 : 0,
+             downstream_close_requested ? 1 : 0,
+             esp_err_to_name(downstream_close_ret),
              (long long)first_byte_ms,
              (long long)last_byte_ms);
     return ret;
@@ -1805,6 +1842,7 @@ esp_err_t server_client_post_voice_turn(const char *device_id,
     const char *stage = "set_headers";
     size_t written = 0;
     size_t response_bytes = 0;
+    bool upstream_closed = false;
     bool epoch_request_registered = false;
     ret = register_epoch_request(client, request_epoch, ESP111_PROTOCOL_SERVER_ROUTE_VOICE_TURN);
     if (ret == ESP_OK) {
@@ -1931,7 +1969,8 @@ esp_err_t server_client_post_voice_turn(const char *device_id,
                                   user_ctx,
                                   request_start_ms,
                                   request_epoch,
-                                  &response_bytes);
+                                  &response_bytes,
+                                  &upstream_closed);
     }
     if (http_status != NULL && status == 0) {
         *http_status = esp_http_client_get_status_code(client);
@@ -1970,7 +2009,9 @@ esp_err_t server_client_post_voice_turn(const char *device_id,
         unregister_epoch_request(client);
     }
     /* Keep the socket open after the PCM body write until headers/body are read or an error ends the turn. */
-    esp_http_client_close(client);
+    if (!upstream_closed) {
+        esp_http_client_close(client);
+    }
     esp_http_client_cleanup(client);
     give_http_channel_slot(SERVER_CLIENT_HTTP_CHANNEL_HIGH,
                            request_start_ms,

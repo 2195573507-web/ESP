@@ -9,8 +9,6 @@
 
 #include "network_worker.h"
 
-#include <ctype.h>
-#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -129,26 +127,6 @@ static const char *TAG = "network_worker";
 #define NETWORK_WORKER_OFFLINE_POLICY_LOG_MS 5000U
 #endif
 
-#ifndef NETWORK_WORKER_CSI_IDLE_UPLOAD_MS
-#define NETWORK_WORKER_CSI_IDLE_UPLOAD_MS 5000U
-#endif
-
-#ifndef NETWORK_WORKER_CSI_MOTION_UPLOAD_MS
-#define NETWORK_WORKER_CSI_MOTION_UPLOAD_MS 2000U
-#endif
-
-#ifndef NETWORK_WORKER_CSI_UPLOAD_MIN_INTERVAL_MS
-#define NETWORK_WORKER_CSI_UPLOAD_MIN_INTERVAL_MS 2000U
-#endif
-
-#ifndef NETWORK_WORKER_CSI_PAYLOAD_LINKS_LOG_MS
-#define NETWORK_WORKER_CSI_PAYLOAD_LINKS_LOG_MS 2000U
-#endif
-
-#ifndef NETWORK_WORKER_CSI_PAYLOAD_JSON_LOG_MS
-#define NETWORK_WORKER_CSI_PAYLOAD_JSON_LOG_MS 2000U
-#endif
-
 #ifndef NETWORK_WORKER_SNAPSHOT_PRESSURE_DEPTH
 #define NETWORK_WORKER_SNAPSHOT_PRESSURE_DEPTH 2U
 #endif
@@ -196,11 +174,7 @@ typedef struct {
     char device_id[CHILD_REGISTRY_DEVICE_ID_LEN];
     char command_id[48];
     char source[24];
-    uint32_t csi_generation;
     uint32_t bme_cache_sequence;
-    char csi_state[16];
-    char csi_links[160];
-    char csi_upload_reason[20];
 } network_worker_work_item_t;
 
 static QueueHandle_t s_event_queue;
@@ -226,8 +200,6 @@ static int64_t s_last_upload_fail_log_ms;
 static int64_t s_last_command_stack_log_ms;
 static int64_t s_last_command_heap_log_ms;
 static int64_t s_last_server_summary_log_ms;
-static int64_t s_last_csi_payload_links_log_ms;
-static int64_t s_last_csi_payload_json_log_ms;
 static bool s_sta_connect_pending;
 static bool s_sta_connect_request_sent;
 static bool s_sta_reconnect_needed;
@@ -250,30 +222,13 @@ static int64_t s_softap_ready_since_ms;
 static uint32_t s_local_http_retry_count;
 static int64_t s_last_server_probe_ms;
 static bool s_snapshot_upload_pending;
-static bool s_csi_upload_pending;
 static bool s_command_pull_pending;
 static bool s_smart_home_poll_pending;
 static bool s_server_ready;
 static uint32_t s_server_failure_count;
 static uint32_t s_server_success_count;
 static char s_server_last_error[32];
-static SemaphoreHandle_t s_csi_upload_lock;
-static char *s_latest_csi_json;
-static uint32_t s_latest_csi_generation;
-static bool s_latest_csi_valid;
-static bool s_csi_offline_dirty;
-static int64_t s_last_csi_upload_ms;
-static int64_t s_last_csi_attempt_ms;
-static uint32_t s_last_csi_attempt_generation;
 static int64_t s_last_snapshot_enqueue_ms;
-static bool s_has_uploaded_csi;
-static char s_latest_csi_state[16];
-static char s_latest_csi_links[160];
-static char s_latest_csi_source[24];
-static char s_last_uploaded_csi_state[16];
-static char s_last_uploaded_csi_links[160];
-static char s_last_csi_attempt_state[16];
-static char s_last_csi_payload_links[160];
 static uint32_t s_low_priority_drop_count;
 static uint32_t s_low_priority_coalesce_count;
 static portMUX_TYPE s_snapshot_stats_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -294,7 +249,6 @@ static pending_softap_station_t s_pending_stations[GATEWAY_CONFIG_MAX_CHILDREN];
 static void release_work_item(network_worker_work_item_t *item);
 static void drop_low_priority_upload_backlog(const char *reason);
 static esp_err_t enqueue_upload_work_item(const network_worker_work_item_t *item);
-static esp_err_t snapshot_latest_csi_upload(network_worker_work_item_t *item);
 static void snapshot_worker_task(void *arg);
 
 static const uint32_t s_local_http_retry_backoff_ms[] = {
@@ -616,8 +570,6 @@ static const char *json_type_name(network_worker_server_json_type_t type)
     switch (type) {
     case NETWORK_WORKER_SERVER_JSON_INGEST:
         return "ingest";
-    case NETWORK_WORKER_SERVER_JSON_CSI_EVENT:
-        return "csi_event";
     case NETWORK_WORKER_SERVER_JSON_GATEWAY_STATE:
         return "gateway_state";
     case NETWORK_WORKER_SERVER_JSON_SYSTEM_LOG:
@@ -632,13 +584,6 @@ static const char *json_type_name(network_worker_server_json_type_t type)
 static bool server_result_ok(esp_err_t ret, int status)
 {
     return ret == ESP_OK && status >= 200 && status < 300;
-}
-
-static bool upload_work_is_csi_event(const network_worker_work_item_t *item)
-{
-    return item != NULL &&
-           item->work_type == NETWORK_WORKER_WORK_UPLOAD_JSON &&
-           item->json_type == NETWORK_WORKER_SERVER_JSON_CSI_EVENT;
 }
 
 static bool upload_work_is_peer_sensor(const network_worker_work_item_t *item)
@@ -707,7 +652,7 @@ static bool upload_work_is_low_priority(const network_worker_work_item_t *item)
 
 static bool upload_work_is_telemetry(const network_worker_work_item_t *item)
 {
-    return upload_work_is_low_priority(item) || upload_work_is_csi_event(item);
+    return upload_work_is_low_priority(item);
 }
 
 static bool upload_work_is_high_priority(const network_worker_work_item_t *item)
@@ -787,19 +732,7 @@ static void snapshot_stats_record_coalesce(void)
 
 static bool snapshot_has_higher_priority_work(void)
 {
-    if (s_work_queue != NULL && uxQueueMessagesWaiting(s_work_queue) > 0U) {
-        return true;
-    }
-    if (s_csi_upload_lock == NULL) {
-        return false;
-    }
-    if (xSemaphoreTake(s_csi_upload_lock,
-                       pdMS_TO_TICKS(NETWORK_WORKER_SNAPSHOT_LOCK_TIMEOUT_MS)) != pdTRUE) {
-        return true;
-    }
-    const bool csi_pending = s_csi_upload_pending;
-    xSemaphoreGive(s_csi_upload_lock);
-    return csi_pending;
+    return s_work_queue != NULL && uxQueueMessagesWaiting(s_work_queue) > 0U;
 }
 
 static void log_server_health_summary(const char *reason,
@@ -950,519 +883,6 @@ static void log_server_upload_failed_limited(const network_worker_work_item_t *i
              "server JSON upload failed type=%s source=%s status=%d ret=%s",
              item != NULL ? json_type_name(item->json_type) : "unknown",
              item != NULL ? item->source : "-",
-             status,
-             esp_err_to_name(ret));
-}
-
-static bool strings_differ(const char *a, const char *b)
-{
-    return strcmp(a != NULL ? a : "", b != NULL ? b : "") != 0;
-}
-
-static bool csi_upload_object_has_exact_keys(cJSON *object,
-                                             const char *const *keys,
-                                             size_t key_count)
-{
-    if (!cJSON_IsObject(object) || keys == NULL || key_count == 0U || key_count > 32U) {
-        return false;
-    }
-
-    uint32_t seen = 0U;
-    for (cJSON *item = object->child; item != NULL; item = item->next) {
-        if (item->string == NULL) {
-            return false;
-        }
-
-        size_t index = 0U;
-        while (index < key_count && strcmp(item->string, keys[index]) != 0) {
-            ++index;
-        }
-        if (index == key_count || (seen & (1UL << index)) != 0U) {
-            return false;
-        }
-        seen |= 1UL << index;
-    }
-
-    const uint32_t expected = key_count == 32U ? UINT32_MAX : ((1UL << key_count) - 1UL);
-    return seen == expected;
-}
-
-typedef struct {
-    char schema_version[8];
-    char trace_id[129];
-    uint64_t tick_id;
-    char fused_state[16];
-    double confidence;
-    int link_count;
-    uint64_t timestamp_ms;
-} csi_final_payload_summary_t;
-
-static bool csi_upload_text_is_canonical(const char *value, size_t max_len)
-{
-    if (value == NULL || value[0] == '\0') {
-        return false;
-    }
-    size_t length = strlen(value);
-    return length <= max_len &&
-           !isspace((unsigned char)value[0]) &&
-           !isspace((unsigned char)value[length - 1U]);
-}
-
-static bool csi_upload_number_is_integer(cJSON *value, double min)
-{
-    return cJSON_IsNumber(value) &&
-           isfinite(value->valuedouble) &&
-           value->valuedouble >= min &&
-           floor(value->valuedouble) == value->valuedouble;
-}
-
-static bool csi_upload_link_is_allowed(const char *link_id, int expected_index)
-{
-    if (link_id == NULL || expected_index < 0 || expected_index > 7) {
-        return false;
-    }
-
-    char expected[16];
-    int written = snprintf(expected, sizeof(expected), "link_%d", expected_index);
-    return written > 0 && (size_t)written < sizeof(expected) && strcmp(link_id, expected) == 0;
-}
-
-static bool csi_upload_state_is_allowed(const char *state)
-{
-    return state != NULL &&
-           (strcmp(state, "IDLE") == 0 ||
-            strcmp(state, "MOTION") == 0 ||
-            strcmp(state, "HOLD") == 0);
-}
-
-static esp_err_t csi_final_payload_links_from_json(const char *json_body,
-                                                   char *links_out,
-                                                   size_t links_out_size,
-                                                   csi_final_payload_summary_t *summary_out)
-{
-    if (links_out == NULL || links_out_size < 3U || summary_out == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    strlcpy(links_out, "[]", links_out_size);
-    memset(summary_out, 0, sizeof(*summary_out));
-    if (json_body == NULL || json_body[0] == '\0') {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    cJSON *root = cJSON_Parse(json_body);
-    if (root == NULL) {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    static const char *const top_level_keys[] = {
-        "schema_version",
-        "trace_id",
-        "tick_id",
-        "fused_state",
-        "confidence",
-        "links",
-        "timestamp_ms",
-    };
-
-    cJSON *schema_version = cJSON_GetObjectItemCaseSensitive(root, "schema_version");
-    cJSON *trace_id = cJSON_GetObjectItemCaseSensitive(root, "trace_id");
-    cJSON *tick_id = cJSON_GetObjectItemCaseSensitive(root, "tick_id");
-    cJSON *fused_state = cJSON_GetObjectItemCaseSensitive(root, "fused_state");
-    cJSON *confidence = cJSON_GetObjectItemCaseSensitive(root, "confidence");
-    cJSON *links = cJSON_GetObjectItemCaseSensitive(root, "links");
-    cJSON *timestamp_ms = cJSON_GetObjectItemCaseSensitive(root, "timestamp_ms");
-
-    if (!csi_upload_object_has_exact_keys(root,
-                                          top_level_keys,
-                                          sizeof(top_level_keys) / sizeof(top_level_keys[0])) ||
-        !cJSON_IsString(schema_version) || schema_version->valuestring == NULL ||
-        strcmp(schema_version->valuestring, ESP111_PROTOCOL_CSI_EVENT_SCHEMA_VERSION_STRING) != 0 ||
-        !cJSON_IsString(trace_id) ||
-        !csi_upload_text_is_canonical(trace_id->valuestring, 128U) ||
-        !csi_upload_number_is_integer(tick_id, 0.0) ||
-        !cJSON_IsString(fused_state) || fused_state->valuestring == NULL ||
-        !csi_upload_state_is_allowed(fused_state->valuestring) ||
-        !cJSON_IsNumber(confidence) || !isfinite(confidence->valuedouble) ||
-        confidence->valuedouble < 0.0 || confidence->valuedouble > 1.0 ||
-        !cJSON_IsArray(links) || cJSON_GetArraySize(links) <= 0 ||
-        cJSON_GetArraySize(links) > 8 ||
-        !csi_upload_number_is_integer(timestamp_ms, 1.0)) {
-        cJSON_Delete(root);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t ret = ESP_OK;
-    size_t used = 0U;
-    links_out[used++] = '[';
-    cJSON *link = NULL;
-    int link_index = 0;
-    cJSON_ArrayForEach(link, links) {
-        if (!cJSON_IsString(link) || link->valuestring == NULL ||
-            !csi_upload_link_is_allowed(link->valuestring, link_index)) {
-            ret = ESP_ERR_INVALID_ARG;
-            break;
-        }
-        int written = snprintf(links_out + used,
-                               links_out_size - used,
-                               "%s%s",
-                               used == 1U ? "" : ",",
-                               link->valuestring);
-        if (written <= 0 || (size_t)written >= links_out_size - used) {
-            ret = ESP_ERR_INVALID_SIZE;
-            break;
-        }
-        used += (size_t)written;
-        ++link_index;
-    }
-    if (used + 2U <= links_out_size) {
-        links_out[used++] = ']';
-        links_out[used] = '\0';
-    } else {
-        links_out[links_out_size - 2U] = ']';
-        links_out[links_out_size - 1U] = '\0';
-        ret = ESP_ERR_INVALID_SIZE;
-    }
-
-    if (ret == ESP_OK) {
-        strlcpy(summary_out->schema_version,
-                schema_version->valuestring,
-                sizeof(summary_out->schema_version));
-        strlcpy(summary_out->trace_id, trace_id->valuestring, sizeof(summary_out->trace_id));
-        summary_out->tick_id = (uint64_t)tick_id->valuedouble;
-        strlcpy(summary_out->fused_state,
-                fused_state->valuestring,
-                sizeof(summary_out->fused_state));
-        summary_out->confidence = confidence->valuedouble;
-        summary_out->link_count = cJSON_GetArraySize(links);
-        summary_out->timestamp_ms = (uint64_t)timestamp_ms->valuedouble;
-    }
-
-    cJSON_Delete(root);
-    return ret;
-}
-
-static bool log_csi_final_payload_json(const char *json_body)
-{
-    const int64_t timestamp_ms = now_ms();
-    if (s_last_csi_payload_json_log_ms != 0 &&
-        timestamp_ms - s_last_csi_payload_json_log_ms <
-            (int64_t)NETWORK_WORKER_CSI_PAYLOAD_JSON_LOG_MS) {
-        return false;
-    }
-    s_last_csi_payload_json_log_ms = timestamp_ms;
-    ESP_LOGD(TAG,
-             "CSI_SERVER_FINAL_PAYLOAD_JSON body=%s",
-             json_body != NULL && json_body[0] != '\0' ? json_body : "{}");
-    return true;
-}
-
-static esp_err_t validate_and_log_csi_final_payload(const char *json_body)
-{
-    char links_text[160] = "[]";
-    csi_final_payload_summary_t summary = {0};
-    esp_err_t ret = csi_final_payload_links_from_json(json_body,
-                                                      links_text,
-                                                      sizeof(links_text),
-                                                      &summary);
-    bool schema_log_due = log_csi_final_payload_json(json_body);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "CSI server final payload rejected expected_fields=[schema_version,trace_id,tick_id,fused_state,confidence,links,timestamp_ms] links=%s ret=%s",
-                 links_text,
-                 esp_err_to_name(ret));
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (schema_log_due) {
-        ESP_LOGD(TAG, "CSI_SERVER_FINAL_PAYLOAD_LINKS links=%s", links_text);
-        ESP_LOGD(TAG,
-                 "CSI_SERVER_FINAL_SCHEMA fields=[schema_version:string,trace_id:string,tick_id:integer,fused_state:string,confidence:number,links:string[],timestamp_ms:integer] schema_version=%s trace_id=%s tick_id=%llu fused_state=%s confidence=%.3f links=%s link_count=%d timestamp_ms=%llu gateway_id_header=%s",
-                 summary.schema_version,
-                 summary.trace_id,
-                 (unsigned long long)summary.tick_id,
-                 summary.fused_state,
-                 summary.confidence,
-                 links_text,
-                 summary.link_count,
-                 (unsigned long long)summary.timestamp_ms,
-                 gateway_config_get()->gateway_id);
-    }
-    return ESP_OK;
-}
-
-static bool csi_response_is_invalid_link(int status, const char *response_body)
-{
-    return status == 400 &&
-           response_body != NULL &&
-           strstr(response_body, "INVALID_CSI_LINK") != NULL;
-}
-
-static void read_csi_metadata(const char *json_body,
-                              char *state_out,
-                              size_t state_out_size,
-                              char *links_out,
-                              size_t links_out_size)
-{
-    if (state_out != NULL && state_out_size > 0U) {
-        strlcpy(state_out, "UNKNOWN", state_out_size);
-    }
-    if (links_out != NULL && links_out_size > 0U) {
-        strlcpy(links_out, "[]", links_out_size);
-    }
-    if (json_body == NULL || json_body[0] == '\0') {
-        return;
-    }
-
-    cJSON *root = cJSON_Parse(json_body);
-    if (root == NULL) {
-        return;
-    }
-
-    cJSON *state = cJSON_GetObjectItemCaseSensitive(root, "fused_state");
-    if (cJSON_IsString(state) && state->valuestring != NULL &&
-        state_out != NULL && state_out_size > 0U) {
-        strlcpy(state_out, state->valuestring, state_out_size);
-    } else if (cJSON_IsObject(state) && state_out != NULL && state_out_size > 0U) {
-        cJSON *nested_state = cJSON_GetObjectItemCaseSensitive(state, "state");
-        if (cJSON_IsString(nested_state) && nested_state->valuestring != NULL) {
-            strlcpy(state_out, nested_state->valuestring, state_out_size);
-        }
-    }
-
-    cJSON *links = cJSON_GetObjectItemCaseSensitive(root, "links");
-    if (cJSON_IsArray(links) && links_out != NULL && links_out_size > 0U) {
-        size_t used = 0U;
-        links_out[used++] = '[';
-        cJSON *link = NULL;
-        cJSON_ArrayForEach(link, links) {
-            if (!cJSON_IsString(link) || link->valuestring == NULL) {
-                continue;
-            }
-            int written = snprintf(links_out + used,
-                                   links_out_size - used,
-                                   "%s%s",
-                                   used == 1U ? "" : ",",
-                                   link->valuestring);
-            if (written <= 0 || (size_t)written >= links_out_size - used) {
-                break;
-            }
-            used += (size_t)written;
-        }
-        if (used + 1U < links_out_size) {
-            links_out[used++] = ']';
-            links_out[used] = '\0';
-        } else {
-            links_out[links_out_size - 2U] = ']';
-            links_out[links_out_size - 1U] = '\0';
-        }
-    }
-
-    cJSON_Delete(root);
-}
-
-static uint32_t csi_upload_interval_ms(const char *state)
-{
-    const uint32_t interval_ms =
-        state != NULL && strcmp(state, "IDLE") == 0 ?
-            NETWORK_WORKER_CSI_IDLE_UPLOAD_MS :
-            NETWORK_WORKER_CSI_MOTION_UPLOAD_MS;
-    return interval_ms < NETWORK_WORKER_CSI_UPLOAD_MIN_INTERVAL_MS ?
-               NETWORK_WORKER_CSI_UPLOAD_MIN_INTERVAL_MS :
-               interval_ms;
-}
-
-static bool csi_upload_due_locked(int64_t timestamp_ms)
-{
-    if (!s_latest_csi_valid || !s_csi_upload_pending || !s_server_ready ||
-        s_latest_csi_generation == s_last_csi_attempt_generation) {
-        return false;
-    }
-    if (!s_has_uploaded_csi || s_csi_offline_dirty) {
-        return true;
-    }
-    if (strings_differ(s_latest_csi_state, s_last_uploaded_csi_state)) {
-        return true;
-    }
-
-    const uint32_t interval_ms = csi_upload_interval_ms(s_latest_csi_state);
-    return s_last_csi_upload_ms == 0 ||
-           timestamp_ms - s_last_csi_upload_ms >= (int64_t)interval_ms;
-}
-
-static esp_err_t store_latest_csi_json(char *json_body, const char *source)
-{
-    if (json_body == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (s_csi_upload_lock != NULL) {
-        xSemaphoreTake(s_csi_upload_lock, portMAX_DELAY);
-    }
-
-    if (s_latest_csi_json != NULL) {
-        cJSON_free(s_latest_csi_json);
-    }
-    s_latest_csi_json = json_body;
-    json_body = NULL;
-    s_latest_csi_valid = true;
-    s_csi_upload_pending = true;
-    if (s_latest_csi_generation < UINT32_MAX) {
-        ++s_latest_csi_generation;
-    } else {
-        s_latest_csi_generation = 1U;
-    }
-    read_csi_metadata(s_latest_csi_json,
-                      s_latest_csi_state,
-                      sizeof(s_latest_csi_state),
-                      s_latest_csi_links,
-                      sizeof(s_latest_csi_links));
-    strlcpy(s_latest_csi_source,
-            source != NULL ? source : "csi_fact",
-            sizeof(s_latest_csi_source));
-    if (!s_server_ready) {
-        s_csi_offline_dirty = true;
-    }
-    if (s_csi_upload_lock != NULL) {
-        xSemaphoreGive(s_csi_upload_lock);
-    }
-    return ESP_OK;
-}
-
-static esp_err_t snapshot_latest_csi_upload(network_worker_work_item_t *item)
-{
-    if (item == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    memset(item, 0, sizeof(*item));
-    item->work_type = NETWORK_WORKER_WORK_UPLOAD_JSON;
-    item->json_type = NETWORK_WORKER_SERVER_JSON_CSI_EVENT;
-
-    if (s_csi_upload_lock != NULL) {
-        xSemaphoreTake(s_csi_upload_lock, portMAX_DELAY);
-    }
-
-    const int64_t timestamp_ms = now_ms();
-    if (!csi_upload_due_locked(timestamp_ms)) {
-        if (s_csi_upload_lock != NULL) {
-            xSemaphoreGive(s_csi_upload_lock);
-        }
-        return ESP_ERR_NOT_FOUND;
-    }
-    const uint32_t interval_ms = csi_upload_interval_ms(s_latest_csi_state);
-    const bool state_transition = s_last_csi_attempt_state[0] != '\0' &&
-                                  strings_differ(s_latest_csi_state,
-                                                 s_last_csi_attempt_state);
-    if (!state_transition && s_last_csi_attempt_ms != 0 &&
-        timestamp_ms - s_last_csi_attempt_ms < (int64_t)interval_ms) {
-        if (s_csi_upload_lock != NULL) {
-            xSemaphoreGive(s_csi_upload_lock);
-        }
-        return ESP_ERR_NOT_FOUND;
-    }
-    size_t json_len = strlen(s_latest_csi_json);
-    item->json_body = cJSON_malloc(json_len + 1U);
-    if (item->json_body == NULL) {
-        if (s_csi_upload_lock != NULL) {
-            xSemaphoreGive(s_csi_upload_lock);
-        }
-        return ESP_ERR_NO_MEM;
-    }
-    memcpy(item->json_body, s_latest_csi_json, json_len + 1U);
-    item->csi_generation = s_latest_csi_generation;
-    strlcpy(item->csi_state, s_latest_csi_state, sizeof(item->csi_state));
-    strlcpy(item->csi_links, s_latest_csi_links, sizeof(item->csi_links));
-    strlcpy(item->source,
-            s_latest_csi_source[0] != '\0' ? s_latest_csi_source : "csi_fact",
-            sizeof(item->source));
-    strlcpy(item->csi_upload_reason,
-            state_transition ? "state_transition" : "periodic",
-            sizeof(item->csi_upload_reason));
-    s_last_csi_attempt_ms = timestamp_ms;
-    strlcpy(s_last_csi_attempt_state,
-            s_latest_csi_state,
-            sizeof(s_last_csi_attempt_state));
-    s_last_csi_attempt_generation = item->csi_generation;
-
-    if (s_csi_upload_lock != NULL) {
-        xSemaphoreGive(s_csi_upload_lock);
-    }
-    return ESP_OK;
-}
-
-static void mark_csi_upload_unretryable(const network_worker_work_item_t *item,
-                                        const char *last_error)
-{
-    if (!upload_work_is_csi_event(item)) {
-        return;
-    }
-
-    if (s_csi_upload_lock != NULL) {
-        xSemaphoreTake(s_csi_upload_lock, portMAX_DELAY);
-    }
-    if (item->csi_generation == 0U || item->csi_generation == s_latest_csi_generation) {
-        if (s_latest_csi_json != NULL) {
-            cJSON_free(s_latest_csi_json);
-            s_latest_csi_json = NULL;
-        }
-        s_latest_csi_valid = false;
-        s_csi_upload_pending = false;
-        s_csi_offline_dirty = false;
-        s_has_uploaded_csi = false;
-        s_latest_csi_state[0] = '\0';
-        s_latest_csi_links[0] = '\0';
-        s_latest_csi_source[0] = '\0';
-    }
-    if (s_csi_upload_lock != NULL) {
-        xSemaphoreGive(s_csi_upload_lock);
-    }
-
-    strlcpy(s_server_last_error,
-            last_error != NULL && last_error[0] != '\0' ? last_error :
-                                                               ESP111_PROTOCOL_ERROR_INVALID_CSI_RESULT,
-            sizeof(s_server_last_error));
-    ESP_LOGW(TAG,
-             "CSI upload dropped unretryable reason=%s generation=%lu links=%s",
-             s_server_last_error,
-             (unsigned long)item->csi_generation,
-             item->csi_links[0] != '\0' ? item->csi_links : "-");
-}
-
-static void mark_csi_upload_result(const network_worker_work_item_t *item, esp_err_t ret, int status)
-{
-    if (!upload_work_is_csi_event(item)) {
-        return;
-    }
-
-    const bool ok = server_result_ok(ret, status);
-    if (s_csi_upload_lock != NULL) {
-        xSemaphoreTake(s_csi_upload_lock, portMAX_DELAY);
-    }
-    if (ok) {
-        s_last_csi_upload_ms = now_ms();
-        s_has_uploaded_csi = true;
-        strlcpy(s_last_uploaded_csi_state, item->csi_state, sizeof(s_last_uploaded_csi_state));
-        strlcpy(s_last_uploaded_csi_links, item->csi_links, sizeof(s_last_uploaded_csi_links));
-        if (item->csi_generation == s_latest_csi_generation) {
-            s_csi_upload_pending = false;
-            s_csi_offline_dirty = false;
-        }
-    } else {
-        s_csi_offline_dirty = true;
-        if (item->csi_generation == s_latest_csi_generation) {
-            /* 同一 generation 不重试；下一条融合结果会重新置 pending 并覆盖 latest。 */
-            s_csi_upload_pending = false;
-        }
-    }
-    if (s_csi_upload_lock != NULL) {
-        xSemaphoreGive(s_csi_upload_lock);
-    }
-
-    ESP_LOGI(TAG,
-             "CSI_UPLOAD_REASON reason=%s generation=%lu state=%s status=%d ret=%s",
-             server_result_ok(ret, status) ?
-                 (item->csi_upload_reason[0] != '\0' ? item->csi_upload_reason : "periodic") :
-                 "dropped",
-             (unsigned long)item->csi_generation,
-             item->csi_state[0] != '\0' ? item->csi_state : "unknown",
              status,
              esp_err_to_name(ret));
 }
@@ -1857,7 +1277,7 @@ static void evaluate_state(const char *reason)
 
     /*
      * local ingest 只依赖 SoftAP。STA/IP/server preflight 只影响 Server upload gate，
-     * 不能暂停 C5 本地 register/heartbeat/sensor/CSI/UDP stream ingest。
+     * 不能暂停 C5 本地 register/heartbeat/sensor/UDP stream ingest。
      */
     const bool softap_ready = gateway_wifi_is_softap_ready();
     const bool sta_started = gateway_wifi_is_sta_started();
@@ -2312,10 +1732,6 @@ static esp_err_t enqueue_upload_work_item(const network_worker_work_item_t *item
     if (item == NULL || s_work_queue == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (upload_work_is_csi_event(item)) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
     const bool low_priority = upload_work_is_low_priority(item);
     if (low_priority && !server_link_stable()) {
         ++s_low_priority_drop_count;
@@ -2364,7 +1780,7 @@ static esp_err_t enqueue_upload_work_item(const network_worker_work_item_t *item
         return ESP_ERR_TIMEOUT;
     }
 
-    if (low_priority || upload_work_is_csi_event(item)) {
+    if (low_priority) {
         mark_upload_pending_flag(item);
     }
     xSemaphoreGive(s_work_queue_mutation_lock);
@@ -2457,87 +1873,6 @@ static void requeue_or_drop_work(QueueHandle_t queue,
     release_work_item(item);
 }
 
-static void log_csi_server_payload_links_text(const char *links_text,
-                                              const char *reason,
-                                              bool force)
-{
-    if (links_text == NULL || links_text[0] == '\0') {
-        links_text = "[]";
-    }
-
-    const int64_t timestamp_ms = now_ms();
-    const bool changed = strcmp(links_text, s_last_csi_payload_links) != 0;
-    if (!force && !changed &&
-        s_last_csi_payload_links_log_ms != 0 &&
-        timestamp_ms - s_last_csi_payload_links_log_ms <
-            (int64_t)NETWORK_WORKER_CSI_PAYLOAD_LINKS_LOG_MS) {
-        return;
-    }
-    s_last_csi_payload_links_log_ms = timestamp_ms;
-    strlcpy(s_last_csi_payload_links, links_text, sizeof(s_last_csi_payload_links));
-    ESP_LOGI(TAG,
-             "CSI_SERVER_PAYLOAD_LINKS links=%s reason=%s",
-             links_text,
-             reason != NULL ? reason : (changed ? "changed" : "periodic"));
-}
-
-static void log_csi_server_payload_links_json(const char *json_body,
-                                              const char *reason,
-                                              bool force)
-{
-    if (json_body == NULL || json_body[0] == '\0') {
-        if (force) {
-            ESP_LOGW(TAG, "CSI_SERVER_PAYLOAD_LINKS links=[] reason=empty_payload");
-        }
-        return;
-    }
-
-    cJSON *root = cJSON_Parse(json_body);
-    if (root == NULL) {
-        if (force) {
-            ESP_LOGW(TAG, "CSI_SERVER_PAYLOAD_LINKS links=[] reason=parse_failed");
-        }
-        return;
-    }
-
-    cJSON *links = cJSON_GetObjectItemCaseSensitive(root, "links");
-    if (!cJSON_IsArray(links)) {
-        if (force) {
-            ESP_LOGW(TAG, "CSI_SERVER_PAYLOAD_LINKS links=[] reason=missing_links");
-        }
-        cJSON_Delete(root);
-        return;
-    }
-
-    char links_text[160] = "[";
-    size_t used = 1U;
-    cJSON *link = NULL;
-    cJSON_ArrayForEach(link, links) {
-        if (!cJSON_IsString(link) || link->valuestring == NULL) {
-            continue;
-        }
-        int written = snprintf(links_text + used,
-                               sizeof(links_text) - used,
-                               "%s%s",
-                               used == 1U ? "" : ",",
-                               link->valuestring);
-        if (written <= 0 || (size_t)written >= sizeof(links_text) - used) {
-            break;
-        }
-        used += (size_t)written;
-    }
-    if (used + 2U <= sizeof(links_text)) {
-        links_text[used++] = ']';
-        links_text[used] = '\0';
-    } else {
-        links_text[sizeof(links_text) - 2U] = ']';
-        links_text[sizeof(links_text) - 1U] = '\0';
-    }
-
-    log_csi_server_payload_links_text(links_text, reason, force);
-    cJSON_Delete(root);
-}
-
 static esp_err_t perform_server_json(network_worker_work_item_t *item)
 {
     if (item == NULL || item->json_body == NULL) {
@@ -2547,7 +1882,6 @@ static esp_err_t perform_server_json(network_worker_work_item_t *item)
     char response[SERVER_CLIENT_SMALL_BODY_BYTES];
     int status = 0;
     esp_err_t ret = ESP_ERR_INVALID_ARG;
-    bool csi_unretryable = false;
     bool telemetry_local_deferred = false;
     bool peer_cancelled = false;
     switch (item->json_type) {
@@ -2577,20 +1911,6 @@ static esp_err_t perform_server_json(network_worker_work_item_t *item)
                                                  &status);
         }
         break;
-    case NETWORK_WORKER_SERVER_JSON_CSI_EVENT:
-        ret = validate_and_log_csi_final_payload(item->json_body);
-        if (ret != ESP_OK) {
-            csi_unretryable = true;
-            mark_csi_upload_unretryable(item, ESP111_PROTOCOL_ERROR_INVALID_CSI_RESULT);
-            break;
-        }
-        ret = server_client_post_csi_event_json(item->json_body, response, sizeof(response), &status);
-        telemetry_local_deferred = ret == ESP_ERR_NOT_FINISHED;
-        if (csi_response_is_invalid_link(status, response)) {
-            csi_unretryable = true;
-            mark_csi_upload_unretryable(item, "INVALID_CSI_LINK");
-        }
-        break;
     case NETWORK_WORKER_SERVER_JSON_GATEWAY_STATE:
         ret = server_client_post_gateway_state_json(item->json_body, response, sizeof(response), &status);
         telemetry_local_deferred = ret == ESP_ERR_NOT_FINISHED;
@@ -2608,11 +1928,10 @@ static esp_err_t perform_server_json(network_worker_work_item_t *item)
         break;
     }
 
-    if (!csi_unretryable && !peer_cancelled) {
+    if (!peer_cancelled) {
         if (!upload_work_is_telemetry(item) && !telemetry_local_deferred) {
             (void)update_server_health(ret, status, json_type_name(item->json_type));
         }
-        mark_csi_upload_result(item, ret, status);
     }
     if (item->json_type == NETWORK_WORKER_SERVER_JSON_INGEST &&
         item->bme_cache_sequence != 0U &&
@@ -2629,57 +1948,9 @@ static esp_err_t perform_server_json(network_worker_work_item_t *item)
     }
     if (!peer_cancelled && !telemetry_local_deferred &&
         (ret != ESP_OK || status < 200 || status >= 300)) {
-        if (upload_work_is_csi_event(item)) {
-            if (item->csi_links[0] != '\0') {
-                log_csi_server_payload_links_text(item->csi_links, "upload_failed", true);
-            } else {
-                log_csi_server_payload_links_json(item->json_body, "upload_failed", true);
-            }
-        }
         log_server_upload_failed_limited(item, ret, status);
     }
     return ret;
-}
-
-static void process_latest_csi_upload_if_due(void)
-{
-    if (!server_link_stable() || !resource_manager_has_active_sessions()) {
-        return;
-    }
-
-    network_worker_work_item_t item = {0};
-    esp_err_t ret = snapshot_latest_csi_upload(&item);
-    if (ret == ESP_ERR_NOT_FOUND) {
-        return;
-    }
-    if (ret != ESP_OK) {
-        log_server_upload_failed_limited(&item, ret, 0);
-        return;
-    }
-
-    bool current = false;
-    if (s_csi_upload_lock != NULL) {
-        xSemaphoreTake(s_csi_upload_lock, portMAX_DELAY);
-        current = s_latest_csi_valid &&
-                  item.csi_generation == s_latest_csi_generation;
-        xSemaphoreGive(s_csi_upload_lock);
-    }
-    if (!current || !resource_manager_has_active_sessions()) {
-        cJSON_free(item.json_body);
-        item.json_body = NULL;
-        return;
-    }
-
-    ret = perform_server_json(&item);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "network worker latest CSI failed source=%s generation=%lu ret=%s",
-                 item.source,
-                 (unsigned long)item.csi_generation,
-                 esp_err_to_name(ret));
-    }
-    cJSON_free(item.json_body);
-    item.json_body = NULL;
 }
 
 static void process_upload_work_item(network_worker_work_item_t *item)
@@ -2710,14 +1981,6 @@ static void process_upload_work_item(network_worker_work_item_t *item)
     esp_err_t ret = ESP_OK;
     switch (item->work_type) {
     case NETWORK_WORKER_WORK_UPLOAD_JSON:
-        if (upload_work_is_csi_event(item) &&
-            item->csi_generation != 0U &&
-            item->csi_generation != s_latest_csi_generation) {
-            ++s_low_priority_coalesce_count;
-            log_upload_drop_summary("stale_csi_generation", item);
-            release_work_item(item);
-            return;
-        }
         ret = perform_server_json(item);
         if (ret == ESP_ERR_INVALID_STATE && !server_link_stable()) {
             requeue_or_drop_work(s_work_queue, item, ret);
@@ -2854,7 +2117,7 @@ static void upload_worker_task(void *arg)
 
     while (1) {
         if (!server_link_stable()) {
-            /* Server 未 ready 时不上传；清掉过期 snapshot，CSI 仅保留在独立 latest 槽。 */
+            /* Server 未 ready 时不上传；清掉过期的低优先级 snapshot。 */
             drop_low_priority_upload_backlog("server_not_ready_backlog");
             app_stack_monitor_log_periodic(TAG,
                                            "upload_worker",
@@ -2866,8 +2129,6 @@ static void upload_worker_task(void *arg)
             app_task_wdt_delay_ms(wdt_registered, NETWORK_WORKER_POLL_MS);
             continue;
         }
-
-        process_latest_csi_upload_if_due();
 
         network_worker_work_item_t item = {0};
         if (xQueueReceive(s_work_queue, &item, pdMS_TO_TICKS(NETWORK_WORKER_POLL_MS)) ==
@@ -3000,12 +2261,6 @@ esp_err_t network_worker_init(void)
     if (s_command_queue_mutation_lock == NULL) {
         s_command_queue_mutation_lock = xSemaphoreCreateMutex();
         if (s_command_queue_mutation_lock == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_csi_upload_lock == NULL) {
-        s_csi_upload_lock = xSemaphoreCreateMutex();
-        if (s_csi_upload_lock == NULL) {
             return ESP_ERR_NO_MEM;
         }
     }
@@ -3240,11 +2495,6 @@ esp_err_t network_worker_submit_peer_server_json(network_worker_server_json_type
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (type == NETWORK_WORKER_SERVER_JSON_CSI_EVENT) {
-        esp_err_t ret = store_latest_csi_json(json_body, source);
-        return ret;
-    }
-
     network_worker_work_item_t item = {
         .work_type = NETWORK_WORKER_WORK_UPLOAD_JSON,
         .json_type = type,
@@ -3346,36 +2596,6 @@ esp_err_t network_worker_submit_bme_cached_json_for_peer(char *json_body,
     return ret;
 }
 
-void network_worker_clear_latest_csi(const char *reason)
-{
-    if (s_csi_upload_lock == NULL) {
-        return;
-    }
-    xSemaphoreTake(s_csi_upload_lock, portMAX_DELAY);
-    if (s_latest_csi_json != NULL) {
-        cJSON_free(s_latest_csi_json);
-        s_latest_csi_json = NULL;
-    }
-    ++s_latest_csi_generation;
-    if (s_latest_csi_generation == 0U) {
-        s_latest_csi_generation = 1U;
-    }
-    s_latest_csi_valid = false;
-    s_csi_offline_dirty = false;
-    s_csi_upload_pending = false;
-    s_last_csi_attempt_ms = 0;
-    s_last_csi_attempt_generation = 0U;
-    s_latest_csi_state[0] = '\0';
-    s_latest_csi_links[0] = '\0';
-    s_latest_csi_source[0] = '\0';
-    s_last_csi_attempt_state[0] = '\0';
-    xSemaphoreGive(s_csi_upload_lock);
-
-    ESP_LOGI(TAG,
-             "CSI latest upload cleared reason=%s",
-             reason != NULL ? reason : "resource_release");
-}
-
 static size_t cancel_peer_upload_queue(const char *device_id)
 {
     if (s_work_queue == NULL || s_work_queue_mutation_lock == NULL || device_id == NULL) {
@@ -3437,7 +2657,6 @@ esp_err_t network_worker_release_peer_resources(const char *device_id)
     }
     size_t upload_cancelled = cancel_peer_upload_queue(device_id);
     size_t command_cancelled = cancel_command_pull_queue_if_idle();
-    network_worker_clear_latest_csi("peer_resource_release");
     ESP_LOGI(TAG,
              "peer network work released device_id=%s sensor_cancelled=%u command_pull_cancelled=%u",
              device_id,

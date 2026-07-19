@@ -1,0 +1,116 @@
+Command: ninja all
+[0/1] Re-running CMake...
+-- Minimal build - OFF
+-- Building ESP-IDF components for target esp32c5
+NOTICE: 
+Following dependencies have new versions available:
+Dependency "espressif/dl_fft": "0.4.0" -> "0.6.0"
+Consider running "idf.py update-dependencies" to update your lock file.
+NOTICE: Processing 5 dependencies:
+NOTICE: [1/5] espressif/cjson (1.7.19~2)
+NOTICE: [2/5] espressif/dl_fft (0.4.0)
+NOTICE: [3/5] espressif/esp-dsp (1.8.0)
+NOTICE: [4/5] espressif/esp-sr (2.4.6)
+NOTICE: [5/5] idf (5.5.4)
+-- CONFIG_ESP32P4_SELECTS_REV_LESS_V3 is 
+-- IDF_VERSION_MAJOR is 5
+-- IDF_VERSION_MINOR is 5
+-- IDF_VERSION_PATCH is 4
+-- TARGET_LIB_PATH is set to: esp32c5
+-- Project sdkconfig file /Users/zhiqin/ESP 雷达/ESPC51/sdkconfig
+Loading defaults file /Users/zhiqin/ESP 雷达/ESPC51/sdkconfig.defaults...
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/riscv/ld/rom.api.ld
+-- USING O3
+-- App "00_Learn" version: 6efb830-dirty
+-- Adding linker script /Users/zhiqin/ESP 雷达/build-radar-c51/esp-idf/esp_system/ld/memory.ld
+-- Adding linker script /Users/zhiqin/ESP 雷达/build-radar-c51/esp-idf/esp_system/ld/sections.ld.in
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.api.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.rvfp.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.wdt.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.systimer.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.version.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.phy.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.coexist.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.net80211.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.pp.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.libc.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.newlib.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom/esp32c5/ld/esp32c5.rom.heap.ld
+-- Adding linker script /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/soc/esp32c5/ld/esp32c5.peripherals.ld
+-- CONFIG_ESP32P4_SELECTS_REV_LESS_V3 is 
+-- IDF_VERSION_MAJOR is 5
+-- IDF_VERSION_MINOR is 5
+-- IDF_VERSION_PATCH is 4
+-- TARGET_LIB_PATH is set to: esp32c5
+-- Components: BSP IIC IIS Middlewares app_config app_time_sync app_trace app_update bootloader bootloader_support bt cmock console cxx driver efuse esp-tls esp111_protocol_common esp_adc esp_app_format esp_bootloader_format esp_coex esp_common esp_driver_ana_cmpr esp_driver_bitscrambler esp_driver_cam esp_driver_dac esp_driver_gpio esp_driver_gptimer esp_driver_i2c esp_driver_i2s esp_driver_isp esp_driver_jpeg esp_driver_ledc esp_driver_mcpwm esp_driver_parlio esp_driver_pcnt esp_driver_ppa esp_driver_rmt esp_driver_sdio esp_driver_sdm esp_driver_sdmmc esp_driver_sdspi esp_driver_spi esp_driver_touch_sens esp_driver_tsens esp_driver_twai esp_driver_uart esp_driver_usb_serial_jtag esp_eth esp_event esp_gdbstub esp_hal_ieee802154 esp_hid esp_http_client esp_http_server esp_https_ota esp_https_server esp_hw_support esp_lcd esp_local_ctrl esp_mm esp_netif esp_netif_stack esp_partition esp_phy esp_pm esp_psram esp_ringbuf esp_rom esp_security esp_system esp_tee esp_timer esp_vfs_console esp_wifi espcoredump espressif__cjson espressif__dl_fft espressif__esp-dsp espressif__esp-sr esptool_py fatfs freertos hal heap http_parser idf_test ieee802154 json log lwip main mbedtls mqtt newlib nvs_flash nvs_sec_provider openthread partition_table protobuf-c protocomm pthread radar_ld2450 riscv rt sdmmc server_comm soc spi_flash spiffs tcp_transport ulp unity usb vfs wear_levelling wifi_provisioning wpa_supplicant
+-- Component paths: /Users/zhiqin/ESP 雷达/ESPC51/components/BSP /Users/zhiqin/ESP 雷达/ESPC51/components/BSP/IIC /Users/zhiqin/ESP 雷达/ESPC51/components/BSP/IIS /Users/zhiqin/ESP 雷达/ESPC51/components/Middlewares /Users/zhiqin/ESP 雷达/ESPC51/components/app_config /Users/zhiqin/ESP 雷达/ESPC51/components/app_time_sync /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/app_trace /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/app_update /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/bootloader /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/bootloader_support /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/bt /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/cmock /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/console /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/cxx /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/driver /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/efuse /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp-tls /Users/zhiqin/ESP 雷达/ESPC51/components/esp111_protocol_common /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_adc /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_app_format /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_bootloader_format /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_coex /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_common /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_ana_cmpr /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_bitscrambler /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_cam /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_dac /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_gpio /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_gptimer /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_i2c /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_i2s /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_isp /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_jpeg /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_ledc /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_mcpwm /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_parlio /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_pcnt /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_ppa /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_rmt /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_sdio /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_sdm /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_sdmmc /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_sdspi /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_spi /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_touch_sens /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_tsens /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_twai /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_uart /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_driver_usb_serial_jtag /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_eth /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_event /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_gdbstub /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_hal_ieee802154 /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_hid /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_http_client /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_http_server /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_https_ota /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_https_server /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_hw_support /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_lcd /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_local_ctrl /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_mm /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_netif /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_netif_stack /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_partition /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_phy /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_pm /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_psram /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_ringbuf /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_rom /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_security /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_system /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_tee /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_timer /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_vfs_console /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esp_wifi /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/espcoredump /Users/zhiqin/ESP 雷达/ESPC51/managed_components/espressif__cjson /Users/zhiqin/ESP 雷达/ESPC51/managed_components/espressif__dl_fft /Users/zhiqin/ESP 雷达/ESPC51/managed_components/espressif__esp-dsp /Users/zhiqin/ESP 雷达/ESPC51/managed_components/espressif__esp-sr /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/esptool_py /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/fatfs /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/freertos /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/hal /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/heap /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/http_parser /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/idf_test /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/ieee802154 /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/json /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/log /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/lwip /Users/zhiqin/ESP 雷达/ESPC51/main /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/mbedtls /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/mqtt /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/newlib /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/nvs_flash /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/nvs_sec_provider /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/openthread /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/protobuf-c /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/protocomm /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/pthread /Users/zhiqin/ESP 雷达/ESPC51/components/radar_ld2450 /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/riscv /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/rt /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/sdmmc /Users/zhiqin/ESP 雷达/ESPC51/components/Middlewares/server_comm /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/soc /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/spi_flash /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/spiffs /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/tcp_transport /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/ulp /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/unity /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/usb /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/vfs /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/wear_levelling /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/wifi_provisioning /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/wpa_supplicant
+-- Configuring done (3.6s)
+-- Generating done (0.4s)
+-- Build files have been written to: /Users/zhiqin/ESP 雷达/build-radar-c51
+[1/47] Building C object esp-idf/radar_ld2450/CMakeFiles/__idf_radar_ld2450.dir/radar_state_codec.c.obj
+[2/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/mic/mic_adc_pcm.c.obj
+[3/47] Building C object esp-idf/radar_ld2450/CMakeFiles/__idf_radar_ld2450.dir/ld2450_parser.c.obj
+[4/47] Building C object esp-idf/radar_ld2450/CMakeFiles/__idf_radar_ld2450.dir/radar_service.c.obj
+[5/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/mic/mic_vad.c.obj
+[6/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/display_placeholder/ai_screen_bridge.c.obj
+[7/47] Linking C static library esp-idf/radar_ld2450/libradar_ld2450.a
+[8/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/display_placeholder/screen_server_client.c.obj
+[9/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/display_placeholder/screen_service.c.obj
+[10/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/app_orchestrator/app_orchestrator.c.obj
+[11/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/speaker/speaker_resample.c.obj
+[12/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/wake/local_wake_word.c.obj
+[13/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/wifi/wifi_manager.c.obj
+[14/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/memory/c5_memory.c.obj
+[15/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/runtime/app_runtime.c.obj
+[16/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/runtime/c5_event_bus.c.obj
+[17/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/wake/wake_prompt_cache.c.obj
+[18/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/runtime/c5_backpressure_controller.c.obj
+[19/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/runtime/c5_resource_manager.c.obj
+[20/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/runtime/c5_runtime_workers.c.obj
+[21/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/device_protocol/device_protocol_metadata.c.obj
+[22/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/radar_ble/radar_ble_stream.c.obj
+[23/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/radar_ble/radar_ble_transport.c.obj
+[24/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/sensor_domain/bme690/service/bme_sensor_service.c.obj
+[25/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/sensor_domain/radar/radar_state_client.c.obj
+[26/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/speaker/speaker_player.c.obj
+[27/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/server_voice/server_voice_client.c.obj
+[28/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/radar_ble/radar_ble_runtime.c.obj
+[29/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/sensor_domain/bme690/server_client/bme_server_client.c.obj
+[30/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/sensor_domain/bme690/driver/bme690.c.obj
+[31/47] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/main.c.obj
+[32/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/device_protocol/device_stream_client.c.obj
+[33/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/sensor_domain/bme690/service/bme_air_quality.c.obj
+[34/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/command_domain/system_command/system_service.c.obj
+[35/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/mic/mic_adc_test.c.obj
+[36/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/voice_domain/voice_chain.c.obj
+[37/47] Performing build step for 'bootloader'
+[1/1] cd "/Users/zhiqin/ESP 雷达/build-radar-c51/bootloader/esp-idf/esptool_py" && /Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x2000 /Users/zhiqin/ESP\ 雷达/build-radar-c51/bootloader/bootloader.bin
+Bootloader binary size 0x5670 bytes. 0x990 bytes (10%) free.
+[38/47] No install step for 'bootloader'
+[39/47] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/command_domain/system_command/system_server_client.c.obj
+[40/47] Completed 'bootloader'
+[41/47] Linking C static library esp-idf/Middlewares/libMiddlewares.a
+[42/47] Linking C static library esp-idf/main/libmain.a
+[43/47] Generating esp-idf/esp_system/ld/sections.ld
+[44/47] Linking CXX executable 00_Learn.elf
+[45/47] Generating binary image from built executable
+esptool.py v4.12.dev2
+Creating esp32c5 image...
+Merged 1 ELF section
+Successfully created esp32c5 image.
+Generated /Users/zhiqin/ESP 雷达/build-radar-c51/00_Learn.bin
+[46/47] cd "/Users/zhiqin/ESP 雷达/build-radar-c51/esp-idf/esptool_py" && /Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /Users/zhiqin/ESP\ 雷达/build-radar-c51/partition_table/partition-table.bin /Users/zhiqin/ESP\ 雷达/build-radar-c51/00_Learn.bin
+00_Learn.bin binary size 0x14e810 bytes. Smallest app partition is 0x500000 bytes. 0x3b17f0 bytes (74%) free.

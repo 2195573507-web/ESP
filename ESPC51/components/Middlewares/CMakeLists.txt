@@ -32,10 +32,13 @@ set(runtime_srcs
             runtime/app_runtime.c
             runtime/c5_backpressure_controller.c
             runtime/c5_event_bus.c
+            runtime/c5_resource_manager.c
             runtime/c5_runtime_workers.c)
 
+set(memory_srcs
+            memory/c5_memory.c)
+
 set(device_protocol_srcs
-            device_protocol/envelope_builder.c
             device_protocol/device_protocol_metadata.c
             device_protocol/device_stream_client.c)
 
@@ -44,12 +47,17 @@ set(sensor_srcs
             sensor_domain/bme690/service/bme_air_quality.c
             sensor_domain/bme690/service/bme_sensor_service.c
             sensor_domain/bme690/server_client/bme_server_client.c
-            sensor_domain/csi_placeholder/csi_service.c
-            sensor_domain/csi_placeholder/csi_server_client.c
-            sensor_domain/csi_edge_detector/csi_edge_detector.c
-            sensor_domain/csi_phase_a/csi_capture.c
-            sensor_domain/csi_phase_a/csi_feature.c
-            sensor_domain/csi_phase_a/csi_phase_a_tests.c)
+            )
+set(radar_ble_srcs
+            radar_ble/radar_ble_transport.c
+            radar_ble/radar_ble_runtime.c)
+
+set(radar_domain_srcs
+            radar_domain/radar_memory_manager.c
+            radar_domain/radar_buffer.c
+            radar_domain/radar_upload_queue.c
+            radar_domain/radar_resource_adapter.c
+            radar_domain/radar_worker.c)
 
 set(system_srcs
             command_domain/system_command/system_service.c
@@ -65,8 +73,11 @@ set(srcs
             ${speaker_srcs}
             ${voice_srcs}
             ${runtime_srcs}
+            ${memory_srcs}
             ${device_protocol_srcs}
             ${sensor_srcs}
+            ${radar_ble_srcs}
+            ${radar_domain_srcs}
             ${system_srcs})
 
 set(include_dirs
@@ -81,13 +92,14 @@ set(priv_include_dirs
             speaker
             voice_domain
             runtime
+            memory
             device_protocol
             sensor_domain/bme690/driver
             sensor_domain/bme690/service
             sensor_domain/bme690/server_client
-            sensor_domain/csi_placeholder
-            sensor_domain/csi_edge_detector
-            sensor_domain/csi_phase_a
+            sensor_domain/radar
+            radar_ble/include
+            radar_domain
             command_domain/system_command)
 
 set(requires
@@ -111,6 +123,9 @@ set(requires
             app_time_sync
             server_comm
             esp111_protocol_common
+            radar_ld2450
+            radar_domain
+            bt
             espressif__esp-sr)
 
 idf_component_register(SRCS ${srcs}

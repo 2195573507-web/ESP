@@ -135,6 +135,8 @@ const char *gateway_link_state_name(gateway_link_state_t state)
         return "LINK_REGISTERING";
     case LINK_READY:
         return "LINK_READY";
+    case LINK_DEGRADED:
+        return "LINK_DEGRADED";
     case LINK_LOST:
         return "LINK_LOST";
     default:
@@ -197,7 +199,7 @@ static void gateway_link_set_state(gateway_link_state_t state, const char *reaso
 
     if (changed) {
         ESP_LOGI(TAG,
-                 "%s -> %s%s%s",
+                 "gateway_transport_state=%s->%s%s%s",
                  gateway_link_state_name(old_state),
                  gateway_link_state_name(state),
                  reason != NULL && reason[0] != '\0' ? " reason=" : "",
@@ -373,6 +375,7 @@ bool gateway_link_http_error_is_link_failure(esp_err_t ret)
     case ESP_ERR_HTTP_FETCH_HEADER:
     case ESP_ERR_HTTP_INVALID_TRANSPORT:
     case ESP_ERR_HTTP_CONNECTION_CLOSED:
+    case ESP_ERR_HTTP_EAGAIN:
     case ESP_ERR_TIMEOUT:
     case ESP_FAIL:
     case SERVER_COMM_ERR_WIFI_NOT_READY:
@@ -388,9 +391,15 @@ void gateway_link_record_http_result(esp_err_t ret, bool voice_request, bool rec
         return;
     }
     if (ret == ESP_OK) {
+        bool degraded_exit = false;
         portENTER_CRITICAL(&s_link_lock);
+        degraded_exit = s_link.state == LINK_DEGRADED;
         s_link.consecutive_failures = 0;
         portEXIT_CRITICAL(&s_link_lock);
+        if (degraded_exit) {
+            ESP_LOGI(TAG, "degraded_exit reason=http_success");
+            gateway_link_set_state(LINK_READY, "http_success");
+        }
         return;
     }
 
@@ -405,16 +414,27 @@ void gateway_link_record_http_result(esp_err_t ret, bool voice_request, bool rec
         return;
     }
 
-    bool mark_lost = false;
+    bool enter_degraded = false;
+    uint32_t failure_count = 0;
     portENTER_CRITICAL(&s_link_lock);
-    if (s_link.state == LINK_READY || s_link.state == LINK_LOST) {
+    if (s_link.state == LINK_READY || s_link.state == LINK_DEGRADED || s_link.state == LINK_LOST) {
         s_link.consecutive_failures++;
-        mark_lost = s_link.consecutive_failures >= GATEWAY_LINK_FAILURE_THRESHOLD;
+        failure_count = s_link.consecutive_failures;
+        enter_degraded = s_link.state == LINK_READY &&
+                         failure_count >= GATEWAY_LINK_FAILURE_THRESHOLD;
     }
     portEXIT_CRITICAL(&s_link_lock);
 
-    if (mark_lost) {
-        gateway_link_set_state(LINK_LOST, esp_err_to_name(ret));
+    ESP_LOGW(TAG,
+             "http_failure_count=%lu ret=%s voice=%d reconnect=%d",
+             (unsigned long)failure_count,
+             esp_err_to_name(ret),
+             voice_request ? 1 : 0,
+             reconnect_request ? 1 : 0);
+    if (enter_degraded) {
+        ESP_LOGW(TAG, "degraded_enter failures=%lu reason=%s", (unsigned long)failure_count,
+                 esp_err_to_name(ret));
+        gateway_link_set_state(LINK_DEGRADED, esp_err_to_name(ret));
         gateway_link_request_reconnect();
     }
 }
@@ -530,6 +550,21 @@ static esp_err_t gateway_link_register_child(void)
     return ret;
 }
 
+static bool gateway_link_defer_reconnect_for_voice(esp_err_t ret)
+{
+    if (ret != SERVER_COMM_ERR_BLOCKED_BY_VOICE_BUSY) {
+        return false;
+    }
+
+    if (gateway_link_should_log(&s_link.last_voice_skip_log_ms)) {
+        ESP_LOGI(TAG,
+                 "reconnect health/register deferred while voice lease owns normal HTTP");
+    }
+    vTaskDelay(pdMS_TO_TICKS(GATEWAY_LINK_RETRY_FAST_MS));
+    gateway_link_request_reconnect();
+    return true;
+}
+
 static void gateway_link_reconnect_task(void *arg)
 {
     (void)arg;
@@ -558,12 +593,15 @@ static void gateway_link_reconnect_task(void *arg)
             continue;
         }
 
-        if (state == LINK_DOWN || state == LINK_LOST) {
+        if (state == LINK_DOWN || state == LINK_LOST || state == LINK_DEGRADED) {
             gateway_link_set_state(LINK_WIFI_CONNECTED, "wifi_stable");
         }
 
         esp_err_t ret = gateway_link_health_probe();
         if (ret != ESP_OK) {
+            if (gateway_link_defer_reconnect_for_voice(ret)) {
+                continue;
+            }
             gateway_link_note_reconnect_failure();
             vTaskDelay(pdMS_TO_TICKS(gateway_link_retry_delay_ms()));
             continue;
@@ -572,6 +610,9 @@ static void gateway_link_reconnect_task(void *arg)
         gateway_link_set_state(LINK_REGISTERING, "health_ok");
         ret = gateway_link_register_child();
         if (ret != ESP_OK) {
+            if (gateway_link_defer_reconnect_for_voice(ret)) {
+                continue;
+            }
             gateway_link_note_reconnect_failure();
             vTaskDelay(pdMS_TO_TICKS(gateway_link_retry_delay_ms()));
             continue;

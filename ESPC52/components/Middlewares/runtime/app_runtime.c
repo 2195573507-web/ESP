@@ -42,7 +42,9 @@ static void app_runtime_log_heap(const char *label, const char *reason)
 #endif
 }
 
-esp_err_t app_runtime_pause_non_voice(const char *reason)
+esp_err_t app_runtime_pause_non_voice_timed(const char *reason,
+                                            uint32_t http_timeout_ms,
+                                            uint32_t bme_timeout_ms)
 {
     bool first_pause = false;
 
@@ -58,8 +60,20 @@ esp_err_t app_runtime_pause_non_voice(const char *reason)
     }
 
     server_comm_http_set_non_voice_paused(true);
+    esp_err_t ret = server_comm_http_wait_for_non_voice_idle(http_timeout_ms);
+    if (ret != ESP_OK) {
+        server_comm_http_set_non_voice_paused(false);
+        portENTER_CRITICAL(&s_app_runtime_lock);
+        s_non_voice_paused = false;
+        portEXIT_CRITICAL(&s_app_runtime_lock);
+        ESP_LOGW(TAG,
+                 "non-voice HTTP quiesce failed reason=%s ret=%s",
+                 reason != NULL ? reason : "<none>",
+                 esp_err_to_name(ret));
+        return ret;
+    }
     bme_sensor_service_pause();
-    esp_err_t ret = bme_sensor_service_wait_paused(APP_RUNTIME_NON_VOICE_PAUSE_TIMEOUT_MS);
+    ret = bme_sensor_service_wait_paused(bme_timeout_ms);
     if (ret != ESP_OK) {
         bme_sensor_service_resume();
         server_comm_http_set_non_voice_paused(false);
@@ -79,7 +93,26 @@ esp_err_t app_runtime_pause_non_voice(const char *reason)
     return ESP_OK;
 }
 
-esp_err_t app_runtime_resume_non_voice(const char *reason)
+esp_err_t app_runtime_pause_non_voice(const char *reason)
+{
+    return app_runtime_pause_non_voice_timed(reason,
+                                             APP_RUNTIME_NON_VOICE_PAUSE_TIMEOUT_MS,
+                                             APP_RUNTIME_NON_VOICE_PAUSE_TIMEOUT_MS);
+}
+
+esp_err_t app_runtime_resume_non_voice_bme(const char *reason)
+{
+    if (!app_runtime_non_voice_is_paused()) {
+        return ESP_OK;
+    }
+
+    app_runtime_log_heap("non-voice resume begin", reason);
+    bme_sensor_service_resume();
+    app_runtime_log_heap("non-voice BME resumed", reason);
+    return ESP_OK;
+}
+
+esp_err_t app_runtime_finish_non_voice_resume(const char *reason)
 {
     bool should_resume = false;
 
@@ -94,11 +127,18 @@ esp_err_t app_runtime_resume_non_voice(const char *reason)
         return ESP_OK;
     }
 
-    app_runtime_log_heap("non-voice resume begin", reason);
-    bme_sensor_service_resume();
     server_comm_http_set_non_voice_paused(false);
     app_runtime_log_heap("non-voice resumed", reason);
     return ESP_OK;
+}
+
+esp_err_t app_runtime_resume_non_voice(const char *reason)
+{
+    esp_err_t ret = app_runtime_resume_non_voice_bme(reason);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    return app_runtime_finish_non_voice_resume(reason);
 }
 
 bool app_runtime_non_voice_is_paused(void)

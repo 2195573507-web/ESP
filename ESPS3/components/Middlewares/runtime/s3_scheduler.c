@@ -17,14 +17,12 @@
 #include "cJSON.h"
 #include "child_registry.h"
 #include "command_router.h"
-#include "csi_placeholder_gateway.h"
 #include "device_stream_gateway.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "gateway_config.h"
 #include "gateway_event_reporter.h"
@@ -36,6 +34,11 @@
 #include "sensor_aggregator.h"
 
 static const char *TAG = "s3_scheduler";
+
+static const char *safe_diagnostic_text(const char *value)
+{
+    return value != NULL ? value : "(null)";
+}
 
 #ifndef S3_SCHEDULER_TASK_STACK
 #define S3_SCHEDULER_TASK_STACK 12288U
@@ -67,22 +70,6 @@ static const char *TAG = "s3_scheduler";
 
 #ifndef S3_STREAM_WORKER_TASK_PRIORITY
 #define S3_STREAM_WORKER_TASK_PRIORITY 3U
-#endif
-
-#ifndef S3_CSI_FUSION_WORKER_QUEUE_DEPTH
-#define S3_CSI_FUSION_WORKER_QUEUE_DEPTH 16U
-#endif
-
-#ifndef S3_CSI_FUSION_WORKER_TASK_STACK
-#define S3_CSI_FUSION_WORKER_TASK_STACK 12288U
-#endif
-
-#ifndef S3_CSI_FUSION_WORKER_TASK_PRIORITY
-#define S3_CSI_FUSION_WORKER_TASK_PRIORITY 3U
-#endif
-
-#ifndef S3_CSI_FUSION_WORKER_BUDGET
-#define S3_CSI_FUSION_WORKER_BUDGET 12U
 #endif
 
 #ifndef S3_SCHEDULER_BASE_TICK_MS
@@ -136,16 +123,6 @@ typedef struct {
 } s3_runtime_event_state_t;
 
 typedef enum {
-    S3_CSI_FUSION_WORK_INGRESS = 0,
-    S3_CSI_FUSION_WORK_FLUSH,
-} s3_csi_fusion_work_type_t;
-
-typedef struct {
-    s3_csi_fusion_work_type_t type;
-    s3_runtime_ingress_t *ingress;
-} s3_csi_fusion_work_item_t;
-
-typedef enum {
     S3_STREAM_WORK_FRAME = 0,
     S3_STREAM_WORK_SEND,
 } s3_stream_work_type_t;
@@ -160,12 +137,9 @@ typedef struct {
 } s3_stream_work_item_t;
 
 static QueueHandle_t s_protocol_queue;
-static QueueHandle_t s_csi_fusion_queue;
 static QueueHandle_t s_stream_queue;
-static SemaphoreHandle_t s_csi_fusion_queue_lock;
 static TaskHandle_t s_scheduler_task;
 static TaskHandle_t s_protocol_worker_task;
-static TaskHandle_t s_csi_fusion_worker_task;
 static TaskHandle_t s_stream_worker_task;
 
 static s3_runtime_device_state_t s_device_registry[GATEWAY_CONFIG_MAX_CHILDREN];
@@ -175,8 +149,6 @@ static size_t s_runtime_event_cursor;
 
 static s3_scheduler_network_state_t s_network_state = S3_SCHEDULER_NET_NOT_READY;
 static bool s_voice_busy;
-static int64_t s_last_csi_flush_ms;
-static int64_t s_last_csi_trigger_ms;
 static int64_t s_last_snapshot_upload_ms;
 static int64_t s_last_smart_home_poll_ms;
 static int64_t s_last_command_pull_ms;
@@ -186,23 +158,19 @@ static int64_t s_last_stack_monitor_ms;
 static int64_t s_last_heap_monitor_ms;
 static int64_t s_last_protocol_stack_monitor_ms;
 static int64_t s_last_protocol_heap_monitor_ms;
-static int64_t s_last_csi_fusion_stack_monitor_ms;
-static int64_t s_last_csi_fusion_heap_monitor_ms;
 static int64_t s_last_stream_stack_monitor_ms;
 static int64_t s_last_stream_heap_monitor_ms;
 static int64_t s_last_dispatch_warning_ms;
-static bool s_pending_csi_fusion_flush;
-static bool s_csi_fusion_flush_queued;
 static bool s_pending_command_pull;
-static uint32_t s_csi_ingress_drop_count;
-static uint32_t s_csi_ingress_coalesce_count;
-static uint32_t s_csi_worker_yield_count;
 
 static s3_scheduler_event_t *event_alloc(s3_scheduler_event_type_t type,
                                          s3_scheduler_priority_t priority);
 static void event_release(s3_scheduler_event_t *event);
 static esp_err_t queue_push_owned(s3_scheduler_event_t *event);
 static esp_err_t queue_push_reliable_owned(s3_scheduler_event_t *event);
+static esp_err_t queue_push_timed_owned(s3_scheduler_event_t *event,
+                                        uint32_t event_bus_lock_timeout_ms,
+                                        s3_scheduler_enqueue_diagnostics_t *diagnostics);
 
 /* scheduler 使用本机 uptime 驱动 cadence；Server 时间只作为业务 payload 字段。 */
 static int64_t now_ms(void)
@@ -241,8 +209,6 @@ static const char *event_type_name(s3_scheduler_event_type_t type)
         return "voice_state";
     case S3_SCHEDULER_EVENT_COMMAND_PULL:
         return "command_pull";
-    case S3_SCHEDULER_EVENT_CSI_FUSION_FLUSH:
-        return "csi_fusion_flush";
     case S3_SCHEDULER_EVENT_BACKGROUND_STATS:
         return "background_stats";
     case S3_SCHEDULER_EVENT_NONE:
@@ -254,8 +220,6 @@ static const char *event_type_name(s3_scheduler_event_type_t type)
 static const char *kind_name(s3_runtime_msg_kind_t kind)
 {
     switch (kind) {
-    case S3_RUNTIME_MSG_CSI:
-        return "csi";
     case S3_RUNTIME_MSG_SENSOR:
         return "sensor";
     case S3_RUNTIME_MSG_STATUS:
@@ -364,23 +328,6 @@ static bool ingress_is_c52(const s3_runtime_ingress_t *ingress)
            strcmp(ingress->device_id, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C52) == 0;
 }
 
-static bool ingress_is_deprecated_stream_csi(const s3_runtime_ingress_t *ingress)
-{
-    return ingress != NULL && ingress->is_stream_frame &&
-           ingress->kind == S3_RUNTIME_MSG_CSI;
-}
-
-static void log_deprecated_stream_csi_reject(const s3_runtime_ingress_t *ingress,
-                                             const char *source)
-{
-    ESP_LOGW(TAG,
-             "deprecated stream CSI rejected source=%s did=%s device_id=%s link_id=%s",
-             source != NULL ? source : "scheduler",
-             ingress != NULL ? ingress->unified.did : "-",
-             ingress != NULL ? ingress->device_id : "-",
-             ingress != NULL ? ingress->unified.lid : "-");
-}
-
 static s3_event_bus_state_key_t state_key_for_ingress(const s3_runtime_ingress_t *ingress)
 {
     if (ingress == NULL) {
@@ -388,14 +335,6 @@ static s3_event_bus_state_key_t state_key_for_ingress(const s3_runtime_ingress_t
     }
 
     switch (ingress->kind) {
-    case S3_RUNTIME_MSG_CSI:
-        if (ingress_is_c51(ingress)) {
-            return S3_EVENT_BUS_STATE_CSI_LATEST_C51;
-        }
-        if (ingress_is_c52(ingress)) {
-            return S3_EVENT_BUS_STATE_CSI_LATEST_C52;
-        }
-        return S3_EVENT_BUS_STATE_NONE;
     case S3_RUNTIME_MSG_SENSOR:
         if (ingress_is_c51(ingress)) {
             return S3_EVENT_BUS_STATE_BME_LATEST_C51;
@@ -430,8 +369,6 @@ static s3_event_bus_level_t bus_level_for_event(const s3_scheduler_event_t *even
         return S3_EVENT_BUS_LEVEL_CRITICAL;
     case S3_SCHEDULER_EVENT_COMMAND_PULL:
         return S3_EVENT_BUS_LEVEL_BACKGROUND;
-    case S3_SCHEDULER_EVENT_CSI_FUSION_FLUSH:
-        return S3_EVENT_BUS_LEVEL_REALTIME;
     case S3_SCHEDULER_EVENT_STREAM_SEND:
     case S3_SCHEDULER_EVENT_BACKGROUND_STATS:
         return S3_EVENT_BUS_LEVEL_BACKGROUND;
@@ -443,9 +380,6 @@ static s3_event_bus_level_t bus_level_for_event(const s3_scheduler_event_t *even
             return event->ingress->is_stream_frame ?
                        S3_EVENT_BUS_LEVEL_REALTIME :
                        S3_EVENT_BUS_LEVEL_CRITICAL;
-        }
-        if (event->ingress->kind == S3_RUNTIME_MSG_CSI) {
-            return S3_EVENT_BUS_LEVEL_STATE;
         }
         if (event->ingress->kind == S3_RUNTIME_MSG_SENSOR ||
             event->ingress->kind == S3_RUNTIME_MSG_STATUS) {
@@ -498,12 +432,6 @@ static void stamp_event_bus_policy(s3_scheduler_event_t *event)
     }
 }
 
-static const char *json_string(cJSON *root, const char *key, const char *fallback)
-{
-    cJSON *value = cJSON_GetObjectItemCaseSensitive(root, key);
-    return cJSON_IsString(value) && value->valuestring != NULL ? value->valuestring : fallback;
-}
-
 static float json_float(cJSON *root, const char *key, float fallback)
 {
     cJSON *value = cJSON_GetObjectItemCaseSensitive(root, key);
@@ -543,20 +471,6 @@ static void fill_unified_from_envelope(s3_runtime_ingress_t *ingress,
                       short_device_id_for_local_id(envelope->local_id));
     unified_copy_text(msg->type, sizeof(msg->type), kind_name(ingress->kind));
     unified_copy_text(ingress->device_id, sizeof(ingress->device_id), envelope->device_id);
-
-    if (ingress->kind == S3_RUNTIME_MSG_CSI && envelope->payload != NULL) {
-        /* unified CSI 只取 motion_score/quality/rssi 做运行时摘要，raw/subcarrier 不进入 S3 cache。 */
-        msg->t = ingress->rx_time_ms > 0 ? ingress->rx_time_ms : now_ms();
-        unified_copy_text(msg->lid,
-                          sizeof(msg->lid),
-                          json_string(envelope->payload, "link_id", "unknown"));
-        msg->v1 = json_float(envelope->payload,
-                             "motion_score",
-                             json_float(envelope->payload, "confidence", 0.0f));
-        msg->v2 = json_float(envelope->payload, "quality", 0.0f);
-        msg->v3 = (float)((int)json_float(envelope->payload, "rssi", 0.0f));
-        return;
-    }
 
     if (ingress->kind == S3_RUNTIME_MSG_SENSOR && envelope->payload != NULL) {
         unified_copy_text(msg->lid, sizeof(msg->lid), "bme690");
@@ -600,29 +514,10 @@ static void fill_unified_from_raw_body(s3_runtime_ingress_t *ingress)
     msg->t = (int64_t)json_float(root,
                                  ESP111_PROTOCOL_LOCAL_JSON_UPTIME_MS,
                                  (float)now_ms());
-    if (ingress->kind == S3_RUNTIME_MSG_CSI) {
-        msg->t = ingress->rx_time_ms > 0 ? ingress->rx_time_ms : now_ms();
-    }
     unified_copy_text(msg->did, sizeof(msg->did), short_device_id_for_local_id(local_id));
     unified_copy_text(msg->type, sizeof(msg->type), kind_name(ingress->kind));
 
-    if (ingress->kind == S3_RUNTIME_MSG_CSI) {
-        /* 旧轻量 body 兼容路径；正式 v2 envelope 会在后续 parse_ingress_envelope 覆盖摘要。 */
-        const char *default_link_id =
-            local_id == ESP111_PROTOCOL_LOCAL_DEVICE_ID_C51 ? "S3_TO_C51" :
-            local_id == ESP111_PROTOCOL_LOCAL_DEVICE_ID_C52 ? "S3_TO_C52" :
-                                                              "unknown";
-        unified_copy_text(msg->lid,
-                          sizeof(msg->lid),
-                          json_string(root,
-                                      "link_id",
-                                      default_link_id));
-        msg->v1 = json_float(root,
-                             "motion_score",
-                             json_float(root, "confidence", json_array_float(root, 0, 0.0f)));
-        msg->v2 = json_float(root, "quality", json_array_float(root, 1, 0.0f));
-        msg->v3 = json_float(root, "rssi", json_array_float(root, 2, 0.0f));
-    } else if (ingress->kind == S3_RUNTIME_MSG_SENSOR) {
+    if (ingress->kind == S3_RUNTIME_MSG_SENSOR) {
         unified_copy_text(msg->lid, sizeof(msg->lid), "bme690");
         msg->v1 = json_array_float(root, 0, 0.0f);
         msg->v2 = json_array_float(root, 1, 0.0f);
@@ -638,63 +533,6 @@ static void fill_unified_from_raw_body(s3_runtime_ingress_t *ingress)
     }
 
     cJSON_Delete(root);
-}
-
-static void update_csi_latest_cache(const s3_runtime_ingress_t *ingress)
-{
-    if (ingress == NULL || ingress->kind != S3_RUNTIME_MSG_CSI) {
-        return;
-    }
-
-    s3_event_bus_csi_latest_t latest = {
-        .valid = true,
-        .motion_score = ingress->unified.v1,
-        .quality = ingress->unified.v2,
-        .timestamp_ms = ingress->unified.t,
-        .rx_time_us = ingress->rx_time_us,
-    };
-    strlcpy(latest.device_id,
-            ingress->device_id[0] != '\0' ? ingress->device_id : ingress->unified.did,
-            sizeof(latest.device_id));
-    strlcpy(latest.link_id, ingress->unified.lid, sizeof(latest.link_id));
-    s3_event_bus_update_csi_latest(&latest);
-}
-
-static bool drop_stale_csi_ingress(const s3_runtime_ingress_t *ingress)
-{
-    if (ingress == NULL || ingress->kind != S3_RUNTIME_MSG_CSI) {
-        return false;
-    }
-
-    resource_manager_session_view_t current = {0};
-    const bool found = resource_manager_get_session(ingress->device_id, &current);
-    if (!found) {
-        resource_manager_log_session_diagnostic(ingress->device_id,
-                                                ingress->unified.lid,
-                                                "csi_drop",
-                                                "session_missing");
-        return true;
-    }
-
-    if (ingress->resource_generation != 0U &&
-        current.generation != ingress->resource_generation) {
-        resource_manager_log_session_diagnostic(ingress->device_id,
-                                                ingress->unified.lid,
-                                                "csi_drop",
-                                                "stale_generation");
-        ESP_LOGI(TAG,
-                 "CSI_STALE_DROP device_id=%s link_id=%s rx_generation=%lu current_generation=%lu rx_state=%s current_state=%s rx_time_us=%lld",
-                 ingress->device_id,
-                 ingress->unified.lid[0] != '\0' ? ingress->unified.lid : "-",
-                 (unsigned long)ingress->resource_generation,
-                 (unsigned long)current.generation,
-                 resource_manager_session_state_name(ingress->resource_state_at_rx),
-                 resource_manager_session_state_name(current.state),
-                 (long long)ingress->rx_time_us);
-        return true;
-    }
-
-    return false;
 }
 
 static void record_confirmed_peer_network_identity(const char *device_id,
@@ -757,10 +595,6 @@ static esp_err_t process_stream_ingress(s3_runtime_ingress_t *ingress)
     sensor_aggregator_result_t result = {0};
     esp_err_t ret = ESP_OK;
     switch (ingress->kind) {
-    case S3_RUNTIME_MSG_CSI:
-        log_deprecated_stream_csi_reject(ingress, "process_stream_ingress");
-        ret = ESP_ERR_NOT_SUPPORTED;
-        break;
     case S3_RUNTIME_MSG_SENSOR:
         ret = confirm_peer_network_identity(ingress->device_id,
                                             ingress->peer_ip,
@@ -944,34 +778,6 @@ static esp_err_t handle_sensor_ingress(const s3_runtime_ingress_t *ingress)
     return ret;
 }
 
-static esp_err_t handle_csi_ingress(const s3_runtime_ingress_t *ingress)
-{
-    protocol_adapter_envelope_t envelope = {0};
-    esp_err_t ret = parse_ingress_envelope(ingress, &envelope);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    char previous_peer_ip[16] = {0};
-    (void)child_registry_get_peer_ip(envelope.device_id,
-                                     previous_peer_ip,
-                                     sizeof(previous_peer_ip));
-    /* CSI gateway confirms identity only after feature-level validation. */
-    ret = csi_placeholder_gateway_handle_result_from_peer_at_us(
-        &envelope,
-        ingress->peer_ip,
-        ingress->rx_time_us > 0 ? ingress->rx_time_us : ingress->rx_time_ms * 1000);
-    if (ret == ESP_OK) {
-        record_confirmed_peer_network_identity(envelope.device_id,
-                                               ingress->peer_ip,
-                                               previous_peer_ip);
-        (void)child_registry_touch(envelope.device_id, envelope.seq);
-    }
-
-    protocol_adapter_release_envelope(&envelope);
-    return ret;
-}
-
 static esp_err_t handle_event_ingress(const s3_runtime_ingress_t *ingress)
 {
     if (ingress == NULL || ingress->command_id[0] == '\0') {
@@ -1005,22 +811,14 @@ static void process_ingress(s3_runtime_ingress_t *ingress)
 
     protocol_adapter_envelope_t envelope = {0};
     if ((ingress->kind == S3_RUNTIME_MSG_STATUS ||
-         ingress->kind == S3_RUNTIME_MSG_SENSOR ||
-         ingress->kind == S3_RUNTIME_MSG_CSI) &&
+         ingress->kind == S3_RUNTIME_MSG_SENSOR) &&
         parse_ingress_envelope(ingress, &envelope) == ESP_OK) {
         fill_unified_from_envelope(ingress, &envelope);
         protocol_adapter_release_envelope(&envelope);
     }
 
-    if (drop_stale_csi_ingress(ingress)) {
-        return;
-    }
-
     esp_err_t ret = ESP_ERR_NOT_SUPPORTED;
     switch (ingress->kind) {
-    case S3_RUNTIME_MSG_CSI:
-        ret = handle_csi_ingress(ingress);
-        break;
     case S3_RUNTIME_MSG_SENSOR:
         ret = handle_sensor_ingress(ingress);
         break;
@@ -1037,19 +835,6 @@ static void process_ingress(s3_runtime_ingress_t *ingress)
     }
 
     if (ret != ESP_OK) {
-        if (ingress->kind == S3_RUNTIME_MSG_CSI && ret == ESP_ERR_INVALID_STATE) {
-            resource_manager_log_session_diagnostic(ingress->device_id,
-                                                    ingress->unified.lid,
-                                                    "csi_drop",
-                                                    "invalid_state_suppressed");
-            ESP_LOGI(TAG,
-                     "CSI_INVALID_STATE_SUPPRESSED device_id=%s link_id=%s generation=%lu rx_time_us=%lld",
-                     ingress->device_id,
-                     ingress->unified.lid[0] != '\0' ? ingress->unified.lid : "-",
-                     (unsigned long)ingress->resource_generation,
-                     (long long)ingress->rx_time_us);
-            return;
-        }
         ESP_LOGW(TAG,
                  "runtime bus process failed type=%s did=%s lid=%s ret=%s",
                  ingress->unified.type,
@@ -1059,21 +844,7 @@ static void process_ingress(s3_runtime_ingress_t *ingress)
         return;
     }
 
-    if (ingress->kind == S3_RUNTIME_MSG_CSI) {
-        resource_manager_session_view_t before = {0};
-        if (resource_manager_get_session(ingress->device_id, &before) &&
-            before.state == RESOURCE_MANAGER_SESSION_ACTIVE) {
-            update_csi_latest_cache(ingress);
-            update_runtime_state(ingress);
-
-            resource_manager_session_view_t after = {0};
-            if (!resource_manager_get_session(ingress->device_id, &after) ||
-                after.state != RESOURCE_MANAGER_SESSION_ACTIVE ||
-                after.generation != before.generation) {
-                s3_event_bus_clear_csi_latest(ingress->device_id);
-            }
-        }
-    } else if (ingress->kind != S3_RUNTIME_MSG_EVENT) {
+    if (ingress->kind != S3_RUNTIME_MSG_EVENT) {
         update_runtime_state(ingress);
     }
 
@@ -1106,143 +877,6 @@ static esp_err_t protocol_worker_enqueue_ingress(s3_runtime_ingress_t *ingress,
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
-}
-
-static void release_csi_fusion_work_item(s3_csi_fusion_work_item_t *item)
-{
-    if (item == NULL) {
-        return;
-    }
-    if (item->ingress != NULL) {
-        heap_caps_free(item->ingress);
-        item->ingress = NULL;
-    }
-}
-
-static void coalesce_csi_fusion_ingress_queue(const s3_csi_fusion_work_item_t *incoming)
-{
-    if (incoming == NULL || incoming->type != S3_CSI_FUSION_WORK_INGRESS ||
-        incoming->ingress == NULL || s_csi_fusion_queue == NULL) {
-        return;
-    }
-
-    const s3_event_bus_state_key_t incoming_key = state_key_for_ingress(incoming->ingress);
-    if (incoming_key != S3_EVENT_BUS_STATE_CSI_LATEST_C51 &&
-        incoming_key != S3_EVENT_BUS_STATE_CSI_LATEST_C52) {
-        return;
-    }
-
-    s3_csi_fusion_work_item_t kept[S3_CSI_FUSION_WORKER_QUEUE_DEPTH];
-    size_t kept_count = 0U;
-    s3_csi_fusion_work_item_t queued = {0};
-    while (xQueueReceive(s_csi_fusion_queue, &queued, 0) == pdTRUE) {
-        if (queued.type == S3_CSI_FUSION_WORK_INGRESS && queued.ingress != NULL &&
-            state_key_for_ingress(queued.ingress) == incoming_key) {
-            ++s_csi_ingress_coalesce_count;
-            release_csi_fusion_work_item(&queued);
-            memset(&queued, 0, sizeof(queued));
-            continue;
-        }
-        if (kept_count < S3_CSI_FUSION_WORKER_QUEUE_DEPTH) {
-            kept[kept_count++] = queued;
-        } else {
-            ++s_csi_ingress_drop_count;
-            release_csi_fusion_work_item(&queued);
-        }
-        memset(&queued, 0, sizeof(queued));
-    }
-
-    for (size_t i = 0; i < kept_count; ++i) {
-        if (xQueueSend(s_csi_fusion_queue, &kept[i], 0) != pdTRUE) {
-            ++s_csi_ingress_drop_count;
-            release_csi_fusion_work_item(&kept[i]);
-        }
-    }
-}
-
-static esp_err_t csi_fusion_worker_enqueue(s3_csi_fusion_work_item_t *item,
-                                           TickType_t ticks_to_wait)
-{
-    if (item == NULL || s_csi_fusion_queue == NULL || s_csi_fusion_queue_lock == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_csi_fusion_queue_lock, portMAX_DELAY);
-    if (item->type == S3_CSI_FUSION_WORK_FLUSH && s_csi_fusion_flush_queued) {
-        xSemaphoreGive(s_csi_fusion_queue_lock);
-        return ESP_OK;
-    }
-    coalesce_csi_fusion_ingress_queue(item);
-    BaseType_t queued = item->type == S3_CSI_FUSION_WORK_FLUSH ?
-                            xQueueSendToFront(s_csi_fusion_queue, item, ticks_to_wait) :
-                            xQueueSend(s_csi_fusion_queue, item, ticks_to_wait);
-    if (queued != pdTRUE) {
-        if (item->type == S3_CSI_FUSION_WORK_INGRESS) {
-            ++s_csi_ingress_drop_count;
-        }
-        ESP_LOGW(TAG,
-                 "csi fusion worker queue full type=%d depth=%u",
-                 (int)item->type,
-                 (unsigned int)S3_CSI_FUSION_WORKER_QUEUE_DEPTH);
-        xSemaphoreGive(s_csi_fusion_queue_lock);
-        return ESP_ERR_TIMEOUT;
-    }
-    if (item->type == S3_CSI_FUSION_WORK_FLUSH) {
-        s_csi_fusion_flush_queued = true;
-    }
-    xSemaphoreGive(s_csi_fusion_queue_lock);
-    return ESP_OK;
-}
-
-static void csi_fusion_worker_task(void *arg)
-{
-    (void)arg;
-    const bool wdt_registered = app_task_wdt_add_current(TAG, "csi_fusion_worker");
-    ESP_LOGI(TAG,
-             "csi fusion worker started queue_depth=%u",
-             (unsigned int)S3_CSI_FUSION_WORKER_QUEUE_DEPTH);
-    app_stack_monitor_log(TAG, "csi_fusion_worker", "entry");
-    app_heap_monitor_log(TAG);
-
-    while (1) {
-        uint32_t processed = 0U;
-        do {
-            s3_csi_fusion_work_item_t item = {0};
-            TickType_t wait_ticks = processed == 0U ? pdMS_TO_TICKS(S3_SCHEDULER_BASE_TICK_MS) : 0;
-            if (xQueueReceive(s_csi_fusion_queue, &item, wait_ticks) != pdTRUE) {
-                break;
-            }
-            ++processed;
-            esp_err_t ret = ESP_OK;
-            if (item.type == S3_CSI_FUSION_WORK_INGRESS) {
-                if (item.ingress != NULL) {
-                    process_ingress(item.ingress);
-                    release_csi_fusion_work_item(&item);
-                }
-            } else if (item.type == S3_CSI_FUSION_WORK_FLUSH) {
-                s_csi_fusion_flush_queued = false;
-                ret = csi_placeholder_gateway_flush_fusion();
-            } else {
-                ret = ESP_ERR_INVALID_ARG;
-            }
-            if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-                ESP_LOGW(TAG, "csi fusion worker failed ret=%s", esp_err_to_name(ret));
-            }
-            app_task_wdt_reset_current(wdt_registered);
-        } while (processed < S3_CSI_FUSION_WORKER_BUDGET);
-
-        app_stack_monitor_log_periodic(TAG,
-                                       "csi_fusion_worker",
-                                       &s_last_csi_fusion_stack_monitor_ms,
-                                       APP_STACK_MONITOR_INTERVAL_MS);
-        app_heap_monitor_log_periodic(TAG,
-                                      &s_last_csi_fusion_heap_monitor_ms,
-                                      APP_HEAP_MONITOR_INTERVAL_MS);
-        app_task_wdt_reset_current(wdt_registered);
-        if (processed > 0U) {
-            ++s_csi_worker_yield_count;
-            taskYIELD();
-        }
-    }
 }
 
 static void protocol_worker_task(void *arg)
@@ -1341,31 +975,11 @@ static void stream_worker_task(void *arg)
                                                          item.payload_len,
                                                          item.peer_ip);
             } else if (item.type == S3_STREAM_WORK_SEND) {
-                char device_id[CHILD_REGISTRY_DEVICE_ID_LEN] = {0};
-                const bool is_csi_trigger = strcmp(item.source, "csi_trigger") == 0;
-                if (is_csi_trigger &&
-                    (!child_registry_find_device_by_peer_ip(item.peer_ip,
-                                                            device_id,
-                                                            sizeof(device_id)) ||
-                     !resource_manager_is_live(device_id))) {
-                    if (device_id[0] != '\0') {
-                        resource_manager_log_session_diagnostic(device_id,
-                                                                NULL,
-                                                                "csi_trigger_drop",
-                                                                "session_not_live");
-                    }
-                    ESP_LOGI(TAG,
-                             "CSI trigger dropped peer_ip=%s device_id=%s reason=session_not_live",
-                             item.peer_ip,
-                             device_id[0] != '\0' ? device_id : "unmapped");
-                    ret = ESP_ERR_INVALID_STATE;
-                } else {
-                    ret = device_stream_gateway_send_udp_now(item.peer_ip,
-                                                             item.peer_port,
-                                                             item.payload,
-                                                             item.payload_len,
-                                                             item.source);
-                }
+                ret = device_stream_gateway_send_udp_now(item.peer_ip,
+                                                         item.peer_port,
+                                                         item.payload,
+                                                         item.payload_len,
+                                                         item.source);
             }
             if (ret != ESP_OK && ret != ESP_ERR_INVALID_ARG &&
                 ret != ESP_ERR_INVALID_STATE && ret != ESP_ERR_NOT_ALLOWED &&
@@ -1456,6 +1070,26 @@ static esp_err_t queue_push_reliable_owned(s3_scheduler_event_t *event)
     }
 }
 
+static esp_err_t queue_push_timed_owned(s3_scheduler_event_t *event,
+                                        uint32_t event_bus_lock_timeout_ms,
+                                        s3_scheduler_enqueue_diagnostics_t *diagnostics)
+{
+    if (event == NULL || event->type == S3_SCHEDULER_EVENT_NONE ||
+        event->priority > S3_SCHEDULER_PRIORITY_LOW) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    stamp_event_bus_policy(event);
+    esp_err_t ret = s3_event_bus_push_owned_timed(
+        event,
+        event_bus_lock_timeout_ms,
+        diagnostics != NULL ? &diagnostics->event_bus_lock_wait_ms : NULL,
+        diagnostics != NULL ? &diagnostics->event_bus : NULL);
+    if (diagnostics != NULL) {
+        diagnostics->event_bus_stats_valid = ret == ESP_OK;
+    }
+    return ret;
+}
+
 static size_t queue_depth(void)
 {
     return s3_event_bus_get_stats().queue_depth;
@@ -1507,27 +1141,9 @@ static void enqueue_command_pull_if_needed(void)
     event_release(event);
     s_pending_command_pull = true;
     if (ret != ESP_ERR_TIMEOUT && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "command pull enqueue failed ret=%s", esp_err_to_name(ret));
-    }
-}
-
-static void enqueue_csi_fusion_flush_if_needed(void)
-{
-    s3_scheduler_event_t *event =
-        event_alloc(S3_SCHEDULER_EVENT_CSI_FUSION_FLUSH, S3_SCHEDULER_PRIORITY_NORMAL);
-    if (event == NULL) {
-        s_pending_csi_fusion_flush = true;
-        return;
-    }
-    esp_err_t ret = queue_push_owned(event);
-    if (ret == ESP_OK) {
-        s_pending_csi_fusion_flush = false;
-        return;
-    }
-    event_release(event);
-    s_pending_csi_fusion_flush = true;
-    if (ret != ESP_ERR_TIMEOUT && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "CSI fusion flush enqueue failed ret=%s", esp_err_to_name(ret));
+        ESP_LOGW(TAG,
+                 "command pull enqueue failed ret=%s",
+                 safe_diagnostic_text(esp_err_to_name(ret)));
     }
 }
 
@@ -1550,7 +1166,7 @@ static void log_gateway_heartbeat(void)
     s3_event_bus_stats_t stats = s3_event_bus_get_stats();
     const network_worker_snapshot_stats_t snapshot_stats = network_worker_get_snapshot_stats();
     ESP_LOGI(TAG,
-             "gateway heartbeat net=%s softap=%d sta=%d server=%d voice_busy=%d queue=%u drop_count=%lu coalesce_count=%lu csi_ingress_drop_count=%lu csi_ingress_coalesce_count=%lu csi_worker_yield_count=%lu snapshot_skip_count=%lu snapshot_upload_count=%lu snapshot_coalesce_count=%lu free_heap=%u psram_heap=%u last_error=%s",
+             "gateway heartbeat net=%s softap=%d sta=%d server=%d voice_busy=%d queue=%u drop_count=%lu coalesce_count=%lu snapshot_skip_count=%lu snapshot_upload_count=%lu snapshot_coalesce_count=%lu free_heap=%u psram_heap=%u last_error=%s",
              s3_scheduler_network_state_name(s_network_state),
              gateway_wifi_is_softap_ready() ? 1 : 0,
              gateway_wifi_is_sta_connected() ? 1 : 0,
@@ -1559,9 +1175,6 @@ static void log_gateway_heartbeat(void)
              (unsigned int)stats.queue_depth,
              (unsigned long)stats.drop_count,
              (unsigned long)stats.coalesce_count,
-             (unsigned long)(stats.csi_ingress_drop_count + s_csi_ingress_drop_count),
-             (unsigned long)(stats.csi_ingress_coalesce_count + s_csi_ingress_coalesce_count),
-             (unsigned long)s_csi_worker_yield_count,
              (unsigned long)snapshot_stats.snapshot_skip_count,
              (unsigned long)snapshot_stats.snapshot_upload_count,
              (unsigned long)snapshot_stats.snapshot_coalesce_count,
@@ -1638,19 +1251,6 @@ static bool process_event(s3_scheduler_event_t *event)
         event->bus_level == S3_EVENT_BUS_LEVEL_CRITICAL ? portMAX_DELAY : 0;
     switch (event->type) {
     case S3_SCHEDULER_EVENT_INGRESS:
-        /* CSI fusion 独立 worker，避免高频 CSI 阻塞 status/sensor protocol worker。 */
-        if (event->ingress != NULL && !event->ingress->is_stream_frame &&
-            event->ingress->kind == S3_RUNTIME_MSG_CSI) {
-            s3_csi_fusion_work_item_t item = {
-                .type = S3_CSI_FUSION_WORK_INGRESS,
-                .ingress = event->ingress,
-            };
-            ret = csi_fusion_worker_enqueue(&item, wait_ticks);
-            if (ret == ESP_OK) {
-                event->ingress = NULL;
-            }
-            break;
-        }
         /* register/heartbeat/status/sensor/ack 转交 protocol worker。 */
         ret = protocol_worker_enqueue_ingress(event->ingress, wait_ticks);
         if (ret == ESP_OK) {
@@ -1670,13 +1270,6 @@ static bool process_event(s3_scheduler_event_t *event)
     case S3_SCHEDULER_EVENT_COMMAND_PULL:
         ret = network_worker_enqueue_command_pull();
         break;
-    case S3_SCHEDULER_EVENT_CSI_FUSION_FLUSH: {
-        s3_csi_fusion_work_item_t item = {
-            .type = S3_CSI_FUSION_WORK_FLUSH,
-        };
-        ret = csi_fusion_worker_enqueue(&item, wait_ticks);
-        break;
-    }
     case S3_SCHEDULER_EVENT_BACKGROUND_STATS:
         s3_event_bus_log_stats(event->source[0] != '\0' ? event->source : "background");
         break;
@@ -1699,7 +1292,6 @@ void s3_scheduler_tick(void)
     const int64_t timestamp_ms = now_ms();
     const size_t depth = queue_depth();
     const uint32_t multiplier = load_multiplier(depth);
-    const uint32_t csi_interval_ms = CSI_FUSION_TICK_MS;
     const uint32_t upload_interval_ms =
         adjusted_interval(gateway_config_get()->sensor_forward_period_ms, multiplier);
     const uint32_t snapshot_upload_interval_ms = UPLOAD_SNAPSHOT_INTERVAL_MS;
@@ -1707,9 +1299,7 @@ void s3_scheduler_tick(void)
         interval_at_least(upload_interval_ms, S3_SCHEDULER_COMMAND_PULL_MIN_MS);
     const uint32_t smart_home_interval_ms =
         adjusted_interval(S3_SCHEDULER_SMART_HOME_POLL_MS, multiplier);
-    const bool local_net_ready = gateway_wifi_is_net_ready();
     const bool server_allowed = s3_scheduler_is_server_upload_allowed();
-    const bool has_active_session = resource_manager_has_active_sessions();
     const bool has_live_session = resource_manager_has_live_sessions();
 
     app_stack_monitor_log_periodic(TAG,
@@ -1718,34 +1308,14 @@ void s3_scheduler_tick(void)
                                    APP_STACK_MONITOR_INTERVAL_MS);
     app_heap_monitor_log_periodic(TAG, &s_last_heap_monitor_ms, APP_HEAP_MONITOR_INTERVAL_MS);
 
-    /*
-     * 本地 CSI trigger 只需要 C5<->S3 网络 ready；上云 snapshot/command/smart-home 必须等
-     * link stable，并且 voice_busy 时暂停，避免语音代理长连接被周期上云挤占。
-     */
-    if (has_live_session && local_net_ready && due(timestamp_ms, s_last_csi_trigger_ms,
-                              adjusted_interval(gateway_config_get()->csi_trigger_interval_ms,
-                                                multiplier))) {
-        s_last_csi_trigger_ms = timestamp_ms;
-        if (!s_voice_busy && depth < S3_SCHEDULER_HARD_WATERMARK) {
-            (void)csi_placeholder_gateway_send_triggers();
-        }
-    }
-
-    if (has_active_session &&
-        (s_pending_csi_fusion_flush ||
-         due(timestamp_ms, s_last_csi_flush_ms, csi_interval_ms))) {
-        s_last_csi_flush_ms = timestamp_ms;
-        enqueue_csi_fusion_flush_if_needed();
-    } else if (!has_active_session) {
-        s_pending_csi_fusion_flush = false;
-    }
-
     if (server_allowed && !s_voice_busy &&
         due(timestamp_ms, s_last_snapshot_upload_ms, snapshot_upload_interval_ms)) {
         s_last_snapshot_upload_ms = timestamp_ms;
         esp_err_t ret = network_worker_enqueue_snapshot_upload();
         if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "snapshot upload worker enqueue failed ret=%s", esp_err_to_name(ret));
+            ESP_LOGW(TAG,
+                     "snapshot upload worker enqueue failed ret=%s",
+                     safe_diagnostic_text(esp_err_to_name(ret)));
         }
     }
 
@@ -1763,16 +1333,15 @@ void s3_scheduler_tick(void)
         s_last_smart_home_poll_ms = timestamp_ms;
         esp_err_t ret = network_worker_enqueue_smart_home_poll();
         if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "smart-home poll worker enqueue failed ret=%s", esp_err_to_name(ret));
+            ESP_LOGW(TAG,
+                     "smart-home poll worker enqueue failed ret=%s",
+                     safe_diagnostic_text(esp_err_to_name(ret)));
         }
     }
 
     if (due(timestamp_ms, s_last_diagnostic_log_ms,
             adjusted_interval(S3_SCHEDULER_DIAGNOSTIC_LOG_MS, multiplier))) {
         s_last_diagnostic_log_ms = timestamp_ms;
-        if (has_active_session) {
-            csi_placeholder_gateway_log_latest_diagnostics();
-        }
         enqueue_background_stats_log("diagnostic");
     }
 
@@ -1828,19 +1397,6 @@ esp_err_t s3_scheduler_init(void)
             return ESP_ERR_NO_MEM;
         }
     }
-    if (s_csi_fusion_queue == NULL) {
-        s_csi_fusion_queue = xQueueCreate(S3_CSI_FUSION_WORKER_QUEUE_DEPTH,
-                                          sizeof(s3_csi_fusion_work_item_t));
-        if (s_csi_fusion_queue == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_csi_fusion_queue_lock == NULL) {
-        s_csi_fusion_queue_lock = xSemaphoreCreateMutex();
-        if (s_csi_fusion_queue_lock == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
     if (s_stream_queue == NULL) {
         s_stream_queue = xQueueCreate(S3_STREAM_WORKER_QUEUE_DEPTH,
                                       sizeof(s3_stream_work_item_t));
@@ -1855,13 +1411,6 @@ esp_err_t s3_scheduler_init(void)
         heap_caps_free(stale_ingress);
         stale_ingress = NULL;
     }
-    s3_csi_fusion_work_item_t stale_csi_item = {0};
-    while (xQueueReceive(s_csi_fusion_queue, &stale_csi_item, 0) == pdTRUE) {
-        if (stale_csi_item.ingress != NULL) {
-            heap_caps_free(stale_csi_item.ingress);
-        }
-        memset(&stale_csi_item, 0, sizeof(stale_csi_item));
-    }
     s3_stream_work_item_t stale_stream_item = {0};
     while (xQueueReceive(s_stream_queue, &stale_stream_item, 0) == pdTRUE) {
         release_stream_work_item(&stale_stream_item);
@@ -1869,18 +1418,13 @@ esp_err_t s3_scheduler_init(void)
     }
     s_network_state = S3_SCHEDULER_NET_NOT_READY;
     s_voice_busy = false;
-    s_pending_csi_fusion_flush = false;
-    s_csi_fusion_flush_queued = false;
     s_pending_command_pull = false;
-    s_csi_ingress_drop_count = 0U;
-    s_csi_ingress_coalesce_count = 0U;
-    s_csi_worker_yield_count = 0U;
     return ESP_OK;
 }
 
 esp_err_t s3_scheduler_start(void)
 {
-    if (s_protocol_queue == NULL || s_csi_fusion_queue == NULL || s_stream_queue == NULL) {
+    if (s_protocol_queue == NULL || s_stream_queue == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_protocol_worker_task == NULL) {
@@ -1892,18 +1436,6 @@ esp_err_t s3_scheduler_start(void)
                                          &s_protocol_worker_task);
         if (created != pdPASS) {
             s_protocol_worker_task = NULL;
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_csi_fusion_worker_task == NULL) {
-        BaseType_t created = xTaskCreate(csi_fusion_worker_task,
-                                         "csi_fusion_worker",
-                                         S3_CSI_FUSION_WORKER_TASK_STACK,
-                                         NULL,
-                                         S3_CSI_FUSION_WORKER_TASK_PRIORITY,
-                                         &s_csi_fusion_worker_task);
-        if (created != pdPASS) {
-            s_csi_fusion_worker_task = NULL;
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1944,12 +1476,6 @@ esp_err_t s3_scheduler_enqueue_event(const s3_scheduler_event_t *event)
     }
 
     /* 对外 API 统一拷贝异步数据，调用方可以在返回后释放自己的临时 buffer。 */
-    if (event->type == S3_SCHEDULER_EVENT_INGRESS &&
-        ingress_is_deprecated_stream_csi(event->ingress)) {
-        log_deprecated_stream_csi_reject(event->ingress, "enqueue_event");
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
     s3_scheduler_event_t *owned = event_alloc(event->type, event->priority);
     if (owned == NULL) {
         return ESP_ERR_NO_MEM;
@@ -2020,10 +1546,6 @@ esp_err_t s3_scheduler_enqueue_ingress(const s3_runtime_ingress_t *ingress,
         ingress->body_len > S3_RUNTIME_BUS_BODY_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (ingress_is_deprecated_stream_csi(ingress)) {
-        log_deprecated_stream_csi_reject(ingress, "enqueue_ingress");
-        return ESP_ERR_NOT_SUPPORTED;
-    }
     s3_runtime_ingress_t *owned_ingress =
         heap_caps_calloc(1, sizeof(*owned_ingress), MALLOC_CAP_8BIT);
     if (owned_ingress == NULL) {
@@ -2033,24 +1555,30 @@ esp_err_t s3_scheduler_enqueue_ingress(const s3_runtime_ingress_t *ingress,
     return s3_scheduler_enqueue_ingress_owned(owned_ingress, priority);
 }
 
-esp_err_t s3_scheduler_enqueue_ingress_owned(s3_runtime_ingress_t *ingress,
-                                             s3_scheduler_priority_t priority)
+static esp_err_t enqueue_ingress_owned_internal(
+    s3_runtime_ingress_t *ingress,
+    s3_scheduler_priority_t priority,
+    bool bounded_event_bus_lock,
+    uint32_t event_bus_lock_timeout_ms,
+    s3_scheduler_enqueue_diagnostics_t *out_diagnostics)
 {
+    const int64_t enqueue_started_us = esp_timer_get_time();
+    if (out_diagnostics != NULL) {
+        memset(out_diagnostics, 0, sizeof(*out_diagnostics));
+    }
+    esp_err_t ret = ESP_OK;
+    s3_scheduler_event_t *event = NULL;
     if (ingress == NULL) {
-        return ESP_ERR_INVALID_ARG;
+        ret = ESP_ERR_INVALID_ARG;
+        goto done;
     }
     if (priority > S3_SCHEDULER_PRIORITY_LOW ||
         ingress->kind == S3_RUNTIME_MSG_UNKNOWN ||
         ingress->body_len > S3_RUNTIME_BUS_BODY_MAX) {
         heap_caps_free(ingress);
-        return ESP_ERR_INVALID_ARG;
+        ret = ESP_ERR_INVALID_ARG;
+        goto done;
     }
-    if (ingress_is_deprecated_stream_csi(ingress)) {
-        log_deprecated_stream_csi_reject(ingress, "enqueue_ingress_owned");
-        heap_caps_free(ingress);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
     /* ingress 已由调用方分配；本函数负责补终止符并接管生命周期。 */
     ingress->body[ingress->body_len] = '\0';
     if (ingress->unified.t <= 0) {
@@ -2062,19 +1590,45 @@ esp_err_t s3_scheduler_enqueue_ingress_owned(s3_runtime_ingress_t *ingress,
                           kind_name(ingress->kind));
     }
 
-    s3_scheduler_event_t *event =
-        event_alloc(S3_SCHEDULER_EVENT_INGRESS, priority);
+    event = event_alloc(S3_SCHEDULER_EVENT_INGRESS, priority);
     if (event == NULL) {
         heap_caps_free(ingress);
-        return ESP_ERR_NO_MEM;
+        ret = ESP_ERR_NO_MEM;
+        goto done;
     }
     event->ingress = ingress;
 
-    esp_err_t ret = queue_push_reliable_owned(event);
+    ret = bounded_event_bus_lock ?
+              queue_push_timed_owned(event, event_bus_lock_timeout_ms, out_diagnostics) :
+              queue_push_reliable_owned(event);
     if (ret != ESP_OK) {
         event_release(event);
     }
+done:
+    if (out_diagnostics != NULL) {
+        out_diagnostics->enqueue_duration_ms =
+            (uint32_t)((esp_timer_get_time() - enqueue_started_us) / 1000);
+    }
     return ret;
+}
+
+esp_err_t s3_scheduler_enqueue_ingress_owned(s3_runtime_ingress_t *ingress,
+                                             s3_scheduler_priority_t priority)
+{
+    return enqueue_ingress_owned_internal(ingress, priority, false, 0U, NULL);
+}
+
+esp_err_t s3_scheduler_enqueue_ingress_owned_timed(
+    s3_runtime_ingress_t *ingress,
+    s3_scheduler_priority_t priority,
+    uint32_t event_bus_lock_timeout_ms,
+    s3_scheduler_enqueue_diagnostics_t *out_diagnostics)
+{
+    return enqueue_ingress_owned_internal(ingress,
+                                          priority,
+                                          true,
+                                          event_bus_lock_timeout_ms,
+                                          out_diagnostics);
 }
 
 esp_err_t s3_scheduler_enqueue_network_state(s3_scheduler_network_state_t state)
@@ -2207,64 +1761,6 @@ void s3_scheduler_reset_stream_queue(const char *reason)
     }
 }
 
-static bool csi_ingress_at_or_before_cutoff(const s3_runtime_ingress_t *ingress,
-                                            int64_t cutoff_us)
-{
-    return ingress == NULL || ingress->rx_time_us <= 0 || ingress->rx_time_us <= cutoff_us;
-}
-
-void s3_scheduler_clear_csi_peer_before(const char *device_id,
-                                        int64_t cutoff_us,
-                                        const char *reason)
-{
-    if (device_id == NULL || device_id[0] == '\0' || s_csi_fusion_queue == NULL ||
-        s_csi_fusion_queue_lock == NULL) {
-        return;
-    }
-
-    s3_csi_fusion_work_item_t kept[S3_CSI_FUSION_WORKER_QUEUE_DEPTH] = {0};
-    size_t kept_count = 0U;
-    size_t cleared = 0U;
-    s3_csi_fusion_work_item_t item = {0};
-
-    xSemaphoreTake(s_csi_fusion_queue_lock, portMAX_DELAY);
-    while (xQueueReceive(s_csi_fusion_queue, &item, 0) == pdTRUE) {
-        const bool matches = item.type == S3_CSI_FUSION_WORK_INGRESS &&
-                             item.ingress != NULL &&
-                             strcmp(item.ingress->device_id, device_id) == 0 &&
-                             csi_ingress_at_or_before_cutoff(item.ingress, cutoff_us);
-        if (matches) {
-            release_csi_fusion_work_item(&item);
-            ++cleared;
-        } else if (kept_count < S3_CSI_FUSION_WORKER_QUEUE_DEPTH) {
-            kept[kept_count++] = item;
-        } else {
-            release_csi_fusion_work_item(&item);
-        }
-        memset(&item, 0, sizeof(item));
-    }
-    for (size_t i = 0; i < kept_count; ++i) {
-        if (xQueueSend(s_csi_fusion_queue, &kept[i], 0) != pdTRUE) {
-            release_csi_fusion_work_item(&kept[i]);
-        }
-    }
-    xSemaphoreGive(s_csi_fusion_queue_lock);
-
-    if (cleared > 0U) {
-        ESP_LOGI(TAG,
-                 "CSI queued ingress cleared device_id=%s count=%u cutoff_us=%lld reason=%s",
-                 device_id,
-                 (unsigned int)cleared,
-                 (long long)cutoff_us,
-                 reason != NULL ? reason : "resource_release");
-    }
-}
-
-void s3_scheduler_clear_csi_peer(const char *device_id, const char *reason)
-{
-    s3_scheduler_clear_csi_peer_before(device_id, INT64_MAX, reason);
-}
-
 s3_scheduler_load_t s3_scheduler_get_load(void)
 {
     const s3_event_bus_stats_t stats = s3_event_bus_get_stats();
@@ -2281,14 +1777,8 @@ s3_scheduler_load_t s3_scheduler_get_load(void)
         .background_depth = stats.background_depth,
         .drop_count = stats.drop_count,
         .coalesce_count = stats.coalesce_count,
-        .csi_ingress_drop_count = stats.csi_ingress_drop_count + s_csi_ingress_drop_count,
-        .csi_ingress_coalesce_count =
-            stats.csi_ingress_coalesce_count + s_csi_ingress_coalesce_count,
-        .csi_worker_yield_count = s_csi_worker_yield_count,
-        .csi_latest = stats.csi_latest,
         .network_state = s_network_state,
         .voice_busy = s_voice_busy,
-        .csi_interval_ms = CSI_FUSION_TICK_MS,
         .upload_interval_ms = UPLOAD_SNAPSHOT_INTERVAL_MS,
         .smart_home_interval_ms =
             adjusted_interval(S3_SCHEDULER_SMART_HOME_POLL_MS, multiplier),

@@ -14,7 +14,6 @@
 #include <stdint.h>
 
 #include "cJSON.h"
-#include "csi_fusion.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -51,7 +50,6 @@ typedef enum {
     PROTOCOL_ADAPTER_MESSAGE_HEARTBEAT,
     PROTOCOL_ADAPTER_MESSAGE_STATUS,
     PROTOCOL_ADAPTER_MESSAGE_SENSOR_BME690,
-    PROTOCOL_ADAPTER_MESSAGE_CSI_RESULT,
     PROTOCOL_ADAPTER_MESSAGE_COMMAND_ACK,
 } protocol_adapter_message_kind_t;
 
@@ -63,7 +61,7 @@ esp_err_t protocol_adapter_parse_envelope(const char *json,
 /**
  * @brief 解析 C5 轻量本地 JSON 并补全为完整 envelope。
  *
- * 调用位置：local_http_server 的 register/heartbeat/status/sensor/csi handler。
+ * 调用位置：local_http_server 的 register/heartbeat/status/sensor handlers。
  * @param json 请求 body。
  * @param json_len 请求 body 长度。
  * @param out 输出 envelope，成功后需调用 protocol_adapter_release_envelope()。
@@ -82,10 +80,6 @@ esp_err_t protocol_adapter_validate_local_envelope(const protocol_adapter_envelo
 /** @brief 将 envelope 构造成 S3 -> Server ingest JSON；sensor_aggregator 调用，返回 JSON 需释放。 */
 esp_err_t protocol_adapter_build_server_ingest_json(const protocol_adapter_envelope_t *envelope,
                                                     char **out_json);
-/** @brief 将 S3 fusion telemetry 构造成 canonical CSI event v2；不暴露 C5 device-specific 字段。 */
-esp_err_t protocol_adapter_build_csi_event_v2_json(const csi_fusion_fact_t *fact,
-                                                   const csi_fusion_telemetry_t *telemetry,
-                                                   char **out_json);
 /** @brief 将 C5 短 id 映射为完整 device_id；local HTTP 和 command router 调用。 */
 const char *protocol_adapter_local_device_id_to_device_id(uint8_t local_id);
 /** @brief 将 C5 短 id 映射为默认 alias；register payload 补全时调用。 */

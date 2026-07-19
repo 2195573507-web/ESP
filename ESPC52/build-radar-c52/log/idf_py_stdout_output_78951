@@ -1,0 +1,45 @@
+Command: ninja all
+[1/36] Building C object esp-idf/server_comm/CMakeFiles/__idf_server_comm.dir/server_comm_config.c.obj
+[2/36] Building C object esp-idf/radar_ld2450/CMakeFiles/__idf_radar_ld2450.dir/radar_presence.c.obj
+[3/36] Building C object esp-idf/radar_ld2450/CMakeFiles/__idf_radar_ld2450.dir/ld2450_parser.c.obj
+[4/36] Building C object esp-idf/radar_ld2450/CMakeFiles/__idf_radar_ld2450.dir/radar_state_codec.c.obj
+[5/36] Building C object esp-idf/radar_ld2450/CMakeFiles/__idf_radar_ld2450.dir/radar_service.c.obj
+[6/36] Building C object esp-idf/radar_ld2450/CMakeFiles/__idf_radar_ld2450.dir/ld2450_uart.c.obj
+[7/36] Building C object esp-idf/app_time_sync/CMakeFiles/__idf_app_time_sync.dir/app_time_sync.c.obj
+[8/36] Linking C static library esp-idf/radar_ld2450/libradar_ld2450.a
+[9/36] Building C object esp-idf/server_comm/CMakeFiles/__idf_server_comm.dir/__/terminal_config/terminal_config.c.obj
+[10/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/device_protocol/device_protocol_metadata.c.obj
+[11/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/app_orchestrator/app_orchestrator.c.obj
+[12/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/sensor_domain/bme690/service/bme_sensor_service.c.obj
+[13/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/wifi/wifi_manager.c.obj
+[14/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/radar_ble/radar_ble_transport.c.obj
+[15/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/sensor_domain/radar/radar_state_client.c.obj
+[16/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/sensor_domain/bme690/server_client/bme_server_client.c.obj
+[17/36] Performing build step for 'bootloader'
+[1/1] cd "/Users/zhiqin/ESP 雷达/ESPC52/build-radar-c52/bootloader/esp-idf/esptool_py" && /Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x2000 /Users/zhiqin/ESP\ 雷达/ESPC52/build-radar-c52/bootloader/bootloader.bin
+Bootloader binary size 0x5670 bytes. 0x990 bytes (10%) free.
+[18/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/radar_ble/radar_ble_runtime.c.obj
+[19/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/runtime/c5_backpressure_controller.c.obj
+[20/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/wake/wake_prompt_cache.c.obj
+[21/36] Building C object esp-idf/server_comm/CMakeFiles/__idf_server_comm.dir/gateway_link.c.obj
+[22/36] No install step for 'bootloader'
+[23/36] Completed 'bootloader'
+[24/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/command_domain/system_command/system_service.c.obj
+[25/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/device_protocol/device_stream_client.c.obj
+[26/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/sensor_domain/bme690/service/bme_air_quality.c.obj
+[27/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/command_domain/system_command/system_server_client.c.obj
+[28/36] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/server_voice/server_voice_client.c.obj
+[29/36] Building C object esp-idf/server_comm/CMakeFiles/__idf_server_comm.dir/server_comm_http.c.obj
+[30/36] Linking C static library esp-idf/server_comm/libserver_comm.a
+[31/36] Linking C static library esp-idf/app_time_sync/libapp_time_sync.a
+[32/36] Linking C static library esp-idf/Middlewares/libMiddlewares.a
+[33/36] Generating esp-idf/esp_system/ld/sections.ld
+[34/36] Linking CXX executable 00_Learn.elf
+[35/36] Generating binary image from built executable
+esptool.py v4.12.dev2
+Creating esp32c5 image...
+Merged 1 ELF section
+Successfully created esp32c5 image.
+Generated /Users/zhiqin/ESP 雷达/ESPC52/build-radar-c52/00_Learn.bin
+[36/36] cd "/Users/zhiqin/ESP 雷达/ESPC52/build-radar-c52/esp-idf/esptool_py" && /Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /Users/zhiqin/ESP\ 雷达/ESPC52/build-radar-c52/partition_table/partition-table.bin /Users/zhiqin/ESP\ 雷达/ESPC52/build-radar-c52/00_Learn.bin
+00_Learn.bin binary size 0x14e840 bytes. Smallest app partition is 0x500000 bytes. 0x3b17c0 bytes (74%) free.

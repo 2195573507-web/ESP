@@ -150,6 +150,22 @@ esp_err_t mic_adc_test_wait_paused(uint32_t timeout_ms);
 esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms);
 
 /**
+ * @brief 在同一 voice lease 内安全退出 Mic task 并释放 ADC continuous/DMA。
+ *
+ * 调用方法：voice_chain 在 Speaker PDM TX 初始化前调用。该函数不触碰
+ * C5 resource lease/generation；仅在 Mic task 已离开 ADC read 临界区后释放
+ * ADC handle 和其 DMA 资源。成功后必须通过 mic_adc_test_start() 重建 Mic。
+ */
+esp_err_t mic_adc_test_release_for_speaker(uint32_t timeout_ms);
+
+/**
+ * @brief 等待 Mic task 已重建 ADC continuous 并实际开始采样。
+ *
+ * 调用方法：voice_chain 在 mic_adc_test_start() 后、打开正式录音窗口前调用。
+ */
+esp_err_t mic_adc_test_wait_running(uint32_t timeout_ms);
+
+/**
  * @brief 清空 Mic server voice 本地小音频缓存。
  *
  * 调用方法：voice_chain 已请求暂停并确认 Mic ADC 任务处于 PAUSED 后调用。
@@ -166,5 +182,8 @@ esp_err_t mic_adc_test_clear_audio_cache(void);
  * @return 已暂停返回 true。
  */
 bool mic_adc_test_is_paused(void);
+
+/** @brief 返回当前 Mic/VAD 录音周期 generation，用于丢弃旧异步事件。 */
+uint32_t mic_adc_test_get_session_generation(void);
 
 #endif // MIC_ADC_TEST_H

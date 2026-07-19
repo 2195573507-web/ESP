@@ -6,7 +6,7 @@
  * @brief ESPS3 per-child live resource session lifecycle.
  *
  * Identity retention remains owned by child_registry. This component owns only
- * live command, sensor, and CSI resources for an allowlisted C5.
+ * live command and sensor resources for an allowlisted C5.
  */
 
 #include <stdbool.h>
@@ -33,7 +33,6 @@ typedef enum {
     RESOURCE_MANAGER_SIGNAL_HEARTBEAT,
     RESOURCE_MANAGER_SIGNAL_STATUS,
     RESOURCE_MANAGER_SIGNAL_SENSOR,
-    RESOURCE_MANAGER_SIGNAL_CSI,
 } resource_manager_identity_signal_t;
 
 typedef struct {
@@ -86,15 +85,12 @@ esp_err_t resource_manager_confirm_peer_at_us(const char *device_id,
  * @brief AP_STACONNECTED can prepare a RELEASED/GRACE session for restore.
  *
  * This never marks the peer ACTIVE and never restores resources by itself. A
- * later validated register/heartbeat/status/sensor/CSI confirmation must finish
+ * later validated register/heartbeat/status/sensor confirmation must finish
  * the transition. Peer IP is an optional transport mapping and is not identity.
  */
 esp_err_t resource_manager_prepare_reconnect_at_us(const char *device_id,
                                                    int64_t observed_at_us,
                                                    const char *reason);
-
-/** @brief Compatibility no-op once ingress restoration has already committed ACTIVE. */
-esp_err_t resource_manager_complete_restore(const char *device_id, const char *reason);
 
 /** @brief Advance GRACE expiry and reconcile the existing 30-second heartbeat timeout. */
 void resource_manager_tick(void);
@@ -124,6 +120,18 @@ size_t resource_manager_snapshot_live(
 /** @brief Read one session view without exposing internal storage. */
 bool resource_manager_get_session(const char *device_id,
                                   resource_manager_session_view_t *out_view);
+
+/**
+ * @brief Read one session view while bounding the manager mutex wait.
+ *
+ * `ESP_OK` means the lock was acquired; `out_found` then distinguishes a
+ * missing session from a populated view. HTTP ingress uses this to fail
+ * admission instead of waiting indefinitely behind lifecycle work.
+ */
+esp_err_t resource_manager_get_session_timed(const char *device_id,
+                                             resource_manager_session_view_t *out_view,
+                                             uint32_t lock_timeout_ms,
+                                             bool *out_found);
 
 /** @brief Emit a consistent session diagnostic log for lifecycle boundaries. */
 void resource_manager_log_session_diagnostic(const char *device_id,

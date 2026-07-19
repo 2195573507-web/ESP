@@ -23,8 +23,7 @@ extern "C" {
 #endif
 
 typedef enum {
-    C5_EVENT_CSI_READY = 0,
-    C5_EVENT_BME_SAMPLE,
+    C5_EVENT_BME_SAMPLE = 0,
     C5_EVENT_HEARTBEAT,
     C5_EVENT_STATUS,
     C5_EVENT_COMMAND,

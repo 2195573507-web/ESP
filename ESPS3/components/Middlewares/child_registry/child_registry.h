@@ -90,7 +90,7 @@ esp_err_t child_registry_touch(const char *device_id, uint32_t seq);
 esp_err_t child_registry_confirm_identity(const char *device_id);
 /** @brief 仅记录合法活动时间和 seq，不改变 LINK_LOST/OFFLINE session 状态。 */
 esp_err_t child_registry_note_activity(const char *device_id, uint32_t seq);
-/** @brief 记录 C5 最近一次本地 HTTP 请求来源 IP；CSI trigger 使用该 IP 发送轻量 UDP 触发包。 */
+/** @brief 记录 C5 最近一次已验证的本地 HTTP 请求来源 IP。 */
 esp_err_t child_registry_update_peer_ip(const char *device_id, const char *peer_ip);
 /** @brief 读取 C5 当前记录的本地来源 IP；未登记或未记录时返回 false。 */
 bool child_registry_get_peer_ip(const char *device_id, char *out, size_t out_size);

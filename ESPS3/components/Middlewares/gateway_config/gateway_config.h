@@ -33,27 +33,6 @@ extern "C" {
 #define GATEWAY_CONFIG_LINK_LOST_GRACE_MS 20000U
 #define GATEWAY_CONFIG_SENSOR_FORWARD_PERIOD_MS 2000U
 
-#ifndef GATEWAY_CONFIG_ENABLE_CSI_TRIGGER
-#define GATEWAY_CONFIG_ENABLE_CSI_TRIGGER 1
-#endif
-
-#ifndef GATEWAY_CONFIG_ENABLE_CSI_RESULT_INGEST
-#define GATEWAY_CONFIG_ENABLE_CSI_RESULT_INGEST 1
-#endif
-
-#ifndef GATEWAY_CONFIG_CSI_TRIGGER_INTERVAL_MS
-#define GATEWAY_CONFIG_CSI_TRIGGER_INTERVAL_MS 50U
-#endif
-
-#ifndef GATEWAY_CONFIG_CSI_TRIGGER_UDP_PORT
-#define GATEWAY_CONFIG_CSI_TRIGGER_UDP_PORT 33434U
-#endif
-
-#ifndef GATEWAY_CONFIG_CSI_TRIGGER_TARGET_DEVICE_ID
-/* 空字符串表示对所有在线 C5 发送 CSI trigger。 */
-#define GATEWAY_CONFIG_CSI_TRIGGER_TARGET_DEVICE_ID ""
-#endif
-
 #ifndef GATEWAY_CONFIG_SOFTAP_SSID
 #define GATEWAY_CONFIG_SOFTAP_SSID ESP111_PROTOCOL_GATEWAY_SSID
 #endif
@@ -103,11 +82,6 @@ typedef struct {
     uint32_t heartbeat_timeout_ms;
     uint32_t link_lost_grace_ms;
     uint32_t sensor_forward_period_ms;
-    bool csi_trigger_enabled;
-    bool csi_result_ingest_enabled;
-    uint32_t csi_trigger_interval_ms;
-    uint16_t csi_trigger_udp_port;
-    const char *csi_trigger_target_device_id;
     const char *children_allowlist[GATEWAY_CONFIG_MAX_CHILDREN];
     size_t children_allowlist_count;
 } gateway_runtime_config_t;

@@ -6,7 +6,7 @@
  * @brief S3 网关到 ESP-server 的 HTTP 客户端接口。
  *
  * C5 从不直接调用本模块；local_http_server/protocol_adapter 结束 C5<->S3 轻量协议后，
- * S3 通过本模块访问完整 /api/device/v1/ingest、/kernel/csi_event、logs、
+ * S3 通过本模块访问完整 /api/device/v1/ingest、logs、
  * smart-home、/api/voice/turn。本层只做 HTTP transport，不推断或改写 schema。
  */
 
@@ -52,11 +52,6 @@ esp_err_t server_client_post_ingest_json_cancellable_for_device(
     int *http_status,
     server_client_cancel_cb_t cancel_cb,
     void *cancel_ctx);
-/** @brief POST S3 canonical CSI event v2 到 Server；payload 已由 protocol_adapter 严格校验。 */
-esp_err_t server_client_post_csi_event_json(const char *json_body,
-                                            char *response_body,
-                                            size_t response_body_size,
-                                            int *http_status);
 /** @brief POST S3 gateway-state telemetry 到 Server。 */
 esp_err_t server_client_post_gateway_state_json(const char *json_body,
                                                 char *response_body,
@@ -118,7 +113,7 @@ esp_err_t server_client_get_pending_commands_cancellable(const char *device_id,
 /**
  * @brief Interrupt active command-poll and sensor-ingest HTTP requests for one C5.
  *
- * Idempotent when no scoped request is active. Unrelated gateway, voice, CSI and ACK requests are
+ * Idempotent when no scoped request is active. Unrelated gateway, voice and ACK requests are
  * never registered and are therefore unaffected.
  */
 esp_err_t server_client_cancel_peer_requests(const char *device_id);

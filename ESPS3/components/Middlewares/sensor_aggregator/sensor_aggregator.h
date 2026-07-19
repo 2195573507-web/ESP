@@ -13,7 +13,6 @@
 #include <stdint.h>
 
 #include "esp_err.h"
-#include "csi_fusion.h"
 #include "protocol_adapter.h"
 
 #ifdef __cplusplus
@@ -68,10 +67,6 @@ esp_err_t sensor_aggregator_handle_stream_status(const char *device_id,
                                                  double uptime,
                                                  double wifi_rssi,
                                                  sensor_aggregator_result_t *result);
-/** @brief 转发 S3 生成的 canonical CSI event v2 到 ESP-server，并刷新 snapshot。 */
-esp_err_t sensor_aggregator_handle_csi_fact(const csi_fusion_fact_t *fact,
-                                            const csi_fusion_telemetry_t *telemetry,
-                                            sensor_aggregator_result_t *result);
 /** @brief 记录一次 voice turn 事件并尝试上传 dashboard snapshot。 */
 void sensor_aggregator_record_voice_event(const char *device_id,
                                           size_t pcm_bytes,

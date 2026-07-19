@@ -26,28 +26,10 @@ typedef struct {
     const char *room_name;
 } protocol_adapter_local_child_t;
 
-typedef struct {
-    bool valid;
-    double frame_energy;
-    double variance;
-    double cv;
-    double rssi;
-    double quality;
-} protocol_adapter_csi_metrics_t;
-
 static const protocol_adapter_local_child_t s_local_children[] = {
     {ESP111_PROTOCOL_LOCAL_DEVICE_ID_C51, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C51, "SensaiShuttle", "living_room"},
     {ESP111_PROTOCOL_LOCAL_DEVICE_ID_C52, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C52, "SensaiShuttle02", "bedroom"},
 };
-
-static const char *const s_csi_internal_links[] = {
-    "S3_TO_C51",
-    "S3_TO_C52",
-};
-
-/* CSI fusion may emit the same link map every tick; retain only the last mapping for diagnostics. */
-static char s_last_csi_server_link_map[CSI_FUSION_LINK_COUNT][48];
-static uint8_t s_last_csi_server_link_count;
 
 static bool copy_json_string(cJSON *root, const char *key, char *out, size_t out_size)
 {
@@ -90,8 +72,7 @@ static bool local_payload_type_matches(const char *local_payload_type, const cha
     if (strcmp(local_payload_type, message_type) == 0) {
         return true;
     }
-    return strcmp(local_payload_type, ESP111_PROTOCOL_MSG_CSI_RESULT) == 0 &&
-           strcmp(message_type, ESP111_PROTOCOL_MSG_CSI_MOTION) == 0;
+    return false;
 }
 
 static int64_t get_json_i64(cJSON *root, const char *key, int64_t fallback)
@@ -108,17 +89,6 @@ static int64_t protocol_adapter_now_ms(void)
     return esp_timer_get_time() / 1000;
 }
 
-static bool schema_version_is_csi_v2(cJSON *root)
-{
-    cJSON *schema = cJSON_GetObjectItemCaseSensitive(root,
-                                                     ESP111_PROTOCOL_JSON_SCHEMA_VERSION);
-    if (cJSON_IsString(schema) && schema->valuestring != NULL) {
-        return strcmp(schema->valuestring, ESP111_PROTOCOL_CSI_EVENT_SCHEMA_VERSION_STRING) == 0 ||
-               strcmp(schema->valuestring, "2") == 0;
-    }
-    return cJSON_IsNumber(schema) && schema->valueint == CSI_FUSION_SCHEMA_VERSION;
-}
-
 static bool read_finite_number(cJSON *root, const char *key, double *out)
 {
     if (root == NULL || key == NULL || out == NULL) {
@@ -132,13 +102,6 @@ static bool read_finite_number(cJSON *root, const char *key, double *out)
     return true;
 }
 
-static bool protocol_adapter_is_active_csi_link(const char *link_id)
-{
-    return link_id != NULL &&
-           (strcmp(link_id, "S3_TO_C51") == 0 ||
-            strcmp(link_id, "S3_TO_C52") == 0);
-}
-
 static bool read_finite_array_number(cJSON *array, int index, double *out)
 {
     if (!cJSON_IsArray(array) || index < 0 || out == NULL) {
@@ -150,179 +113,6 @@ static bool read_finite_array_number(cJSON *array, int index, double *out)
     }
     *out = value->valuedouble;
     return true;
-}
-
-static const char *canonical_csi_state_hint(const char *state_hint)
-{
-    if (state_hint == NULL || state_hint[0] == '\0') {
-        return "";
-    }
-    if (strcasecmp(state_hint, "MOTION") == 0 ||
-        strcasecmp(state_hint, "motion") == 0 ||
-        strcasecmp(state_hint, "occupied") == 0) {
-        return "MOTION";
-    }
-    if (strcasecmp(state_hint, "HOLD") == 0 ||
-        strcasecmp(state_hint, "hold") == 0) {
-        return "HOLD";
-    }
-    if (strcasecmp(state_hint, "IDLE") == 0 ||
-        strcasecmp(state_hint, "idle") == 0 ||
-        strcasecmp(state_hint, "vacant") == 0 ||
-        strcasecmp(state_hint, "no_motion") == 0 ||
-        strcasecmp(state_hint, "no-motion") == 0) {
-        return "IDLE";
-    }
-    return "";
-}
-
-static bool read_csi_timestamp_ms(cJSON *root, double *out)
-{
-    if (read_finite_number(root, "timestamp_ms", out) ||
-        read_finite_number(root, "timestamp", out) ||
-        read_finite_number(root, ESP111_PROTOCOL_DEVICE_STREAM_JSON_TIMESTAMP, out)) {
-        return *out > 0.0;
-    }
-    return false;
-}
-
-static const char *read_csi_link_id(cJSON *root)
-{
-    const char *link_id = read_json_string(root, ESP111_PROTOCOL_DEVICE_STREAM_JSON_LINK_ID);
-    return link_id[0] != '\0' ? link_id : read_json_string(root, "link_id");
-}
-
-static bool read_csi_edge_fields(cJSON *root,
-                                 double *motion_score,
-                                 double *confidence,
-                                 const char **state)
-{
-    if (root == NULL || motion_score == NULL || confidence == NULL || state == NULL) {
-        return false;
-    }
-    const char *state_text = read_json_string_first(root, "state", "state_hint");
-    const char *canonical_state = canonical_csi_state_hint(state_text);
-    if (canonical_state[0] == '\0' ||
-        !read_finite_number(root, "motion_score", motion_score) ||
-        !read_finite_number(root, "confidence", confidence) ||
-        *motion_score < 0.0 || *motion_score > 1.0 ||
-        *confidence < 0.0 || *confidence > 1.0) {
-        return false;
-    }
-    *state = canonical_state;
-    return true;
-}
-
-static double read_csi_number_or(cJSON *root,
-                                 cJSON *metrics,
-                                 const char *key,
-                                 double fallback)
-{
-    double value = fallback;
-    if (read_finite_number(root, key, &value)) {
-        return value;
-    }
-    if (cJSON_IsObject(metrics) && read_finite_number(metrics, key, &value)) {
-        return value;
-    }
-    return fallback;
-}
-
-static bool read_csi_feature_metrics(cJSON *root,
-                                     cJSON *metrics,
-                                     protocol_adapter_csi_metrics_t *out)
-{
-    if (out == NULL) {
-        return false;
-    }
-    memset(out, 0, sizeof(*out));
-
-    double frame_energy = 0.0;
-    double variance = 0.0;
-    double cv = 0.0;
-    double rssi = 0.0;
-    double quality = 0.0;
-    bool has_energy = read_finite_number(metrics, "frame_energy", &frame_energy) ||
-                      read_finite_number(root, "frame_energy", &frame_energy) ||
-                      read_finite_number(root, "energy", &frame_energy);
-    bool has_variance = read_finite_number(metrics, "variance", &variance) ||
-                        read_finite_number(root, "variance", &variance);
-    bool has_cv = read_finite_number(metrics, "cv", &cv) ||
-                  read_finite_number(root, "cv", &cv);
-    bool has_rssi = read_finite_number(metrics, "rssi", &rssi) ||
-                    read_finite_number(root, "rssi", &rssi);
-    bool has_quality = read_finite_number(metrics, "quality", &quality) ||
-                       read_finite_number(root, "quality", &quality);
-
-    if (!has_energy || !has_variance || !has_cv || !has_rssi || !has_quality ||
-        frame_energy < 0.0 || variance < 0.0 || cv < 0.0 ||
-        quality < 0.0 || quality > 1.0) {
-        return false;
-    }
-
-    out->valid = true;
-    out->frame_energy = frame_energy;
-    out->variance = variance;
-    out->cv = cv;
-    out->rssi = rssi;
-    out->quality = quality;
-    return true;
-}
-
-static bool csi_signal_key_forbidden(const char *key)
-{
-    return key != NULL &&
-           (strcmp(key, "raw_csi") == 0 ||
-            strcmp(key, "raw_iq") == 0 ||
-            strcmp(key, "iq") == 0 ||
-            strcmp(key, "iq_samples") == 0 ||
-            strcmp(key, "i_samples") == 0 ||
-            strcmp(key, "q_samples") == 0 ||
-            strcmp(key, "phase") == 0 ||
-            strcmp(key, "phase_data") == 0 ||
-            strcmp(key, "subcarrier_data") == 0 ||
-            strcmp(key, "selected_subcarriers") == 0 ||
-            strcmp(key, "subcarrier_matrix") == 0 ||
-            strcmp(key, "subcarriers") == 0 ||
-            strcmp(key, "amplitude") == 0 ||
-            strcmp(key, "amplitudes") == 0);
-}
-
-static bool csi_has_forbidden_signal_fields(cJSON *root)
-{
-    if (root == NULL) {
-        return false;
-    }
-
-    for (cJSON *item = root->child; item != NULL; item = item->next) {
-        if (csi_signal_key_forbidden(item->string)) {
-            return true;
-        }
-        if ((cJSON_IsObject(item) || cJSON_IsArray(item)) &&
-            csi_has_forbidden_signal_fields(item)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static esp_err_t add_csi_metrics_payload(cJSON *payload,
-                                         const protocol_adapter_csi_metrics_t *metrics)
-{
-    if (payload == NULL || metrics == NULL || !metrics->valid) {
-        return ESP_OK;
-    }
-
-    cJSON *payload_metrics = cJSON_AddObjectToObject(payload, "metrics");
-    if (payload_metrics == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    cJSON_AddNumberToObject(payload_metrics, "frame_energy", metrics->frame_energy);
-    cJSON_AddNumberToObject(payload_metrics, "variance", metrics->variance);
-    cJSON_AddNumberToObject(payload_metrics, "cv", metrics->cv);
-    cJSON_AddNumberToObject(payload_metrics, "rssi", metrics->rssi);
-    cJSON_AddNumberToObject(payload_metrics, "quality", metrics->quality);
-    return ESP_OK;
 }
 
 const char *protocol_adapter_local_device_id_to_device_id(uint8_t local_id)
@@ -646,360 +436,6 @@ static esp_err_t protocol_adapter_fill_bme_payload(cJSON *root,
     return ESP_OK;
 }
 
-static esp_err_t protocol_adapter_fill_csi_v2_payload(protocol_adapter_envelope_t *out)
-{
-    if (out == NULL || out->root == NULL || csi_has_forbidden_signal_fields(out->root)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    const char *input_device_id = read_json_string(out->root, "device_id");
-    const char *peer_id = read_json_string(out->root, "peer_id");
-    const char *link_id = read_csi_link_id(out->root);
-    const char *state_input = read_json_string_first(out->root, "state", "state_hint");
-    const char *state = canonical_csi_state_hint(state_input);
-    cJSON *metrics = cJSON_GetObjectItemCaseSensitive(out->root, "metrics");
-
-    double timestamp_ms = 0.0;
-    double rssi = 0.0;
-    double quality = 0.0;
-    double motion_score = 0.0;
-    double confidence = 0.0;
-    protocol_adapter_csi_metrics_t csi_metrics = {0};
-    const char *edge_state = "";
-    bool edge_payload = read_csi_edge_fields(out->root, &motion_score, &confidence, &edge_state);
-    bool metrics_payload = read_csi_feature_metrics(out->root, metrics, &csi_metrics);
-    if (input_device_id[0] == '\0' || link_id[0] == '\0' ||
-        !read_csi_timestamp_ms(out->root, &timestamp_ms)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!protocol_adapter_is_active_csi_link(link_id)) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    if (edge_payload) {
-        state = edge_state;
-        rssi = metrics_payload ? csi_metrics.rssi :
-                                 read_csi_number_or(out->root, metrics, "rssi", 0.0);
-        quality = metrics_payload ? csi_metrics.quality :
-                                    read_csi_number_or(out->root, metrics, "quality", confidence);
-    } else if (metrics_payload) {
-        rssi = csi_metrics.rssi;
-        quality = csi_metrics.quality;
-        confidence = quality;
-        if (!read_finite_number(out->root, "motion_score", &motion_score)) {
-            motion_score = quality;
-        }
-    } else {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (motion_score < 0.0 || motion_score > 1.0 ||
-        confidence < 0.0 || confidence > 1.0 ||
-        quality < 0.0 || quality > 1.0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    uint8_t local_id = protocol_adapter_device_id_to_local_id(input_device_id);
-    const char *device_id = protocol_adapter_local_device_id_to_device_id(local_id);
-    if (device_id == NULL) {
-        return ESP_ERR_NOT_ALLOWED;
-    }
-
-    out->local_id = local_id;
-    out->local_protocol_version = ESP111_PROTOCOL_LOCAL_SCHEMA_VERSION;
-    out->local_packet_type = ESP111_PROTOCOL_LOCAL_PACKET_CSI;
-    out->seq = (uint32_t)((uint64_t)timestamp_ms & 0xffffffffU);
-    out->timestamp_ms = (int64_t)timestamp_ms;
-    out->uptime_ms = (int64_t)timestamp_ms;
-    strlcpy(out->gateway_id, gateway_config_get()->gateway_id, sizeof(out->gateway_id));
-    strlcpy(out->device_id, device_id, sizeof(out->device_id));
-    strlcpy(out->room_id,
-            protocol_adapter_local_device_id_to_room(local_id),
-            sizeof(out->room_id));
-    strlcpy(out->alias,
-            protocol_adapter_local_device_id_to_alias(local_id),
-            sizeof(out->alias));
-    strlcpy(out->firmware_version,
-            ESP111_PROTOCOL_FIRMWARE_VERSION,
-            sizeof(out->firmware_version));
-    strlcpy(out->message_type, ESP111_PROTOCOL_MSG_CSI_MOTION, sizeof(out->message_type));
-
-    esp_err_t ret = protocol_adapter_add_capabilities(out);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    cJSON *payload = protocol_adapter_add_payload(out);
-    if (payload == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    cJSON_AddStringToObject(payload, "device_id", out->device_id);
-    if (peer_id[0] != '\0') {
-        cJSON_AddStringToObject(payload, "peer_id", peer_id);
-    }
-    cJSON_AddStringToObject(payload, "link_id", link_id);
-    cJSON_AddNumberToObject(payload, "timestamp_ms", timestamp_ms);
-    if (state_input[0] != '\0') {
-        cJSON_AddStringToObject(payload, "state_hint", state_input);
-    }
-    if (state[0] != '\0') {
-        cJSON_AddStringToObject(payload, "state", state);
-    }
-    /*
-     * csi_fusion consumes low-dimensional feature metrics; they remain nested
-     * and are never promoted to the server-facing CSI event.
-     */
-    cJSON_AddNumberToObject(payload, "confidence", confidence);
-    cJSON_AddNumberToObject(payload, "motion_score", motion_score);
-    cJSON_AddNumberToObject(payload, "quality", quality);
-    cJSON_AddNumberToObject(payload, "rssi", rssi);
-
-    return add_csi_metrics_payload(payload, &csi_metrics);
-}
-
-static bool protocol_adapter_is_compact_csi_result(cJSON *root)
-{
-    if (root == NULL) {
-        return false;
-    }
-    return cJSON_GetObjectItemCaseSensitive(root, ESP111_PROTOCOL_DEVICE_STREAM_JSON_LINK_ID) != NULL ||
-           cJSON_IsString(cJSON_GetObjectItemCaseSensitive(root, ESP111_PROTOCOL_LOCAL_JSON_ID));
-}
-
-static esp_err_t protocol_adapter_fill_compact_csi_result_payload(protocol_adapter_envelope_t *out)
-{
-    if (out == NULL || out->root == NULL || csi_has_forbidden_signal_fields(out->root)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    cJSON *id = cJSON_GetObjectItemCaseSensitive(out->root, ESP111_PROTOCOL_LOCAL_JSON_ID);
-    const char *link_id = read_csi_link_id(out->root);
-    cJSON *values = cJSON_GetObjectItemCaseSensitive(out->root,
-                                                     ESP111_PROTOCOL_LOCAL_JSON_VALUES);
-    double timestamp_ms = 0.0;
-    if ((!cJSON_IsString(id) && !cJSON_IsNumber(id)) ||
-        !read_csi_timestamp_ms(out->root, &timestamp_ms) ||
-        link_id[0] == '\0') {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    double rssi = 0.0;
-    double quality = 0.0;
-    double motion_score = 0.0;
-    double confidence = 0.0;
-    protocol_adapter_csi_metrics_t csi_metrics = {0};
-    const char *state = "";
-    bool edge_payload = read_csi_edge_fields(out->root, &motion_score, &confidence, &state);
-    bool metrics_payload = false;
-    if (!edge_payload) {
-        metrics_payload = cJSON_IsArray(values) && cJSON_GetArraySize(values) == 5 &&
-                          read_finite_array_number(values, 0, &csi_metrics.frame_energy) &&
-                          read_finite_array_number(values, 1, &csi_metrics.variance) &&
-                          read_finite_array_number(values, 2, &csi_metrics.cv) &&
-                          read_finite_array_number(values, 3, &csi_metrics.rssi) &&
-                          read_finite_array_number(values, 4, &csi_metrics.quality);
-        if (!metrics_payload ||
-            csi_metrics.frame_energy < 0.0 ||
-            csi_metrics.variance < 0.0 ||
-            csi_metrics.cv < 0.0 ||
-            csi_metrics.quality < 0.0 ||
-            csi_metrics.quality > 1.0) {
-            return ESP_ERR_INVALID_ARG;
-        }
-        csi_metrics.valid = true;
-        rssi = csi_metrics.rssi;
-        quality = csi_metrics.quality;
-        confidence = quality;
-        if (!read_finite_number(out->root, "motion_score", &motion_score)) {
-            motion_score = quality;
-        }
-    } else {
-        cJSON *metrics = cJSON_GetObjectItemCaseSensitive(out->root, "metrics");
-        metrics_payload = read_csi_feature_metrics(out->root, metrics, &csi_metrics);
-        rssi = metrics_payload ? csi_metrics.rssi :
-                                 read_csi_number_or(out->root, metrics, "rssi", 0.0);
-        quality = metrics_payload ? csi_metrics.quality :
-                                    read_csi_number_or(out->root, metrics, "quality", confidence);
-    }
-    if (!protocol_adapter_is_active_csi_link(link_id)) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    if (motion_score < 0.0 || motion_score > 1.0 ||
-        confidence < 0.0 || confidence > 1.0 ||
-        quality < 0.0 || quality > 1.0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    uint8_t local_id = 0;
-    if (cJSON_IsNumber(id)) {
-        local_id = (uint8_t)id->valueint;
-    } else {
-        local_id = protocol_adapter_device_id_to_local_id(id->valuestring);
-    }
-    const char *device_id = protocol_adapter_local_device_id_to_device_id(local_id);
-    if (device_id == NULL) {
-        return ESP_ERR_NOT_ALLOWED;
-    }
-    const char *explicit_device_id = read_json_string(out->root, "device_id");
-    if (explicit_device_id[0] != '\0' && strcmp(explicit_device_id, device_id) != 0) {
-        return ESP_ERR_NOT_ALLOWED;
-    }
-
-    out->local_id = local_id;
-    out->local_protocol_version = ESP111_PROTOCOL_LOCAL_SCHEMA_VERSION;
-    out->local_packet_type = ESP111_PROTOCOL_LOCAL_PACKET_CSI;
-    out->seq = (uint32_t)((uint64_t)timestamp_ms & 0xffffffffU);
-    out->timestamp_ms = (int64_t)timestamp_ms;
-    out->uptime_ms = (int64_t)timestamp_ms;
-    strlcpy(out->gateway_id, gateway_config_get()->gateway_id, sizeof(out->gateway_id));
-    strlcpy(out->device_id, device_id, sizeof(out->device_id));
-    strlcpy(out->room_id,
-            protocol_adapter_local_device_id_to_room(local_id),
-            sizeof(out->room_id));
-    strlcpy(out->alias,
-            protocol_adapter_local_device_id_to_alias(local_id),
-            sizeof(out->alias));
-    strlcpy(out->firmware_version,
-            ESP111_PROTOCOL_FIRMWARE_VERSION,
-            sizeof(out->firmware_version));
-    strlcpy(out->message_type, ESP111_PROTOCOL_MSG_CSI_MOTION, sizeof(out->message_type));
-
-    esp_err_t ret = protocol_adapter_add_capabilities(out);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    cJSON *payload = protocol_adapter_add_payload(out);
-    if (payload == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    cJSON_AddStringToObject(payload, "device_id", out->device_id);
-    cJSON_AddStringToObject(payload, "link_id", link_id);
-    cJSON_AddNumberToObject(payload, "timestamp_ms", timestamp_ms);
-    if (state[0] != '\0') {
-        cJSON_AddStringToObject(payload, "state", state);
-    }
-    cJSON_AddNumberToObject(payload, "confidence", confidence);
-    cJSON_AddNumberToObject(payload, "motion_score", motion_score);
-    cJSON_AddNumberToObject(payload, "quality", quality);
-    cJSON_AddNumberToObject(payload, "rssi", rssi);
-
-    return add_csi_metrics_payload(payload, &csi_metrics);
-}
-
-static esp_err_t protocol_adapter_fill_csi_payload(const protocol_adapter_envelope_t *envelope,
-                                                   cJSON *payload)
-{
-    cJSON *values = cJSON_GetObjectItemCaseSensitive(envelope->root,
-                                                     ESP111_PROTOCOL_LOCAL_JSON_VALUES);
-    int value_count = cJSON_IsArray(values) ? cJSON_GetArraySize(values) : 0;
-    if (payload == NULL || csi_has_forbidden_signal_fields(envelope->root)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    double edge_motion_score = 0.0;
-    double edge_confidence = 0.0;
-    const char *edge_state = "";
-    bool edge_payload =
-        read_csi_edge_fields(envelope->root, &edge_motion_score, &edge_confidence, &edge_state);
-
-    if (!edge_payload &&
-        (value_count < 5 || value_count > 6 ||
-         cJSON_GetObjectItemCaseSensitive(envelope->root, "metrics") != NULL ||
-         cJSON_GetObjectItemCaseSensitive(envelope->root, "features") != NULL ||
-         cJSON_GetObjectItemCaseSensitive(envelope->root, "device_id") != NULL ||
-         cJSON_GetObjectItemCaseSensitive(envelope->root, "frame_energy") != NULL ||
-         cJSON_GetObjectItemCaseSensitive(envelope->root, "energy") != NULL ||
-         cJSON_GetObjectItemCaseSensitive(envelope->root, "variance") != NULL ||
-         cJSON_GetObjectItemCaseSensitive(envelope->root, "cv") != NULL ||
-         cJSON_GetObjectItemCaseSensitive(envelope->root, "rssi") != NULL ||
-         cJSON_GetObjectItemCaseSensitive(envelope->root, "sample_count") != NULL)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (!edge_payload) {
-        for (int i = 0; i < value_count; ++i) {
-            cJSON *item = cJSON_GetArrayItem(values, i);
-            if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble)) {
-                return ESP_ERR_INVALID_ARG;
-            }
-        }
-    }
-
-    cJSON *link_item = cJSON_GetObjectItemCaseSensitive(envelope->root,
-                                                        ESP111_PROTOCOL_DEVICE_STREAM_JSON_LINK_ID);
-    if (!cJSON_IsString(link_item) || link_item->valuestring == NULL ||
-        link_item->valuestring[0] == '\0') {
-        link_item = cJSON_GetObjectItemCaseSensitive(envelope->root, "link_id");
-    }
-    if (!cJSON_IsString(link_item) || link_item->valuestring == NULL ||
-        link_item->valuestring[0] == '\0') {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!protocol_adapter_is_active_csi_link(link_item->valuestring)) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    if (edge_payload) {
-        cJSON *metrics = cJSON_GetObjectItemCaseSensitive(envelope->root, "metrics");
-        protocol_adapter_csi_metrics_t csi_metrics = {0};
-        bool metrics_payload = read_csi_feature_metrics(envelope->root, metrics, &csi_metrics);
-        double timestamp = 0.0;
-        double quality = metrics_payload ? csi_metrics.quality :
-                                           read_csi_number_or(envelope->root,
-                                                              metrics,
-                                                              "quality",
-                                                              edge_confidence);
-        double rssi = metrics_payload ? csi_metrics.rssi :
-                                        read_csi_number_or(envelope->root, metrics, "rssi", 0.0);
-        double frame_seq = read_csi_number_or(envelope->root, NULL, "frame_seq", 0.0);
-        if (!read_csi_timestamp_ms(envelope->root, &timestamp)) {
-            timestamp = envelope->timestamp_ms > 0 ? (double)envelope->timestamp_ms : 0.0;
-        }
-        if (timestamp <= 0.0 || quality < 0.0 || quality > 1.0 || frame_seq < 0.0) {
-            return ESP_ERR_INVALID_ARG;
-        }
-
-        cJSON_AddStringToObject(payload, "device_id", envelope->device_id);
-        cJSON_AddStringToObject(payload, "link_id", link_item->valuestring);
-        cJSON_AddStringToObject(payload, "state", edge_state);
-        cJSON_AddNumberToObject(payload, "confidence", edge_confidence);
-        cJSON_AddNumberToObject(payload, "motion_score", edge_motion_score);
-        cJSON_AddNumberToObject(payload, "quality", quality);
-        cJSON_AddNumberToObject(payload, "rssi", rssi);
-        cJSON_AddNumberToObject(payload, "timestamp", timestamp);
-        cJSON_AddNumberToObject(payload, "timestamp_ms", timestamp);
-        if (frame_seq > 0.0) {
-            cJSON_AddNumberToObject(payload, "frame_seq", frame_seq);
-        }
-        return add_csi_metrics_payload(payload, &csi_metrics);
-    }
-
-    double confidence = cJSON_GetArrayItem(values, 0)->valuedouble;
-    double quality = cJSON_GetArrayItem(values, 1)->valuedouble;
-    double rssi = cJSON_GetArrayItem(values, 2)->valuedouble;
-    double timestamp = cJSON_GetArrayItem(values, 3)->valuedouble;
-    double frame_seq = cJSON_GetArrayItem(values, 4)->valuedouble;
-    double tick_id = value_count == 6 ? cJSON_GetArrayItem(values, 5)->valuedouble : 0.0;
-
-    if (confidence < 0.0 || confidence > 1.0 || quality < 0.0 || quality > 1.0 ||
-        timestamp <= 0.0 || frame_seq < 0.0 || tick_id < 0.0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    cJSON_AddStringToObject(payload, "device_id", envelope->device_id);
-    cJSON_AddStringToObject(payload, "link_id", link_item->valuestring);
-    cJSON_AddNumberToObject(payload, "confidence", confidence);
-    cJSON_AddNumberToObject(payload, "motion_score", confidence);
-    cJSON_AddNumberToObject(payload, "quality", quality);
-    cJSON_AddNumberToObject(payload, "rssi", rssi);
-    cJSON_AddNumberToObject(payload, "frame_seq", frame_seq);
-    cJSON_AddNumberToObject(payload, "timestamp", timestamp);
-    cJSON_AddNumberToObject(payload, "timestamp_ms", timestamp);
-    if (tick_id > 0.0) {
-        cJSON_AddNumberToObject(payload, "tick_id", tick_id);
-    }
-    return ESP_OK;
-}
-
 static esp_err_t protocol_adapter_fill_local_payload(protocol_adapter_envelope_t *out,
                                                      const char *local_type)
 {
@@ -1055,10 +491,6 @@ static esp_err_t protocol_adapter_fill_local_payload(protocol_adapter_envelope_t
                                                  out->local_protocol_version >= ESP111_PROTOCOL_LOCAL_SCHEMA_VERSION);
     }
 
-    if (strcmp(local_type, ESP111_PROTOCOL_LOCAL_TYPE_CSI_RESULT) == 0) {
-        return protocol_adapter_fill_csi_payload(out, payload);
-    }
-
     return ESP_ERR_NOT_SUPPORTED;
 }
 
@@ -1074,22 +506,6 @@ esp_err_t protocol_adapter_parse_local_envelope(const char *json,
     out->root = cJSON_ParseWithLength(json, json_len);
     if (out->root == NULL) {
         return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    if (schema_version_is_csi_v2(out->root)) {
-        esp_err_t ret = protocol_adapter_fill_csi_v2_payload(out);
-        if (ret != ESP_OK) {
-            protocol_adapter_release_envelope(out);
-        }
-        return ret;
-    }
-
-    if (protocol_adapter_is_compact_csi_result(out->root)) {
-        esp_err_t ret = protocol_adapter_fill_compact_csi_result_payload(out);
-        if (ret != ESP_OK) {
-            protocol_adapter_release_envelope(out);
-        }
-        return ret;
     }
 
     cJSON *local_id_item =
@@ -1143,9 +559,6 @@ esp_err_t protocol_adapter_parse_local_envelope(const char *json,
             out->local_packet_type = ESP111_PROTOCOL_LOCAL_PACKET_SENSOR;
             out->local_sensor_kind = ESP111_PROTOCOL_LOCAL_SENSOR_KIND_BME690;
             strlcpy(out->message_type, ESP111_PROTOCOL_MSG_SENSOR_BME690, sizeof(out->message_type));
-        } else if (strcmp(local_type, ESP111_PROTOCOL_LOCAL_TYPE_CSI_RESULT) == 0) {
-            out->local_packet_type = ESP111_PROTOCOL_LOCAL_PACKET_CSI;
-            strlcpy(out->message_type, ESP111_PROTOCOL_MSG_CSI_MOTION, sizeof(out->message_type));
         } else {
             protocol_adapter_release_envelope(out);
             return ESP_ERR_NOT_SUPPORTED;
@@ -1175,10 +588,6 @@ esp_err_t protocol_adapter_parse_local_envelope(const char *json,
                 protocol_adapter_release_envelope(out);
                 return ESP_ERR_NOT_SUPPORTED;
             }
-            break;
-        case ESP111_PROTOCOL_LOCAL_PACKET_CSI:
-            local_type = ESP111_PROTOCOL_LOCAL_TYPE_CSI_RESULT;
-            strlcpy(out->message_type, ESP111_PROTOCOL_MSG_CSI_MOTION, sizeof(out->message_type));
             break;
         case ESP111_PROTOCOL_LOCAL_PACKET_VOICE:
         case ESP111_PROTOCOL_LOCAL_PACKET_CMD_ACK:
@@ -1321,10 +730,6 @@ protocol_adapter_message_kind_t protocol_adapter_message_kind(const char *messag
     if (strcmp(message_type, ESP111_PROTOCOL_MSG_SENSOR_BME690) == 0) {
         return PROTOCOL_ADAPTER_MESSAGE_SENSOR_BME690;
     }
-    if (strcmp(message_type, ESP111_PROTOCOL_MSG_CSI_RESULT) == 0 ||
-        strcmp(message_type, ESP111_PROTOCOL_MSG_CSI_MOTION) == 0) {
-        return PROTOCOL_ADAPTER_MESSAGE_CSI_RESULT;
-    }
     if (strcmp(message_type, ESP111_PROTOCOL_MSG_COMMAND_ACK) == 0) {
         return PROTOCOL_ADAPTER_MESSAGE_COMMAND_ACK;
     }
@@ -1412,179 +817,6 @@ esp_err_t protocol_adapter_build_server_ingest_json(const protocol_adapter_envel
     return *out_json != NULL ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
-static bool protocol_adapter_float_range(float value, float min, float max)
-{
-    return isfinite((double)value) && value >= min && value <= max;
-}
-
-static esp_err_t protocol_adapter_validate_csi_event_v2(const csi_fusion_fact_t *fact,
-                                                        const csi_fusion_telemetry_t *telemetry)
-{
-    if (fact == NULL || telemetry == NULL || !fact->valid || !telemetry->valid ||
-        fact->schema_version != CSI_FUSION_SCHEMA_VERSION ||
-        telemetry->schema_version != CSI_FUSION_SCHEMA_VERSION ||
-        fact->trace_id[0] == '\0' ||
-        strcmp(fact->trace_id, telemetry->trace_id) != 0 ||
-        fact->tick_id != telemetry->tick_id ||
-        fact->timestamp_ms == 0ULL || fact->timestamp_ms != telemetry->timestamp_ms ||
-        telemetry->active_link_count == 0U ||
-        fact->active_link_count != telemetry->active_link_count ||
-        fact->active_link_count > CSI_FUSION_LINK_COUNT ||
-        !protocol_adapter_float_range(fact->motion_score, 0.0f, 1.0f) ||
-        !protocol_adapter_float_range(fact->confidence, 0.0f, 1.0f) ||
-        !protocol_adapter_float_range(telemetry->motion_score, 0.0f, 1.0f) ||
-        !protocol_adapter_float_range(telemetry->confidence, 0.0f, 1.0f) ||
-        fact->fused_state != telemetry->fused_state) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    for (uint8_t i = 0; i < fact->active_link_count; ++i) {
-        if (fact->links[i][0] == '\0' ||
-            strcmp(fact->links[i], telemetry->links[i]) != 0) {
-            return ESP_ERR_INVALID_ARG;
-        }
-    }
-    return ESP_OK;
-}
-
-static bool protocol_adapter_add_csi_link(cJSON *links, const char *link_id)
-{
-    if (links == NULL || link_id == NULL || link_id[0] == '\0') {
-        return false;
-    }
-
-    cJSON *item = cJSON_CreateString(link_id);
-    if (item == NULL) {
-        return false;
-    }
-    if (!cJSON_AddItemToArray(links, item)) {
-        cJSON_Delete(item);
-        return false;
-    }
-    return true;
-}
-
-static bool csi_internal_link_is_known(const char *internal)
-{
-    if (internal == NULL || internal[0] == '\0') {
-        return false;
-    }
-    for (size_t i = 0; i < sizeof(s_csi_internal_links) / sizeof(s_csi_internal_links[0]); ++i) {
-        if (strcmp(internal, s_csi_internal_links[i]) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static esp_err_t protocol_adapter_add_csi_upload_links(cJSON *links,
-                                                       const csi_fusion_fact_t *fact)
-{
-    if (links == NULL || fact == NULL || fact->active_link_count == 0U) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    for (uint8_t i = 0; i < fact->active_link_count && i < CSI_FUSION_LINK_COUNT; ++i) {
-        const char *internal_link = fact->links[i];
-        if (!csi_internal_link_is_known(internal_link)) {
-            char mapping[48];
-            snprintf(mapping,
-                     sizeof(mapping),
-                     "%s->unknown",
-                     internal_link != NULL && internal_link[0] != '\0' ? internal_link : "-");
-            if (strcmp(s_last_csi_server_link_map[i], mapping) != 0) {
-                printf("CSI_SERVER_LINK_MAP internal_link=%s server_link=unknown reason=unknown_link\n",
-                       internal_link != NULL && internal_link[0] != '\0' ? internal_link : "-");
-                strlcpy(s_last_csi_server_link_map[i],
-                        mapping,
-                        sizeof(s_last_csi_server_link_map[i]));
-            }
-            return ESP_ERR_INVALID_ARG;
-        }
-
-        char server_link[16];
-        int written = snprintf(server_link, sizeof(server_link), "link_%u", (unsigned int)i);
-        if (written <= 0 || (size_t)written >= sizeof(server_link)) {
-            return ESP_ERR_INVALID_SIZE;
-        }
-        char mapping[48];
-        snprintf(mapping, sizeof(mapping), "%s->%s", internal_link, server_link);
-        if (strcmp(s_last_csi_server_link_map[i], mapping) != 0) {
-            printf("CSI_SERVER_LINK_MAP internal_link=%s server_link=%s\n",
-                   internal_link,
-                   server_link);
-            strlcpy(s_last_csi_server_link_map[i],
-                    mapping,
-                    sizeof(s_last_csi_server_link_map[i]));
-        }
-        if (!protocol_adapter_add_csi_link(links, server_link)) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    for (uint8_t i = fact->active_link_count;
-         i < s_last_csi_server_link_count && i < CSI_FUSION_LINK_COUNT;
-         ++i) {
-        s_last_csi_server_link_map[i][0] = '\0';
-    }
-    s_last_csi_server_link_count = fact->active_link_count;
-
-    return ESP_OK;
-}
-
-esp_err_t protocol_adapter_build_csi_event_v2_json(const csi_fusion_fact_t *fact,
-                                                   const csi_fusion_telemetry_t *telemetry,
-                                                   char **out_json)
-{
-    if (out_json == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *out_json = NULL;
-
-    esp_err_t ret = protocol_adapter_validate_csi_event_v2(fact, telemetry);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    cJSON *root = cJSON_CreateObject();
-    if (root == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    if (cJSON_AddStringToObject(root,
-                                ESP111_PROTOCOL_JSON_SCHEMA_VERSION,
-                                ESP111_PROTOCOL_CSI_EVENT_SCHEMA_VERSION_STRING) == NULL ||
-        cJSON_AddStringToObject(root, "trace_id", fact->trace_id) == NULL ||
-        cJSON_AddNumberToObject(root, "tick_id", (double)fact->tick_id) == NULL) {
-        cJSON_Delete(root);
-        return ESP_ERR_NO_MEM;
-    }
-
-    cJSON *links = cJSON_AddArrayToObject(root, "links");
-    if (links == NULL ||
-        cJSON_AddStringToObject(root,
-                                "fused_state",
-                                csi_fusion_state_to_string(fact->fused_state)) == NULL ||
-        cJSON_AddNumberToObject(root, "confidence", fact->confidence) == NULL) {
-        cJSON_Delete(root);
-        return ESP_ERR_NO_MEM;
-    }
-
-    ret = protocol_adapter_add_csi_upload_links(links, fact);
-    if (ret != ESP_OK) {
-        cJSON_Delete(root);
-        return ret;
-    }
-
-    if (cJSON_AddNumberToObject(root, "timestamp_ms", (double)fact->timestamp_ms) == NULL) {
-        cJSON_Delete(root);
-        return ESP_ERR_NO_MEM;
-    }
-
-    *out_json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    return *out_json != NULL ? ESP_OK : ESP_ERR_NO_MEM;
-}
-
 void protocol_adapter_free_json(char *json)
 {
     if (json != NULL) {
@@ -1611,7 +843,6 @@ esp_err_t protocol_adapter_build_ok_response(const char *device_id,
                            (unsigned int)seq);
     return written > 0 && written < (int)out_size ? ESP_OK : ESP_ERR_INVALID_SIZE;
 }
-
 esp_err_t protocol_adapter_build_local_ok_response(uint8_t local_id,
                                                    char *out,
                                                    size_t out_size)

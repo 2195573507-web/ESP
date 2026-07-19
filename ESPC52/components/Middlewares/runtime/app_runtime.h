@@ -2,6 +2,7 @@
 #define APP_RUNTIME_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -35,6 +36,16 @@
 esp_err_t app_runtime_pause_non_voice(const char *reason);
 
 /**
+ * @brief Pause normal HTTP and BME with separate bounded admission and BME waits.
+ *
+ * The resource manager uses this lower-level form to preserve the required
+ * HTTP -> BME quiesce order without changing legacy callers.
+ */
+esp_err_t app_runtime_pause_non_voice_timed(const char *reason,
+                                            uint32_t http_timeout_ms,
+                                            uint32_t bme_timeout_ms);
+
+/**
  * @brief 恢复非语音后台链路。
  *
  * 调用位置：voice_chain 在 Server PCM 播放结束或错误清理后调用。
@@ -42,6 +53,21 @@ esp_err_t app_runtime_pause_non_voice(const char *reason);
  * @return ESP_OK；当前恢复路径不向上抛出硬件错误。
  */
 esp_err_t app_runtime_resume_non_voice(const char *reason);
+
+/**
+ * @brief Resume only BME while retaining the normal-HTTP admission gate.
+ *
+ * Resource release uses this before background workers resume, so no newly
+ * scheduled HTTP request can overlap audio cleanup.
+ */
+esp_err_t app_runtime_resume_non_voice_bme(const char *reason);
+
+/**
+ * @brief Reopen normal HTTP admission after every audio resource is released.
+ *
+ * This is the final step of the ordered C5 resource-manager resume sequence.
+ */
+esp_err_t app_runtime_finish_non_voice_resume(const char *reason);
 
 /** @brief 查询非语音链路是否处于暂停 gate；状态页或调试日志调用。 */
 bool app_runtime_non_voice_is_paused(void);
