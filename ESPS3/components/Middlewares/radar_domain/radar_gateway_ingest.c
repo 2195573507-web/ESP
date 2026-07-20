@@ -32,12 +32,12 @@ typedef struct {
     bool has_sample;
     uint8_t local_id;
     radar_source_id_t source;
+    RadarSourceContext *context;
     uint32_t session_generation;
     uint32_t last_sequence;
     uint64_t last_received_ms;
     uint64_t last_log_ms;
     radar_gateway_sample_t last_sample;
-    radar_spatial_state_t spatial;
     radar_rate_manager_t rate_manager;
     radar_gateway_output_t output;
 } radar_gateway_slot_t;
@@ -333,12 +333,14 @@ static uint32_t track_id_for_target(const radar_spatial_snapshot_t *snapshot,
     for (size_t i = 0U; i < RADAR_TRACKER_MAX_TRACKS; ++i) {
         const radar_track_snapshot_t *track = &snapshot->tracks[i];
         if (!track->active) continue;
-        const uint32_t distance = target_distance_sq(track->x_mm, track->y_mm,
-                                                     target->x_mm, target->y_mm);
+        const uint32_t distance = target_distance_sq(track->filtered_x_mm,
+                                                     track->filtered_y_mm,
+                                                     target->x_mm,
+                                                     target->y_mm);
         if (distance < best_distance) {
             best_distance = distance;
             track_id = track->track_id;
-            is_visible = track->visible;
+            is_visible = track->visible && track->lifecycle == RADAR_TRACK_CONFIRMED;
         }
     }
     if (visible != NULL) *visible = is_visible;
@@ -377,10 +379,10 @@ static void add_zone(radar_gateway_output_t *output,
 static void build_output(radar_gateway_slot_t *slot)
 {
     radar_spatial_snapshot_t snapshot;
-    radar_spatial_state_get_snapshot(&slot->spatial, &snapshot);
+    radar_spatial_state_get_snapshot(slot->context->spatial_state, &snapshot);
     memset(&slot->output, 0, sizeof(slot->output));
     slot->output.local_id = slot->local_id;
-    const char *device_id = radar_registry_device_id(slot->source);
+    const char *device_id = slot->context->device_id;
     if (device_id != NULL) {
         strncpy(slot->output.device_id, device_id, sizeof(slot->output.device_id) - 1U);
     }
@@ -389,14 +391,27 @@ static void build_output(radar_gateway_slot_t *slot)
     slot->output.motion = snapshot.motion_state;
     slot->output.updated_at_ms = slot->last_received_ms;
 
-    for (uint8_t i = 0U; slot->last_sample.sample_valid && i < snapshot.accepted_target_count &&
-                           i < LD2450_MAX_TARGETS; ++i) {
+    slot->output.count_summary = (radar_count_summary_t){
+        .raw_target_count = snapshot.raw_target_count,
+        .accepted_target_count = snapshot.accepted_target_count,
+        .visible_track_count = snapshot.visible_track_count,
+        .confirmed_active_track_count = snapshot.confirmed_active_track_count,
+        .history_target_count = snapshot.history_target_count,
+        .visible_person_count = snapshot.visible_person_count,
+        .retained_person_count = snapshot.retained_person_count,
+        .source_person_count = snapshot.source_person_count,
+        .count_state = snapshot.count_state,
+    };
+
+    for (uint8_t i = 0U; slot->last_sample.sample_valid &&
+                           snapshot.sensor_state == RADAR_SENSOR_VALID &&
+                           i < snapshot.accepted_target_count && i < LD2450_MAX_TARGETS; ++i) {
         const radar_spatial_target_t *target = &snapshot.accepted_targets[i];
         bool visible = false;
         uint8_t confidence = 0U;
         uint8_t zone_id = 0U;
         radar_zone_type_t zone_type = RADAR_ZONE_NONE;
-        (void)radar_zone_map_resolve(&slot->spatial.zone_map,
+        (void)radar_zone_map_resolve(&slot->context->spatial_state->zone_map,
                                      target->x_mm,
                                      target->y_mm,
                                      0U,
@@ -419,25 +434,37 @@ static void build_output(radar_gateway_slot_t *slot)
 
 static void update_rate_and_publish(radar_gateway_slot_t *slot, uint64_t current_ms)
 {
-    if (slot == NULL || slot->source >= RADAR_SOURCE_COUNT) {
+    if (slot == NULL || slot->context == NULL || slot->source >= RADAR_SOURCE_COUNT) {
         return;
     }
     radar_spatial_snapshot_t snapshot;
-    radar_spatial_state_get_snapshot(&slot->spatial, &snapshot);
-    uint8_t retained_track_count = 0U;
-    for (size_t i = 0U; i < RADAR_TRACKER_MAX_TRACKS; ++i) {
-        if (snapshot.tracks[i].active && snapshot.tracks[i].track_id != 0U &&
-            retained_track_count < UINT8_MAX) {
-            ++retained_track_count;
-        }
-    }
+    radar_spatial_state_get_snapshot(slot->context->spatial_state, &snapshot);
+    const uint8_t retained_track_count = snapshot.confirmed_active_track_count;
     (void)radar_rate_manager_update(&slot->rate_manager,
                                     snapshot.accepted_target_count,
                                     snapshot.active_track_count,
                                     retained_track_count,
                                     current_ms);
+    const radar_count_summary_t count_summary = {
+        .raw_target_count = snapshot.raw_target_count,
+        .accepted_target_count = snapshot.accepted_target_count,
+        .visible_track_count = snapshot.visible_track_count,
+        .confirmed_active_track_count = snapshot.confirmed_active_track_count,
+        .history_target_count = snapshot.history_target_count,
+        .visible_person_count = snapshot.visible_person_count,
+        .retained_person_count = snapshot.retained_person_count,
+        .source_person_count = snapshot.source_person_count,
+        .count_state = snapshot.count_state,
+    };
+    radar_source_context_publish(slot->context,
+                                 &snapshot,
+                                 &count_summary,
+                                 slot->last_sample.link_state == 5U &&
+                                     snapshot.sensor_state == RADAR_SENSOR_VALID,
+                                 slot->last_sample.request_sequence,
+                                 snapshot.latest_frame_ms);
 #ifndef RADAR_GATEWAY_HOST_TEST
-    radar_log_manager_publish(slot->source, &snapshot, &slot->rate_manager);
+    radar_log_manager_publish(slot->context, &slot->rate_manager);
 #endif
 }
 
@@ -460,7 +487,7 @@ static radar_presence_state_t legacy_state(const radar_gateway_output_t *output)
 static radar_registry_update_result_t update_registry(radar_gateway_slot_t *slot)
 {
     radar_spatial_snapshot_t spatial;
-    radar_spatial_state_get_snapshot(&slot->spatial, &spatial);
+    radar_spatial_state_get_snapshot(slot->context->spatial_state, &spatial);
     radar_protocol_payload_t payload;
     memset(&payload, 0, sizeof(payload));
     payload.schema_version = RADAR_PROTOCOL_SCHEMA_VERSION;
@@ -489,6 +516,7 @@ static radar_registry_update_result_t update_registry(radar_gateway_slot_t *slot
     bool state_changed = false;
     return radar_registry_update_remote(slot->source,
                                         &payload,
+                                        &slot->output.count_summary,
                                         slot->session_generation,
                                         slot->last_received_ms,
                                         &state_changed);
@@ -531,7 +559,7 @@ radar_gateway_ingest_result_t radar_gateway_ingest_admit(
         slot->has_sample = false;
         slot->last_sequence = 0U;
         slot->last_received_ms = 0U;
-        radar_spatial_state_init(&slot->spatial, NULL, received_at_ms);
+        radar_source_context_reset(slot->context, received_at_ms);
         radar_rate_manager_init(&slot->rate_manager, received_at_ms);
     }
     if (slot->has_sample && sample->request_sequence == slot->last_sequence) {
@@ -548,7 +576,7 @@ radar_gateway_ingest_result_t radar_gateway_ingest_admit(
             return RADAR_GATEWAY_INGEST_SEQUENCE_BACKWARD;
         }
         slot->has_sample = false;
-        radar_spatial_state_init(&slot->spatial, NULL, received_at_ms);
+        radar_source_context_reset(slot->context, received_at_ms);
         radar_rate_manager_init(&slot->rate_manager, received_at_ms);
     }
 
@@ -568,10 +596,12 @@ radar_gateway_ingest_result_t radar_gateway_ingest_admit(
         radar_frame_t frame;
         radar_remote_adapter_build_observation(sample, &frame);
         frame.received_at_ms = received_at_ms;
-        radar_spatial_state_on_frame(&slot->spatial, &frame, true, received_at_ms);
-        radar_spatial_state_poll(&slot->spatial, RADAR_UART_RECOVERY_VALID, received_at_ms);
+        radar_spatial_state_on_frame(slot->context->spatial_state, &frame, true, received_at_ms);
+        radar_spatial_state_poll(slot->context->spatial_state,
+                                 RADAR_UART_RECOVERY_VALID,
+                                 received_at_ms);
     } else {
-        radar_spatial_state_poll(&slot->spatial,
+        radar_spatial_state_poll(slot->context->spatial_state,
                                  sample->link_state == 5U ? RADAR_UART_RECOVERY_WAITING_VALID :
                                                             RADAR_UART_RECOVERY_BACKOFF,
                                  received_at_ms);
@@ -588,9 +618,15 @@ radar_gateway_ingest_result_t radar_gateway_ingest_admit(
     if (slot->last_log_ms == 0U || received_at_ms - slot->last_log_ms >= 1000U) {
         slot->last_log_ms = received_at_ms;
         ESP_LOGI(TAG,
-                 "radar_ingest_ok device_id=%s targets=%u tracking_state=%s presence_state=%s",
+                 "RADAR_RX_FRAME event=ingest source_id=%u source=%s device_id=%s room=%s targets=%u sequence=%lu frame_sequence=%lu timestamp_ms=%llu tracking_state=%s presence_state=%s",
+                 (unsigned int)slot->source,
+                 radar_registry_source_name(slot->source),
                  slot->output.device_id,
+                 radar_registry_room_id(slot->source),
                  (unsigned int)slot->output.target_count,
+                 (unsigned long)slot->last_sample.request_sequence,
+                 (unsigned long)slot->last_sample.frame_seq,
+                 (unsigned long long)slot->last_received_ms,
                  radar_gateway_tracking_name(&slot->output),
                  radar_gateway_occupancy_name(slot->output.occupancy));
     }
@@ -638,7 +674,7 @@ void radar_gateway_ingest_poll(uint64_t current_ms)
         const radar_uart_recovery_state_t state =
             current_ms - slot->last_received_ms > RADAR_GATEWAY_OFFLINE_TIMEOUT_MS
                 ? RADAR_UART_RECOVERY_OFFLINE : RADAR_UART_RECOVERY_VALID;
-        radar_spatial_state_poll(&slot->spatial, state, current_ms);
+        radar_spatial_state_poll(slot->context->spatial_state, state, current_ms);
         update_rate_and_publish(slot, current_ms);
         build_output(slot);
     }
@@ -650,20 +686,36 @@ esp_err_t radar_gateway_ingest_start(void)
     if (s_initialized) return ESP_OK;
 #ifndef RADAR_GATEWAY_HOST_TEST
     s_lock = xSemaphoreCreateMutexStatic(&s_lock_storage);
-    if (s_lock == NULL || !radar_registry_init()) return ESP_ERR_NO_MEM;
+    if (s_lock == NULL) return ESP_ERR_NO_MEM;
+    if (!radar_registry_init()) {
+        s_lock = NULL;
+        return ESP_ERR_NO_MEM;
+    }
 #else
     if (!radar_registry_init()) return ESP_ERR_NO_MEM;
 #endif
+    if (!radar_source_context_init(now_ms())) goto fail;
     memset(s_slots, 0, sizeof(s_slots));
     for (size_t i = 0U; i < RADAR_GATEWAY_MAX_REMOTE_SOURCES; ++i) {
         s_slots[i].local_id = (uint8_t)(i + 1U);
         s_slots[i].source = radar_registry_source_for_local_id((uint8_t)(i + 1U));
-        radar_spatial_state_init(&s_slots[i].spatial, NULL, now_ms());
+        s_slots[i].context = radar_source_context_mutable(s_slots[i].source);
+        if (s_slots[i].context == NULL) goto fail;
+        radar_source_context_reset(s_slots[i].context, now_ms());
         radar_rate_manager_init(&s_slots[i].rate_manager, now_ms());
     }
     s_initialized = true;
-    ESP_LOGI(TAG, "radar_gateway_ingest ready sources=%u", RADAR_GATEWAY_MAX_REMOTE_SOURCES);
+    ESP_LOGI(TAG,
+             "RADAR_SOURCE_STATE event=gateway_ready source_id=255 source=SYSTEM device_id=system room=system sequence=0 sources=%u",
+             RADAR_GATEWAY_MAX_REMOTE_SOURCES);
     return ESP_OK;
+
+fail:
+    memset(s_slots, 0, sizeof(s_slots));
+#ifndef RADAR_GATEWAY_HOST_TEST
+    s_lock = NULL;
+#endif
+    return ESP_ERR_NO_MEM;
 }
 
 const char *radar_gateway_occupancy_name(radar_occupancy_state_t state)

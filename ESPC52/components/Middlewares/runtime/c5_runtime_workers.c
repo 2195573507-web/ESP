@@ -9,6 +9,7 @@
 
 #include "bme_sensor_service.h"
 #include "c5_event_bus.h"
+#include "c5_memory.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -23,6 +24,10 @@ static QueueHandle_t s_bme_worker_queue;
 static QueueHandle_t s_system_worker_queue;
 static TaskHandle_t s_bme_worker_task;
 static TaskHandle_t s_system_worker_task;
+static StackType_t *s_bme_worker_stack;
+static StackType_t *s_system_worker_stack;
+static StaticTask_t s_bme_worker_storage;
+static StaticTask_t s_system_worker_storage;
 static bool s_workers_paused;
 static uint32_t s_worker_active_mask;
 static portMUX_TYPE s_worker_state_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -183,30 +188,53 @@ static esp_err_t create_queue(QueueHandle_t *queue)
 }
 
 static esp_err_t create_task(TaskHandle_t *task,
+                             StackType_t **stack,
+                             StaticTask_t *storage,
                              TaskFunction_t entry,
-                             const char *name)
+                             const char *name,
+                             const char *memory_stage_before,
+                             const char *memory_stage_after,
+                             const char *memory_stage_failed)
 {
-    if (task == NULL || entry == NULL || name == NULL) {
+    if (task == NULL || stack == NULL || storage == NULL || entry == NULL || name == NULL ||
+        memory_stage_before == NULL || memory_stage_after == NULL || memory_stage_failed == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     if (*task != NULL) {
         return ESP_OK;
     }
 
-    BaseType_t created = xTaskCreate(entry,
-                                     name,
-                                     C5_WORKER_TASK_STACK,
-                                     NULL,
-                                     C5_WORKER_TASK_PRIORITY,
-                                     task);
-    if (created != pdPASS) {
-        *task = NULL;
+    c5_mem_log(memory_stage_before);
+    if (*stack == NULL) {
+        *stack = (StackType_t *)c5_mem_alloc(C5_WORKER_TASK_STACK,
+                                             C5_MEM_INTERNAL_CONTROL,
+                                             name);
+    }
+    if (*stack == NULL) {
+        c5_mem_log(memory_stage_failed);
         return ESP_ERR_NO_MEM;
     }
+
+    *task = xTaskCreateStatic(entry,
+                              name,
+                              C5_WORKER_TASK_STACK,
+                              NULL,
+                              C5_WORKER_TASK_PRIORITY,
+                              *stack,
+                              storage);
+    if (*task == NULL) {
+        c5_mem_free(*stack, name);
+        *stack = NULL;
+        c5_mem_log(memory_stage_failed);
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "TASK_CREATE task=%s stack=%u source=internal_static", name,
+             (unsigned int)C5_WORKER_TASK_STACK);
+    c5_mem_log(memory_stage_after);
     return ESP_OK;
 }
 
-esp_err_t c5_runtime_workers_start(void)
+esp_err_t c5_runtime_workers_prepare(void)
 {
     esp_err_t ret = c5_event_bus_init();
     if (ret == ESP_OK) {
@@ -227,11 +255,31 @@ esp_err_t c5_runtime_workers_start(void)
     if (ret == ESP_OK) {
         ret = c5_event_bus_register_handler(C5_EVENT_COMMAND, c5_route_system_event, NULL);
     }
+    return ret;
+}
+
+esp_err_t c5_runtime_workers_start(void)
+{
+    esp_err_t ret = c5_runtime_workers_prepare();
     if (ret == ESP_OK) {
-        ret = create_task(&s_bme_worker_task, bme_worker, "bme_worker");
+        ret = create_task(&s_bme_worker_task,
+                          &s_bme_worker_stack,
+                          &s_bme_worker_storage,
+                          bme_worker,
+                          "bme_worker",
+                          "task_create_before_bme_worker",
+                          "task_create_after_bme_worker",
+                          "task_create_after_bme_worker_failed");
     }
     if (ret == ESP_OK) {
-        ret = create_task(&s_system_worker_task, system_worker, "system_worker");
+        ret = create_task(&s_system_worker_task,
+                          &s_system_worker_stack,
+                          &s_system_worker_storage,
+                          system_worker,
+                          "system_worker",
+                          "task_create_before_system_worker",
+                          "task_create_after_system_worker",
+                          "task_create_after_system_worker_failed");
     }
     if (ret != ESP_OK) {
         return ret;

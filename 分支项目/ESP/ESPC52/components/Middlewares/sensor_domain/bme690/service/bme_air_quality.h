@@ -1,0 +1,81 @@
+#ifndef BME_AIR_QUALITY_H
+#define BME_AIR_QUALITY_H
+
+/**
+ * @file bme_air_quality.h
+ * @brief C5 终端 BME690 空气质量计算接口。
+ *
+ * BME service 在每次 bme690_read() 成功后调用本模块，输出结果随后由
+ * bme_server_client 放入统一设备流 sensor 帧的 v3。
+ */
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "bme690.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define BME_AIR_QUALITY_V2_ALGO_VERSION "c5_bme690_air_quality_v2"
+#define BME_AIR_QUALITY_V3_ALGO_VERSION "c5_bme690_air_quality_v3"
+#define BME_AIR_QUALITY_ALGO_VERSION BME_AIR_QUALITY_V3_ALGO_VERSION
+
+#define AQ_V3_BASELINE_VALID_SAMPLES 30U
+
+typedef struct {
+    const char *algorithm;
+    int score;
+    const char *level;
+    float confidence;
+    float gas_ratio;
+    float stability_score;
+    const char *sensor_state;
+    bool baseline_ready;
+    uint64_t baseline_created_time_ms;
+    uint64_t baseline_update_time_ms;
+} bme_air_quality_v3_output_t;
+
+typedef struct {
+    int air_quality_score;
+    const char *air_quality_level;
+    const char *air_quality_confidence;
+    const char *air_quality_algo_version;
+    const char *air_quality_source;
+    float gas_baseline_ohm;
+    float gas_ratio;
+    int gas_score;
+    int humidity_score;
+    bool baseline_ready;
+    bool warmup_done;
+    uint32_t sample_count;
+    bme_air_quality_v3_output_t air_quality;
+} bme_air_quality_result_t;
+
+/** @brief 重置 baseline 和样本计数；调试/重新开始采样时调用。 */
+void bme_air_quality_reset(void);
+
+/** @brief 启动时恢复已校验的 BME690 v3 baseline；无效或缺失时正常重新学习。 */
+void bme_air_quality_init(void);
+/**
+ * @brief 根据一次 BME690 读数更新空气质量估算。
+ *
+ * 调用位置：bme_sensor_service_tick() 每轮 bme690_read() 成功后。
+ * @param data BME690 物理量读数，不能为空。
+ * @param out_result 输出空气质量结果，不能为空。
+ * @return ESP_OK 表示计算完成；参数为空或 gas 数据无效返回错误码。
+ * 失败处理：BME service 记录日志并跳过本轮上传，下个周期重试。
+ */
+esp_err_t bme_air_quality_update(const bme690_data_t *data,
+                                 bme_air_quality_result_t *out_result);
+
+/** @brief 保留的 v2 相对空气质量计算入口；新代码默认调用 v3。 */
+esp_err_t bme_air_quality_update_v2(const bme690_data_t *data,
+                                    bme_air_quality_result_t *out_result);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* BME_AIR_QUALITY_H */

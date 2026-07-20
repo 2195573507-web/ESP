@@ -309,6 +309,11 @@ bool local_wake_word_should_record_after_vad_start(void)
 esp_err_t local_wake_word_on_local_wake_detected(void)
 {
     portENTER_CRITICAL(&s_wake_lock);
+    if (s_ack_active) {
+        portEXIT_CRITICAL(&s_wake_lock);
+        ESP_LOGW(TAG, "WAKE_ACK_PLAYBACK_REJECTED reason=already_active");
+        return ESP_ERR_INVALID_STATE;
+    }
     s_recording_window_open = false;
     s_ack_active = true;
     s_record_after_tick = 0;

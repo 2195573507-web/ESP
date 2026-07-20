@@ -66,6 +66,17 @@
 #define RADAR_CONFIG_UART_RX_TASK_STACK 4096
 #define RADAR_CONFIG_UART_RX_TASK_PRIORITY 5
 
+/* Every PSRAM-backed radar allocation admits against both aggregate free
+ * capacity and the largest contiguous block.  Keep a small fixed margin for
+ * allocator metadata and the next bounded workspace instead of accepting an
+ * allocation that leaves the module unable to recover. */
+#define RADAR_CONFIG_PSRAM_ALLOCATION_HEADROOM_BYTES 4096U
+#define RADAR_CONFIG_TASK_STOP_TIMEOUT_MS 500U
+/* UART driver owns an internal RX ring/event queue.  Reject a new driver
+ * instance when fragmentation cannot leave a safe bounded control margin. */
+#define RADAR_CONFIG_UART_INTERNAL_MIN_FREE_BYTES 12288U
+#define RADAR_CONFIG_UART_INTERNAL_MIN_LARGEST_BYTES 4096U
+
 /* --------------------------- UART 恢复策略 --------------------------- */
 
 /* 连续达到错误次数后停止读取并进入退避重连。 */
@@ -137,14 +148,32 @@
 #define RADAR_CONFIG_MOTION_EXIT_FRAMES 8U
 #define RADAR_CONFIG_TARGET_JUMP_MAX_MM 1500U
 
+/* --------------------------- Person continuity -------------------------- */
+
+/* These parameters only govern short-term business continuity.  They do not
+ * turn a LD2450 slot or a motion track into a persistent human identity. */
+#define RADAR_CONFIG_PERSON_STILL_HOLD_MS 3000U
+#define RADAR_CONFIG_PERSON_DORMANT_TIMEOUT_MS 12000U
+#define RADAR_CONFIG_PERSON_REACQUIRE_GATE_MM 2000U
+#define RADAR_CONFIG_PERSON_SAME_ZONE_BONUS_MM 250U
+#define RADAR_CONFIG_PERSON_ADJACENT_ZONE_ALLOW 1
+#define RADAR_CONFIG_PERSON_NEW_CONFIRM_FRAMES 2U
+#define RADAR_CONFIG_PERSON_NEW_NEAR_DORMANT_CONFIRM_FRAMES 3U
+/* Keep short prediction bounded: velocity starts to decay after 400 ms and
+ * reaches zero after another 600 ms. */
+#define RADAR_CONFIG_PERSON_VELOCITY_DECAY_START_MS 400U
+#define RADAR_CONFIG_PERSON_VELOCITY_DECAY_MS 600U
+
 /* --------------------------- S3 任务与诊断 --------------------------- */
 
 #define RADAR_CONFIG_LOCAL_ADAPTER_POLL_MS 20U
 #define RADAR_CONFIG_LOCAL_ADAPTER_TASK_STACK 8192U
 #define RADAR_CONFIG_LOCAL_ADAPTER_TASK_PRIORITY 3U
-#define RADAR_CONFIG_DIAGNOSTICS_TASK_STACK 4096U
+#define RADAR_CONFIG_DIAGNOSTICS_TASK_STACK 6144U
 #define RADAR_CONFIG_DIAGNOSTICS_TASK_PRIORITY 2U
 #define RADAR_CONFIG_DIAGNOSTICS_POLL_MS 250U
 #define RADAR_CONFIG_DIAGNOSTICS_LOG_MS 500U
+#define RADAR_CONFIG_LOG_TASK_STACK 6144U
+#define RADAR_CONFIG_LOG_TASK_PRIORITY 1U
 
 #endif

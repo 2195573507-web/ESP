@@ -1,0 +1,63 @@
+{
+  "fixture_version": 1,
+  "provider": "volcengine",
+  "description": "Synthetic realtime TTS event sequence. All text and PCM bytes are artificial; no URL, credential, device id, user text, or provider response is included.",
+  "expected_pcm_base64": "AQACAAMABAAFAAYA",
+  "events": [
+    {
+      "at_ms": 0,
+      "payload": {
+        "type": "tts_session.updated"
+      }
+    },
+    {
+      "at_ms": 8,
+      "payload": {
+        "type": "response.audio.delta",
+        "delta": "AQACAA=="
+      }
+    },
+    {
+      "at_ms": 13,
+      "payload": {
+        "type": "response.audio.delta",
+        "audio_base64": "AwA="
+      }
+    },
+    {
+      "at_ms": 18,
+      "payload": {
+        "type": "response.audio.delta",
+        "pcm_base64": "BAA="
+      }
+    },
+    {
+      "at_ms": 23,
+      "payload": {
+        "type": "response.audio.delta",
+        "audio": "BQA="
+      }
+    },
+    {
+      "at_ms": 28,
+      "payload": {
+        "type": "response.audio.delta",
+        "nested": {
+          "data": "BgA="
+        }
+      }
+    },
+    {
+      "at_ms": 31,
+      "payload": {
+        "type": "provider.keepalive"
+      }
+    },
+    {
+      "at_ms": 40,
+      "payload": {
+        "type": "response.audio.done"
+      }
+    }
+  ]
+}

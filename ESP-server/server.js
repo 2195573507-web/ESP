@@ -7,8 +7,7 @@ const {
 } = require("./server-time-sync/timeSync");
 const {
     createDatabase,
-    createDbHelpers,
-    configureDatabase
+    createDbHelpers
 } = require("./src/db/sqlite");
 const {
     ensureRecordTables
@@ -50,6 +49,18 @@ const {
     ensureVoiceTurnsTable
 } = require("./src/db/voiceTurns");
 const {
+    ensureHomeLocationTables
+} = require("./src/db/homeLocation");
+const {
+    ensureWeatherContextTables
+} = require("./src/db/weatherContext");
+const {
+    ensureHabitRulesTables
+} = require("./src/db/habitRules");
+const {
+    ensureHabitEventsTables
+} = require("./src/db/habitEvents");
+const {
     createCommandRouter
 } = require("./src/routes/commandRoutes");
 const {
@@ -86,45 +97,36 @@ const {
     createUserDataRouter
 } = require("./src/routes/userDataRoutes");
 const {
+    createSettingsRouter
+} = require("./src/routes/settingsRoutes");
+const {
+    createHabitRulesRouter
+} = require("./src/routes/habitRulesRoutes");
+const {
+    createHabitEventsRouter
+} = require("./src/routes/habitEventsRoutes");
+const {
+    createWeatherContextRouter
+} = require("./src/routes/weatherContextRoutes");
+const {
+    ensureDefaultHabitRules
+} = require("./src/services/habitRulesService");
+const {
+    readWeatherConfig
+} = require("./src/agent/weatherQuery");
+const {
     createVoiceBodyParserErrorHandler,
     createVoiceRouter
 } = require("./src/routes/voiceRoutes");
 const {
     recordEvent
 } = require("./src/services/eventLogService");
-const runtimeStateCache = require("./src/services/runtimeStateCache");
-const {
-    createPersistenceWorker
-} = require("./src/services/persistenceWorker");
 
 const app = express();
 
 // 数据库连接
 const db = createDatabase(__dirname);
 const { dbRun, dbAll } = createDbHelpers(db);
-const persistenceWorker = createPersistenceWorker({
-    dbRun,
-    logger: console
-});
-
-app.use((req, res, next) => {
-    const startNs = process.hrtime.bigint();
-    res.on("finish", () => {
-        if (!isMachineApiPath(req.path)) {
-            return;
-        }
-
-        const durationMs = Number(process.hrtime.bigint() - startNs) / 1e6;
-        const roundedDurationMs = Math.round(durationMs * 100) / 100;
-        const line = `[API_LATENCY] path=${req.path} method=${req.method} status=${res.statusCode} duration_ms=${roundedDurationMs}`;
-        if (roundedDurationMs > 500) {
-            console.warn(line);
-        } else {
-            console.info(line);
-        }
-    });
-    next();
-});
 
 app.use(createVoiceRouter({ dbRun, dbAll }));
 app.use(express.json());
@@ -154,23 +156,17 @@ app.get("/dashboard", (req, res) => {
 app.use(createLlmTextRouter({ dbRun, dbAll }));
 app.use(createStructuredLlmRouter({ dbRun, dbAll }));
 app.use(createCommandRouter({ dbRun, dbAll }));
-app.use(createDeviceRouter({
-    dbRun,
-    dbAll,
-    persistenceWorker,
-    runtimeCache: runtimeStateCache
-}));
-app.use("/api/dashboard/v1", createDashboardRouter({
-    dbRun,
-    dbAll,
-    persistenceWorker,
-    runtimeCache: runtimeStateCache
-}));
+app.use(createDeviceRouter({ dbRun, dbAll }));
+app.use("/api/dashboard/v1", createDashboardRouter({ dbRun, dbAll }));
 app.use(createSmartHomeRouter({ dbRun, dbAll }));
 app.use(createEventRouter({ dbRun, dbAll }));
 app.use(createMemoryRouter({ dbRun, dbAll }));
 app.use(createAgentStateRouter({ dbRun, dbAll }));
 app.use(createUserDataRouter({ dbRun, dbAll }));
+app.use(createSettingsRouter({ dbRun, dbAll }));
+app.use(createHabitRulesRouter({ dbRun, dbAll }));
+app.use(createHabitEventsRouter({ dbRun, dbAll }));
+app.use(createWeatherContextRouter({ dbRun, dbAll }));
 app.use(createRecordRouter({ db }));
 app.use(createSensorRouter({ db, dbRun, dbAll }));
 
@@ -185,9 +181,21 @@ function isMachineApiPath(pathname) {
         pathname === "/asr" ||
         pathname.startsWith("/asr/") ||
         pathname === "/llm" ||
-        pathname.startsWith("/llm/") ||
-        pathname === "/kernel" ||
-        pathname.startsWith("/kernel/");
+        pathname.startsWith("/llm/");
+}
+
+function getDashboardHashPage(pathname) {
+    let decodedPathname;
+    try {
+        decodedPathname = decodeURIComponent(pathname);
+    } catch (_) {
+        return null;
+    }
+
+    const page = decodedPathname.replace(/^\/#?/, "");
+    return ["s3", "c51", "c52", "settings", "habit-rules"].includes(page)
+        ? page
+        : null;
 }
 
 app.use((req, res, next) => {
@@ -199,6 +207,21 @@ app.use((req, res, next) => {
         ok: false,
         error: "Not found"
     });
+});
+
+// The dashboard is hash-routed. Normalize direct or proxy-encoded hash paths to
+// the canonical fragment URL, then serve the shell for other SPA paths.
+app.use((req, res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        return next();
+    }
+
+    const page = getDashboardHashPage(req.path);
+    if (page) {
+        return res.redirect(`/#${page}`);
+    }
+
+    return res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
 app.use((err, req, res, next) => {
@@ -258,16 +281,11 @@ async function shutdown(signal) {
     shuttingDown = true;
     console.log(`[server] shutting down signal=${signal}`);
     await closeHttpServer();
-    await persistenceWorker.stop({
-        drain: true
-    });
     await closeDatabase();
     process.exit(0);
 }
 
 async function startServer() {
-    await configureDatabase(dbRun);
-    runtimeStateCache.initRuntimeStateCache();
     await ensureRecordTables(dbRun, dbAll);
     await ensureSensorTimingColumns(dbRun, dbAll);
     await ensureDeviceStatusTables(dbRun, dbAll);
@@ -281,6 +299,12 @@ async function startServer() {
     await ensureMemoryTables(dbRun, dbAll);
     await ensureAgentStateTables(dbRun, dbAll);
     await ensureUserDataDeletionTables(dbRun, dbAll);
+    await ensureHomeLocationTables(dbRun, dbAll);
+    await ensureWeatherContextTables(dbRun);
+    await ensureHabitRulesTables(dbRun);
+    await ensureHabitEventsTables(dbRun);
+    await ensureDefaultHabitRules(dbRun, dbAll);
+    readWeatherConfig(console);
     await recordEvent(dbRun, {
         event_type: "system",
         event_name: "system_log_created",
@@ -300,13 +324,16 @@ async function startServer() {
                 "smart_home",
                 "memory",
                 "agent_state",
-                "user_data_deletion"
+                "user_data_deletion",
+                "home_location",
+                "weather_context",
+                "habit_rules",
+                "habit_events"
             ]
         },
         source: "server_startup",
         server_recv_ms: Date.now()
     });
-    persistenceWorker.start();
 
     httpServer = app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);

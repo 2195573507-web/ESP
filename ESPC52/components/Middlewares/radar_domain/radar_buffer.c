@@ -24,7 +24,9 @@ esp_err_t radar_buffer_init(radar_buffer_t *buffer)
 void radar_buffer_deinit(radar_buffer_t *buffer)
 {
     if (buffer == NULL) return;
-    radar_memory_free(buffer->frames, "raw_ring");
+    radar_memory_free(buffer->frames,
+                      sizeof(radar_raw_frame_t) * RADAR_RAW_RING_CAPACITY,
+                      "raw_ring");
     memset(buffer, 0, sizeof(*buffer));
 }
 

@@ -718,7 +718,7 @@ static esp_err_t system_server_client_execute_command(system_server_client_scrat
 
         int ttl_ms = system_server_client_normalize_ttl_ms(command->ttl_ms);
         esp_err_t ret = screen_service_show_text("Gateway", command->text, ttl_ms);
-        if (ret != ESP_OK) {
+        if (ret != ESP_OK && ret != ESP_ERR_NOT_FINISHED) {
             return system_server_client_post_ack(scratch,
                                                 command->command_id,
                                                 command->seq,
@@ -728,10 +728,11 @@ static esp_err_t system_server_client_execute_command(system_server_client_scrat
         }
 
         ESP_LOGI(TAG,
-                 "display command applied id=%s text_len=%u ttl_ms=%d",
+                 "display command accepted id=%s text_len=%u ttl_ms=%d lcd_ready=%u",
                  command->command_id,
                  (unsigned int)strlen(command->text),
-                 ttl_ms);
+                 ttl_ms,
+                 ret == ESP_OK ? 1U : 0U);
         return system_server_client_post_ack(scratch,
                                              command->command_id,
                                              command->seq,

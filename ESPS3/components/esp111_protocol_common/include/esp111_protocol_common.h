@@ -166,6 +166,7 @@ extern "C" {
 #define ESP111_PROTOCOL_SERVER_ROUTE_GATEWAY_STATE "/api/device/v1/gateway-state"
 #define ESP111_PROTOCOL_SERVER_ROUTE_LOGS_SYSTEM "/api/logs/v1/system"
 #define ESP111_PROTOCOL_SERVER_ROUTE_LOGS_ALARMS "/api/logs/v1/alarms"
+#define ESP111_PROTOCOL_SERVER_ROUTE_WEATHER_REFRESH "/api/weather/v1/refresh"
 #define ESP111_PROTOCOL_SERVER_ROUTE_VOICE_TURN "/api/voice/turn"
 #define ESP111_PROTOCOL_SERVER_ROUTE_SMART_HOME_PENDING "/api/smart-home/v1/commands/pending"
 #define ESP111_PROTOCOL_SERVER_ROUTE_SMART_HOME_COMMANDS_PREFIX "/api/smart-home/v1/commands/"

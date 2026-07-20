@@ -22,56 +22,15 @@ function quoteIdentifier(identifier) {
 }
 
 async function ensureTableColumns(dbRun, dbAll, tableName, columns) {
-    let existingRows;
-    try {
-        existingRows = await dbAll(`PRAGMA table_info(${quoteIdentifier(tableName)})`);
-    } catch (error) {
-        throw migrationError(tableName, "PRAGMA table_info", error);
-    }
+    const existingRows = await dbAll(`PRAGMA table_info(${quoteIdentifier(tableName)})`);
     const existingNames = new Set(existingRows.map(column => column.name));
 
     for (const column of columns) {
         if (!existingNames.has(column.name)) {
-            try {
-                await dbRun(`ALTER TABLE ${quoteIdentifier(tableName)} ADD COLUMN ${quoteIdentifier(column.name)} ${column.addType || normalizeAddColumnType(column.type)}`);
-                existingNames.add(column.name);
-            } catch (error) {
-                // A concurrent or interrupted deployment can leave the column in
-                // place after our initial PRAGMA. Treat only that proven state as
-                // idempotent; every other SQLite error must stop migration.
-                let refreshedRows;
-                try {
-                    refreshedRows = await dbAll(`PRAGMA table_info(${quoteIdentifier(tableName)})`);
-                } catch (pragmaError) {
-                    throw migrationError(tableName, column.name, pragmaError, error);
-                }
-                if (refreshedRows.some(existing => existing.name === column.name)) {
-                    existingNames.add(column.name);
-                    continue;
-                }
-                throw migrationError(tableName, column.name, error);
-            }
+            await dbRun(`ALTER TABLE ${quoteIdentifier(tableName)} ADD COLUMN ${quoteIdentifier(column.name)} ${column.addType || normalizeAddColumnType(column.type)}`);
+            existingNames.add(column.name);
         }
     }
-
-    let verifiedRows;
-    try {
-        verifiedRows = await dbAll(`PRAGMA table_info(${quoteIdentifier(tableName)})`);
-    } catch (error) {
-        throw migrationError(tableName, "PRAGMA table_info verification", error);
-    }
-    const verifiedNames = new Set(verifiedRows.map(column => column.name));
-    for (const column of columns) {
-        if (!verifiedNames.has(column.name)) {
-            throw new Error(`[db:migration] table=${tableName} column=${column.name} SQLite error: column missing after ensure`);
-        }
-    }
-}
-
-function migrationError(tableName, columnName, error, originalError = null) {
-    const sqliteMessage = error?.message || String(error);
-    const suffix = originalError ? `; original SQLite error: ${originalError?.message || originalError}` : "";
-    return new Error(`[db:migration] table=${tableName} column=${columnName} SQLite error: ${sqliteMessage}${suffix}`);
 }
 
 async function tableHasUniqueIndex(dbAll, tableName, columns) {

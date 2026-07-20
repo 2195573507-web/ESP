@@ -7,12 +7,6 @@
     const DISCONNECTED_TEXT = "未连接";
     const SENSOR_EMPTY_TEXT = "--";
     const TARGET_DEVICE_IDS = ["C51", "C52"];
-    const DEVICE_ID_ALIASES = {
-        C51: "C51",
-        SENSAIR_SHUTTLE_01: "C51",
-        C52: "C52",
-        SENSAIR_SHUTTLE_02: "C52"
-    };
     const DEVICE_DISPLAY_NAMES = {
         C51: "卧室（C51）",
         C52: "客厅（C52）"
@@ -46,7 +40,6 @@
     }
 
     function toNumberOrNull(value) {
-        if (value === null || value === undefined || value === "") return null;
         const numeric = Number(value);
         return Number.isFinite(numeric) ? numeric : null;
     }
@@ -131,12 +124,13 @@
         return data || null;
     }
 
-    async function fetchLatestSensor(deviceId = "") {
-        const response = await fetch(buildUrl("/api/dashboard/v1/sensors/latest", { device_id: deviceId }), { cache: "no-store" });
+    async function fetchCommandHistory() {
+        const response = await fetch("/api/commands/history?limit=20", { cache: "no-store" });
         if (!response.ok) {
             throw new Error(`${response.status}`);
         }
-        return unwrapEnvelope(await response.json());
+        const data = unwrapEnvelope(await response.json());
+        return Array.isArray(data?.commands) ? data.commands : [];
     }
 
     async function fetchAlarmLogs() {
@@ -146,6 +140,31 @@
         }
         const data = unwrapEnvelope(await response.json());
         return Array.isArray(data?.events) ? data.events : [];
+    }
+
+    async function fetchListEndpoint(path, keys = []) {
+        const response = await fetch(path, { cache: "no-store" });
+        if (!response.ok) {
+            throw new Error(`${response.status}`);
+        }
+        const data = unwrapEnvelope(await response.json());
+        if (Array.isArray(data)) return data;
+        if (!isPlainObject(data)) return [];
+        for (const key of keys) {
+            if (Array.isArray(data[key])) return data[key];
+        }
+        return [];
+    }
+
+    async function fetchSystemEvents() {
+        const results = await Promise.allSettled([
+            fetchListEndpoint("/api/logs/v1/system?limit=20", ["logs", "system_logs", "events", "records"]),
+            fetchListEndpoint("/api/voice/v1/events?limit=20", ["events", "logs", "records"]),
+            fetchCommandHistory(),
+            fetchListEndpoint("/api/logs/v1/alarms?limit=20", ["alarms", "logs", "events"]),
+            fetchAlarmLogs()
+        ]);
+        return results.flatMap(result => result.status === "fulfilled" ? result.value : []);
     }
 
     function getStatusClass(status) {
@@ -216,32 +235,157 @@
         if (/air|aqi|quality|空气/.test(text)) return "空气质量报警";
         if (/temp|temperature|温度|hot|heat/.test(text)) return "温度过高";
         if (/humid|humidity|湿度/.test(text)) return "湿度异常";
+        if (/pressure|气压/.test(text)) return "气压异常";
         if (/offline|disconnect|离线|设备/.test(text)) return "设备离线";
         return "报警";
     }
 
-    function isPressureAlarmText(type = "", message = "") {
-        return /pressure|气压/.test(`${type || ""} ${message || ""}`.toLowerCase());
+    function getCommandActionText(command, status) {
+        const text = String(command || "").toLowerCase();
+        const statusText = String(status || "").toLowerCase();
+        if (["failed", "error", "danger", "unavailable"].includes(statusText)) return "命令执行失败";
+        if (/turn_on|\.on|open|enable/.test(text)) return "已开启";
+        if (/turn_off|\.off|close|disable/.test(text)) return "已关闭";
+        if (/set_temperature/.test(text)) return "温度已调整";
+        if (["completed", "success", "resolved"].includes(statusText)) return "命令执行成功";
+        if (["queued", "pending", "dispatched", "received"].includes(statusText)) return "命令处理中";
+        return "命令记录已更新";
+    }
+
+    function getCommandTargetLabel(command, record, payload) {
+        const commandText = String(command || "").toLowerCase();
+        const targetText = String(record.target || record.device_name || payload.target || payload.device_name || "").trim();
+        if (targetText && !looksInternalText(targetText)) return targetText;
+        const match = applianceSlots.find(slot => commandText.includes(slot.key) || commandText.includes(slot.key.replace("_", "")));
+        return match?.label || "设备";
+    }
+
+    function humanizeCommandEvent(command, record, payload) {
+        const action = getCommandActionText(command, record.status || payload.status);
+        if (action === "命令执行成功" || action === "命令执行失败" || action === "命令处理中" || action === "命令记录已更新") {
+            return action;
+        }
+        return `${getCommandTargetLabel(command, record, payload)}${action}`;
+    }
+
+    function getRecordTime(record) {
+        if (!isPlainObject(record)) return null;
+        const payload = isPlainObject(record.payload) ? record.payload : {};
+        return parseTimestamp(
+            record.created_at ||
+            record.updated_at ||
+            record.timestamp ||
+            record.completed_at ||
+            record.time ||
+            payload.created_at ||
+            payload.timestamp
+        );
+    }
+
+    function normalizeSystemEvent(record) {
+        const item = isPlainObject(record) ? record : {};
+        const payload = isPlainObject(item.payload) ? item.payload : {};
+        const command = item.command || item.name || item.command_id || payload.command;
+        const eventType = item.event_type || item.type || payload.event_type || payload.type || "";
+        const message = item.message ||
+            item.content ||
+            item.text ||
+            item.local_action ||
+            payload.message ||
+            payload.summary ||
+            payload.description ||
+            payload.text ||
+            "";
+        const time = getRecordTime(item);
+        const combined = `${eventType} ${item.source || ""} ${item.module || ""} ${payload.source || ""} ${payload.module || ""} ${message}`.toLowerCase();
+        const deviceName = friendlyDeviceName(item.device_id || payload.device_id || "");
+        let event = null;
+        if (command) {
+            event = {
+                icon: "💡",
+                type: "设备控制",
+                description: humanizeCommandEvent(command, item, payload)
+            };
+        } else if (/voice|asr|语音/.test(combined) || item.asr_text || payload.asr_text) {
+            const speechText = cleanDisplayText(item.asr_text || payload.asr_text || message, "");
+            event = {
+                icon: "🎤",
+                type: "语音命令",
+                description: speechText ? `收到语音命令：${speechText}` : "收到语音命令"
+            };
+        } else if (/llm|ai|response|回复|分析/.test(combined) || item.response || payload.response) {
+            event = {
+                icon: "🤖",
+                type: "AI 分析",
+                description: "AI 已完成分析"
+            };
+        } else if (/alarm|warning|critical|报警/.test(combined)) {
+            event = {
+                icon: "⚠",
+                type: "报警",
+                description: humanizeAlarmType(eventType, message)
+            };
+        } else if (/wifi|sta_connected|network/.test(combined)) {
+            event = {
+                icon: "📶",
+                type: "网络状态",
+                description: "WiFi 已重新连接"
+            };
+        } else if (/mqtt|cloud|server_available/.test(combined)) {
+            event = {
+                icon: "☁",
+                type: "云端连接",
+                description: /disconnect|offline|failed|未连接|异常/.test(combined) ? "云端连接异常" : "云端连接恢复"
+            };
+        } else if (/gateway|dashboard_snapshot|网关/.test(combined)) {
+            event = {
+                icon: "📡",
+                type: "网关状态",
+                description: /disconnect|offline|failed|离线/.test(combined) ? "设备离线" : "网关重新连接"
+            };
+        } else if (/sensor|bme|temperature|humidity|pressure|air_quality|环境/.test(combined) || item.device_id || payload.device_id) {
+            event = {
+                icon: "🌡️",
+                type: "环境数据",
+                description: `${deviceName.replace(/\s+/g, "")}环境数据更新`
+            };
+        }
+        if (!event) return null;
+        return {
+            timestamp: time,
+            icon: event.icon,
+            type: event.type,
+            description: event.description,
+            detail: event.description
+        };
+    }
+
+    function normalizeSystemEvents(records) {
+        return (Array.isArray(records) ? records : [])
+            .map(normalizeSystemEvent)
+            .filter(event => event && (event.timestamp || event.description))
+            .sort((a, b) => {
+                const aTime = a.timestamp ? a.timestamp.getTime() : 0;
+                const bTime = b.timestamp ? b.timestamp.getTime() : 0;
+                return bTime - aTime;
+            })
+            .slice(0, 20);
     }
 
     function normalizeGateway(rawGateway, deviceStatus = null) {
         const gateway = isPlainObject(rawGateway) ? rawGateway : {};
         const hasDeviceStatus = Boolean(deviceStatus?._hasData);
         const hasGatewaySnapshot = gateway.last_error !== "no_gateway_snapshot";
-        const online = typeof gateway.online === "boolean"
-            ? gateway.online
-            : (typeof gateway.onlin === "boolean" ? gateway.onlin : null);
+        const online = hasGatewaySnapshot && typeof gateway.online === "boolean" ? gateway.online : null;
         const cloudConnected = hasGatewaySnapshot && typeof gateway.cloud_connected === "boolean"
             ? gateway.cloud_connected
-            : (typeof gateway.server_available === "boolean"
-                ? gateway.server_available
-                : (hasGatewaySnapshot && typeof deviceStatus?.online === "boolean" ? deviceStatus.online : null));
+            : (hasGatewaySnapshot && typeof gateway.server_available === "boolean" ? gateway.server_available : null);
         const latency = Number.isFinite(Number(gateway.latency_ms))
             ? Number(gateway.latency_ms)
             : (hasDeviceStatus && Number.isFinite(Number(deviceStatus?.latest_upload_delay_ms)) ? Number(deviceStatus.latest_upload_delay_ms) : null);
-        const localDegraded = typeof gateway.local_degraded === "boolean"
+        const localDegraded = hasGatewaySnapshot && typeof gateway.local_degraded === "boolean"
             ? gateway.local_degraded
-            : (typeof gateway.server_available === "boolean"
+            : (hasGatewaySnapshot && typeof gateway.server_available === "boolean"
                 ? !gateway.server_available
                 : (hasDeviceStatus && typeof deviceStatus?.time_synced === "boolean" ? !deviceStatus.time_synced : null));
         return {
@@ -275,9 +419,7 @@
             online: typeof status.online === "boolean"
                 ? status.online
                 : (typeof status.device_online === "boolean" ? status.device_online : null),
-            device_online: typeof status.device_online === "boolean"
-                ? status.device_online
-                : (typeof status.online === "boolean" ? status.online : null),
+            device_online: typeof status.device_online === "boolean" ? status.device_online : null,
             latest_upload_delay_ms: latestUploadDelay,
             last_seen_ms: lastSeenMs,
             last_seen_age_ms: lastSeenAgeMs,
@@ -286,61 +428,22 @@
         };
     }
 
-    function pickFirstValue(source, keys) {
-        if (!isPlainObject(source)) return undefined;
-        const key = keys.find(item => source[item] !== undefined && source[item] !== null && source[item] !== "");
-        return key ? source[key] : undefined;
-    }
-
-    function getTimestampValue(source) {
-        return pickFirstValue(source, [
-            "timestamp",
-            "created_at",
-            "createdAt",
-            "updated_at",
-            "updatedAt",
-            "last_seen",
-            "lastSeen",
-            "last_seen_ms",
-            "lastSeenMs",
-            "received_at",
-            "receivedAt",
-            "upload_time",
-            "uploadTime",
-            "time"
-        ]);
-    }
-
-    function normalizeSensors(rawSensors, rawDevice = {}) {
+    function normalizeSensors(rawSensors) {
         const sensors = isPlainObject(rawSensors) ? rawSensors : {};
-        const device = isPlainObject(rawDevice) ? rawDevice : {};
         const airQualityObject = isPlainObject(sensors.air_quality) ? sensors.air_quality : {};
-        const topLevelAirQualityObject = isPlainObject(device.air_quality) ? device.air_quality : {};
-        const airQualityScore = toNumberOrNull(
-            sensors.air_quality_score ??
-            airQualityObject.air_quality_score ??
-            device.air_quality_score ??
-            topLevelAirQualityObject.air_quality_score ??
-            sensors.air ??
-            device.air
-        );
+        const airQualityScore = toNumberOrNull(sensors.air_quality_score ?? airQualityObject.air_quality_score);
         const airQualityLevel = sensors.air_quality_level ??
             sensors.air_quality_label ??
             airQualityObject.air_quality_level ??
             airQualityObject.level ??
-            device.air_quality_level ??
-            device.air_quality_label ??
-            topLevelAirQualityObject.air_quality_level ??
-            topLevelAirQualityObject.level ??
             "";
-        const result = {
-            temperature: toNumberOrNull(sensors.temperature ?? sensors.temperature_c ?? sensors.temp ?? device.temperature ?? device.temperature_c ?? device.temp),
-            humidity: toNumberOrNull(sensors.humidity ?? sensors.humidity_percent ?? device.humidity ?? device.humidity_percent),
-            pressure: toNumberOrNull(sensors.pressure ?? sensors.pressure_hpa ?? device.pressure ?? device.pressure_hpa),
+        return {
+            temperature: toNumberOrNull(sensors.temperature ?? sensors.temperature_c),
+            humidity: toNumberOrNull(sensors.humidity ?? sensors.humidity_percent),
+            pressure: toNumberOrNull(sensors.pressure ?? sensors.pressure_hpa),
             air_quality_score: airQualityScore,
             air_quality_level: airQualityLevel ? String(airQualityLevel) : ""
         };
-        return result;
     }
 
     function hasSensorValues(sensors) {
@@ -370,11 +473,10 @@
         const deviceId = device.device_id || device.id || "";
         const displayName = getDeviceDisplayName(deviceId);
         const roomName = getDeviceRoomName(deviceId);
-        const sensors = normalizeSensors(device.sensors, device);
+        const sensors = normalizeSensors(device.sensors);
         const appliances = normalizeAppliances(device.appliances);
         const occupancy = isPlainObject(device.occupancy) ? device.occupancy : null;
         const rawRoom = device.room_name || device.room || "";
-        const timestamp = getTimestampValue(device);
         const hasIdentityData = Boolean(
             device.name ||
             device.alias ||
@@ -392,7 +494,7 @@
             name: displayName || cleanDisplayText(device.name || deviceId, UNKNOWN_TEXT),
             room: roomName || (rawRoom && rawRoom !== "unassigned" ? cleanDisplayText(rawRoom, "未分配") : "未分配"),
             online: hasDeviceEvidence && typeof device.online === "boolean" ? device.online : null,
-            timestamp: hasDeviceEvidence ? timestamp : null,
+            timestamp: hasDeviceEvidence ? device.timestamp : null,
             sensors,
             occupancy: hasOccupancyData ? occupancy : null,
             appliances
@@ -400,8 +502,7 @@
     }
 
     function normalizeDeviceId(value) {
-        const id = String(value || "").trim().toUpperCase();
-        return DEVICE_ID_ALIASES[id] || id;
+        return String(value || "").trim().toUpperCase();
     }
 
     function mergeDevice(existing, next) {
@@ -469,50 +570,6 @@
         return orderedTargets;
     }
 
-    function getLatestSensorPayload(item) {
-        const raw = isPlainObject(item?.data) ? item.data : item;
-        if (isPlainObject(raw?.sensor)) return raw.sensor;
-        if (isPlainObject(raw?.latest)) return raw.latest;
-        if (isPlainObject(raw?.record)) return raw.record;
-        return raw;
-    }
-
-    function normalizeLatestSensor(item) {
-        const fallbackDeviceId = item?.device_id || item?.target_device_id || "";
-        const sensor = getLatestSensorPayload(item);
-        if (!isPlainObject(sensor)) return null;
-        const deviceId = sensor.device_id || sensor.deviceId || fallbackDeviceId || sensor.id || "";
-        if (!deviceId) return null;
-        const normalized = normalizeDevice({
-            ...sensor,
-            device_id: deviceId,
-            sensors: isPlainObject(sensor.sensors) ? sensor.sensors : sensor,
-            timestamp: getTimestampValue(sensor)
-        });
-        if (!hasSensorValues(normalized.sensors) && !normalized.timestamp) return null;
-        return normalized;
-    }
-
-    function applyLatestSensors(devices, latestSensors = []) {
-        const byId = new Map((Array.isArray(devices) ? devices : [])
-            .map(device => [normalizeDeviceId(device.id), device])
-            .filter(([id]) => id));
-
-        (Array.isArray(latestSensors) ? latestSensors : [])
-            .map(normalizeLatestSensor)
-            .filter(Boolean)
-            .forEach(device => {
-                const id = normalizeDeviceId(device.id);
-                if (!id) return;
-                byId.set(id, mergeDevice(byId.get(id) || createEmptyDevice(id), device));
-            });
-
-        return TARGET_DEVICE_IDS.map(deviceId => {
-            const key = normalizeDeviceId(deviceId);
-            return byId.get(key) || createEmptyDevice(deviceId);
-        });
-    }
-
     function normalizeAlarm(rawAlarm) {
         const alarm = isPlainObject(rawAlarm) ? rawAlarm : {};
         const payload = isPlainObject(alarm.payload) ? alarm.payload : {};
@@ -526,7 +583,6 @@
         return {
             event_id: alarm.event_id || "",
             device_id: alarm.device_id || "",
-            raw_event_type: alarm.event_type || payload.event_type || "",
             event_type: eventType,
             severity: alarm.severity || payload.severity || "info",
             message: cleanDisplayText(rawMessage, eventType),
@@ -551,20 +607,15 @@
             if (!status) return device;
             return {
                 ...device,
-                online: typeof status.online === "boolean"
-                    ? status.online
-                    : (typeof status.device_online === "boolean" ? status.device_online : device.online),
+                online: typeof status.online === "boolean" ? status.online : device.online,
                 timestamp: status.last_seen_ms ?? device.timestamp
             };
         });
     }
 
-    function normalizeOverview(data, modules = [], alarms = [], deviceStatus = null, states = {}, relatedOverviews = [], deviceStatuses = [], requestMeta = {}, latestSensors = []) {
+    function normalizeOverview(data, modules = [], alarms = [], deviceStatus = null, states = {}, relatedOverviews = [], deviceStatuses = [], systemEvents = [], requestMeta = {}) {
         const overview = isPlainObject(data) ? data : {};
-        const devices = applyLatestSensors(
-            applyDeviceStatuses(mergeOverviewDevices([overview, ...relatedOverviews]), deviceStatuses),
-            latestSensors
-        );
+        const devices = applyDeviceStatuses(mergeOverviewDevices([overview, ...relatedOverviews]), deviceStatuses);
         const normalizedDeviceStatus = normalizeDeviceStatus(deviceStatus);
         return {
             gateway: {
@@ -574,9 +625,11 @@
             devices,
             home_summary: buildHomeSummary(devices),
             recent_alarms: Array.isArray(alarms) ? alarms.map(normalizeAlarm) : [],
+            system_events: normalizeSystemEvents(systemEvents),
             device_status_error: Boolean(states.deviceStatusError),
             module_error: Boolean(states.moduleError),
             alarm_error: Boolean(states.alarmError),
+            event_error: Boolean(states.eventError),
             request_meta: requestMeta
         };
     }
@@ -595,6 +648,7 @@
         const offlineDevices = devices.filter(device => device.online === false).length;
         const average = (reader, digits = 1) => {
             const values = devices
+                .filter(device => device.online === true)
                 .map(reader)
                 .map(Number)
                 .filter(Number.isFinite);
@@ -631,15 +685,13 @@
     }
 
     function formatDeviceSensorValue(device, key, unit, digits = 1) {
-        const value = device?.sensors?.[key];
-        if (value === null || value === undefined || value === "") return SENSOR_EMPTY_TEXT;
-        return formatSensorValue(value, unit, digits);
+        if (device?.online !== true) return SENSOR_EMPTY_TEXT;
+        return formatSensorValue(device?.sensors?.[key], unit, digits);
     }
 
     function getDeviceAirQualityState(device) {
-        const rawScore = device?.sensors?.air_quality_score;
-        const score = rawScore === null || rawScore === undefined || rawScore === "" ? NaN : Number(rawScore);
-        if (!Number.isFinite(score)) {
+        const score = Number(device?.sensors?.air_quality_score);
+        if (device?.online !== true || !Number.isFinite(score)) {
             return { label: "", className: "unknown" };
         }
         return realtime().getAirQualityState
@@ -648,9 +700,8 @@
     }
 
     function formatDeviceAirQuality(device) {
-        const rawScore = device?.sensors?.air_quality_score;
-        const score = rawScore === null || rawScore === undefined || rawScore === "" ? NaN : Number(rawScore);
-        if (!Number.isFinite(score)) return SENSOR_EMPTY_TEXT;
+        const score = Number(device?.sensors?.air_quality_score);
+        if (device?.online !== true || !Number.isFinite(score)) return SENSOR_EMPTY_TEXT;
         const airState = getDeviceAirQualityState(device);
         const label = airState.label ? ` · ${airState.label}` : "";
         return `${formatNumber(score, 0)} 分${label}`;
@@ -831,6 +882,7 @@
                 <div class="s3-sensor-grid">
                     ${renderSensorMetricRealtime("温度", formatDeviceSensorValue(device, "temperature", "°C"), { key: "temperature" })}
                     ${renderSensorMetricRealtime("湿度", formatDeviceSensorValue(device, "humidity", "%"), { key: "humidity" })}
+                    ${renderSensorMetricRealtime("气压", formatDeviceSensorValue(device, "pressure", " hPa"), { key: "pressure" })}
                 </div>
                 <div class="s3-sensor-grid">
                     ${renderSensorMetricRealtime("空气质量", formatDeviceAirQuality(device), { statusClass: `aqi-${airState.className}`, key: "aqi" })}
@@ -865,7 +917,6 @@
     function getActiveAlarms(data) {
         return (Array.isArray(data.recent_alarms) ? data.recent_alarms : [])
             .filter(isActiveAlarm)
-            .filter(alarm => !isPressureAlarmText(alarm.raw_event_type || alarm.event_type, alarm.message))
             .slice(0, 20);
     }
 
@@ -905,6 +956,21 @@
                         <tbody data-alarm-rows>${rows}</tbody>
                     </table>
                 </div>
+            </article>
+        `;
+    }
+
+    function renderSystemEventsPanel(data) {
+        const events = Array.isArray(data.system_events) ? data.system_events : [];
+        const timeline = realtime().EventTimeline
+            ? realtime().EventTimeline(events)
+            : '<div class="system-log empty">暂无系统事件。</div>';
+        return `
+            <article class="panel s3-events-panel" data-s3-panel="events">
+                <div class="panel-header">
+                    <h2>📝 最近系统事件</h2>
+                </div>
+                <div data-event-timeline>${timeline}</div>
             </article>
         `;
     }
@@ -951,6 +1017,7 @@
             const values = {
                 temperature: formatDeviceSensorValue(device, "temperature", "°C"),
                 humidity: formatDeviceSensorValue(device, "humidity", "%"),
+                pressure: formatDeviceSensorValue(device, "pressure", " hPa"),
                 aqi: formatDeviceAirQuality(device),
                 lastReported: updatedAt ? formatTime(updatedAt) : (device.online === false ? "设备离线" : "暂无数据")
             };
@@ -993,6 +1060,16 @@
             alarmBody.dataset.signature = alarmRows;
         }
 
+        const events = Array.isArray(data.system_events) ? data.system_events : [];
+        const timeline = realtime().EventTimeline
+            ? realtime().EventTimeline(events)
+            : '<div class="system-log empty">暂无系统事件。</div>';
+        const timelineBody = root.querySelector("[data-event-timeline]");
+        if (timelineBody && timelineBody.dataset.signature !== timeline) {
+            timelineBody.innerHTML = timeline;
+            timelineBody.dataset.signature = timeline;
+        }
+
         return true;
     }
 
@@ -1009,6 +1086,7 @@
                 ${renderDeviceOverview(data.devices || [])}
                 ${renderSmartHomeOverview(data)}
                 ${renderAlarmPanel(data)}
+                ${renderSystemEventsPanel(data)}
             </div>
         `;
         container.dataset.s3DashboardReady = "true";
@@ -1030,6 +1108,7 @@
                 ${renderDeviceOverview(data.devices || [])}
                 ${renderSmartHomeOverview(data)}
                 ${renderAlarmPanel(data)}
+                ${renderSystemEventsPanel(data)}
             </div>
         `;
     }
@@ -1054,6 +1133,7 @@
                 ${renderDeviceOverview(data.devices || [])}
                 ${renderSmartHomeOverview(data)}
                 ${renderAlarmPanel(data)}
+                ${renderSystemEventsPanel(data)}
             </div>
         `;
     }
@@ -1070,19 +1150,19 @@
                 deviceStatusRaw,
                 modulesResult,
                 alarmsResult,
+                eventsResult,
                 ...targetResults
             ] = await Promise.allSettled([
                 fetchOverview(),
                 fetchDeviceStatus(),
                 fetchModulesStatus(),
                 fetchAlarmLogs(),
+                fetchSystemEvents(),
                 ...TARGET_DEVICE_IDS.map(deviceId => fetchOverview(deviceId)),
-                ...TARGET_DEVICE_IDS.map(deviceId => fetchDeviceStatus(deviceId)),
-                ...TARGET_DEVICE_IDS.map(deviceId => fetchLatestSensor(deviceId))
+                ...TARGET_DEVICE_IDS.map(deviceId => fetchDeviceStatus(deviceId))
             ]);
             const targetOverviewResults = targetResults.slice(0, TARGET_DEVICE_IDS.length);
-            const targetDeviceStatusResults = targetResults.slice(TARGET_DEVICE_IDS.length, TARGET_DEVICE_IDS.length * 2);
-            const targetLatestSensorResults = targetResults.slice(TARGET_DEVICE_IDS.length * 2);
+            const targetDeviceStatusResults = targetResults.slice(TARGET_DEVICE_IDS.length);
 
             if (overviewRaw.status !== "fulfilled") {
                 throw overviewRaw.reason;
@@ -1096,7 +1176,8 @@
                 {
                     deviceStatusError: deviceStatusRaw.status === "rejected",
                     moduleError: modulesResult.status === "rejected",
-                    alarmError: alarmsResult.status === "rejected"
+                    alarmError: alarmsResult.status === "rejected",
+                    eventError: eventsResult.status === "rejected"
                 },
                 targetOverviewResults
                     .filter(result => result.status === "fulfilled")
@@ -1104,21 +1185,12 @@
                 targetDeviceStatusResults
                     .filter(result => result.status === "fulfilled")
                     .map(result => result.value),
+                eventsResult.status === "fulfilled" ? eventsResult.value : [],
                 {
                     api_ok: true,
                     api_latency_ms: performance.now() - requestStart,
                     last_sync_at: Date.now()
-                },
-                targetLatestSensorResults
-                    .map((result, index) => ({
-                        result,
-                        device_id: TARGET_DEVICE_IDS[index]
-                    }))
-                    .filter(item => item.result.status === "fulfilled")
-                    .map(item => Object.assign(
-                        { target_device_id: item.device_id },
-                        isPlainObject(item.result.value) ? item.result.value : {}
-                    ))
+                }
             );
             realtime().markSuccess?.({
                 syncAt: Date.now(),

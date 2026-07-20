@@ -8,9 +8,12 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "app_stack_monitor.h"
 #include "bme_cache_manager.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "gateway_config.h"
 #include "gateway_event_reporter.h"
@@ -255,16 +258,21 @@ esp_err_t network_replay_worker_init(void)
         return ESP_OK;
     }
 
-    BaseType_t created = xTaskCreate(replay_worker_task,
-                                     "bme_replay_worker",
-                                     NETWORK_REPLAY_WORKER_TASK_STACK,
-                                     NULL,
-                                     NETWORK_REPLAY_WORKER_TASK_PRIORITY,
-                                     &s_replay_task);
+    BaseType_t created = xTaskCreateWithCaps(replay_worker_task,
+                                             "bme_replay_worker",
+                                             NETWORK_REPLAY_WORKER_TASK_STACK,
+                                             NULL,
+                                             NETWORK_REPLAY_WORKER_TASK_PRIORITY,
+                                             &s_replay_task,
+                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         s_replay_task = NULL;
         return ESP_ERR_NO_MEM;
     }
+    app_stack_monitor_log_task_created(TAG,
+                                       "bme_replay_worker",
+                                       s_replay_task,
+                                       NETWORK_REPLAY_WORKER_TASK_STACK);
     return ESP_OK;
 }
 

@@ -16,6 +16,7 @@
 #include "app_runtime.h"
 #include "bme_sensor_service.h"
 #include "c5_event_bus.h"
+#include "c5_memory.h"
 #include "c5_runtime_workers.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -69,6 +70,8 @@ static c5_scheduled_task_t s_scheduler_timers[] = {
 };
 static portMUX_TYPE s_backpressure_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_dispatcher_task;
+static StackType_t *s_dispatcher_stack;
+static StaticTask_t s_dispatcher_storage;
 static uint64_t s_last_diagnostic_log_ms;
 
 /* 只使用 esp_timer uptime；C5 不依赖 Server 时间来驱动本地调度。 */
@@ -417,22 +420,55 @@ esp_err_t c5_scheduler_start(void)
         return ret;
     }
 
-    ret = c5_runtime_workers_start();
+    ret = c5_runtime_workers_prepare();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "start C5 workers failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "prepare C5 worker queues failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    BaseType_t created = xTaskCreate(c5_event_dispatcher_task,
-                                     "c5_event_dispatcher",
-                                     C5_SCHEDULER_TASK_STACK,
-                                     NULL,
-                                     C5_SCHEDULER_TASK_PRIORITY,
-                                     &s_dispatcher_task);
-    if (created != pdPASS) {
-        s_dispatcher_task = NULL;
-        ESP_LOGE(TAG, "create C5 event dispatcher task failed");
+    c5_mem_log("task_create_before_c5_dispatcher");
+    s_dispatcher_stack = (StackType_t *)c5_mem_alloc(C5_SCHEDULER_TASK_STACK,
+                                                      C5_MEM_INTERNAL_CONTROL,
+                                                      "c5_event_dispatcher_stack");
+    if (s_dispatcher_stack == NULL) {
+        ESP_LOGE(TAG, "allocate C5 event dispatcher stack failed");
+        c5_mem_log("task_create_after_c5_dispatcher_failed");
         return ESP_ERR_NO_MEM;
     }
+    s_dispatcher_task = xTaskCreateStatic(c5_event_dispatcher_task,
+                                          "c5_event_dispatcher",
+                                          C5_SCHEDULER_TASK_STACK,
+                                          NULL,
+                                          C5_SCHEDULER_TASK_PRIORITY,
+                                          s_dispatcher_stack,
+                                          &s_dispatcher_storage);
+    if (s_dispatcher_task == NULL) {
+        c5_mem_free(s_dispatcher_stack, "c5_event_dispatcher_stack");
+        s_dispatcher_stack = NULL;
+        s_dispatcher_task = NULL;
+        ESP_LOGE(TAG, "create static C5 event dispatcher task failed");
+        c5_mem_log("task_create_after_c5_dispatcher_failed");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "TASK_CREATE task=c5_event_dispatcher stack=%u source=internal_static",
+             (unsigned int)C5_SCHEDULER_TASK_STACK);
+    c5_mem_log("task_create_after_c5_dispatcher");
+    return ESP_OK;
+}
+
+esp_err_t c5_scheduler_start_deferred_workers(void)
+{
+    if (s_dispatcher_task == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    c5_mem_log("scheduler_phase2_before_workers");
+    const esp_err_t ret = c5_runtime_workers_start();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "C5 scheduler phase2 workers deferred ret=%s", esp_err_to_name(ret));
+        c5_mem_log("scheduler_phase2_after_workers_failed");
+        return ret;
+    }
+    c5_mem_log("scheduler_phase2_after_workers");
     return ESP_OK;
 }

@@ -1,0 +1,99 @@
+#pragma once
+
+#include "lvgl.h"
+
+#define BOOT_CAT_IMAGE_WIDTH 96
+#define BOOT_CAT_IMAGE_HEIGHT 72
+#define BOOT_CAT_IMAGE_STRIDE (BOOT_CAT_IMAGE_WIDTH / 2)
+
+/* Current 80x60 boot cat expanded offline by exactly 1.2x, retaining I4. */
+#define BOOT_CAT_BYTE(hi, lo) ((uint8_t)((((uint8_t)(hi)) << 4) | (uint8_t)(lo)))
+#define BOOT_CAT_NIBBLE_PAIR(c) BOOT_CAT_BYTE(c, c)
+#define BOOT_CAT_BLOCK6(c) \
+    BOOT_CAT_NIBBLE_PAIR(c), BOOT_CAT_NIBBLE_PAIR(c), BOOT_CAT_NIBBLE_PAIR(c),
+#define BOOT_CAT_ROW16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) \
+    BOOT_CAT_BLOCK6(a) BOOT_CAT_BLOCK6(b) BOOT_CAT_BLOCK6(c) BOOT_CAT_BLOCK6(d) \
+    BOOT_CAT_BLOCK6(e) BOOT_CAT_BLOCK6(f) BOOT_CAT_BLOCK6(g) BOOT_CAT_BLOCK6(h) \
+    BOOT_CAT_BLOCK6(i) BOOT_CAT_BLOCK6(j) BOOT_CAT_BLOCK6(k) BOOT_CAT_BLOCK6(l) \
+    BOOT_CAT_BLOCK6(m) BOOT_CAT_BLOCK6(n) BOOT_CAT_BLOCK6(o) BOOT_CAT_BLOCK6(p)
+#define BOOT_CAT_REPEAT2(row) row row
+#define BOOT_CAT_REPEAT3(row) row row row
+
+#define BOOT_CAT_ROW_CLEAR BOOT_CAT_ROW16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+#define BOOT_CAT_ROW_EAR_TIP BOOT_CAT_ROW16(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0)
+#define BOOT_CAT_ROW_EAR_UPPER BOOT_CAT_ROW16(0, 0, 1, 3, 1, 0, 0, 0, 0, 0, 0, 1, 3, 1, 0, 0)
+#define BOOT_CAT_ROW_EAR_BASE BOOT_CAT_ROW16(0, 1, 3, 3, 1, 1, 0, 0, 0, 0, 1, 1, 3, 3, 1, 0)
+#define BOOT_CAT_ROW_FACE_TOP BOOT_CAT_ROW16(0, 1, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 1, 0)
+#define BOOT_CAT_ROW_FACE BOOT_CAT_ROW16(0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0)
+#define BOOT_CAT_ROW_LISTEN_EYES BOOT_CAT_ROW16(0, 1, 1, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 1, 1, 0)
+#define BOOT_CAT_ROW_CHEEKS BOOT_CAT_ROW16(2, 2, 1, 4, 4, 1, 1, 1, 1, 1, 1, 4, 4, 1, 2, 2)
+#define BOOT_CAT_ROW_NOSE BOOT_CAT_ROW16(0, 2, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1, 1, 1, 2, 0)
+#define BOOT_CAT_ROW_MOUTH_CLOSED BOOT_CAT_ROW16(0, 0, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 0, 0)
+#define BOOT_CAT_ROW_FACE_LOWER BOOT_CAT_ROW16(0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0)
+
+static const uint8_t boot_cat_image_map[] __attribute__((aligned(4))) = {
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0x54, 0x3d, 0x2a, 0xff, 0xa6, 0xd2, 0x79, 0xff,
+    0xb5, 0x9b, 0xf4, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_CLEAR)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_EAR_TIP)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_EAR_UPPER)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_EAR_BASE)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_FACE_TOP)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_FACE)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_FACE)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_LISTEN_EYES)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_FACE)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_CHEEKS)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_NOSE)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_MOUTH_CLOSED)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_FACE_LOWER)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_FACE_LOWER)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_FACE_LOWER)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_FACE_LOWER)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_CLEAR)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_CLEAR)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_CLEAR)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_CLEAR)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_CLEAR)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_CLEAR)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_CLEAR)
+    BOOT_CAT_REPEAT3(BOOT_CAT_ROW_CLEAR)
+};
+
+static const lv_image_dsc_t boot_cat_image = {
+    .header = {
+        .magic = LV_IMAGE_HEADER_MAGIC,
+        .cf = LV_COLOR_FORMAT_I4,
+        .flags = 0,
+        .w = BOOT_CAT_IMAGE_WIDTH,
+        .h = BOOT_CAT_IMAGE_HEIGHT,
+        .stride = BOOT_CAT_IMAGE_STRIDE,
+    },
+    .data_size = sizeof(boot_cat_image_map),
+    .data = boot_cat_image_map,
+    .reserved = NULL,
+};
+
+#undef BOOT_CAT_ROW_FACE_LOWER
+#undef BOOT_CAT_ROW_MOUTH_CLOSED
+#undef BOOT_CAT_ROW_NOSE
+#undef BOOT_CAT_ROW_CHEEKS
+#undef BOOT_CAT_ROW_LISTEN_EYES
+#undef BOOT_CAT_ROW_FACE
+#undef BOOT_CAT_ROW_FACE_TOP
+#undef BOOT_CAT_ROW_EAR_BASE
+#undef BOOT_CAT_ROW_EAR_UPPER
+#undef BOOT_CAT_ROW_EAR_TIP
+#undef BOOT_CAT_ROW_CLEAR
+#undef BOOT_CAT_REPEAT3
+#undef BOOT_CAT_REPEAT2
+#undef BOOT_CAT_ROW16
+#undef BOOT_CAT_BLOCK6
+#undef BOOT_CAT_NIBBLE_PAIR
+#undef BOOT_CAT_BYTE

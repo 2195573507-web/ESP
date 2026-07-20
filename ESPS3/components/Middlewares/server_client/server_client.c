@@ -1369,6 +1369,38 @@ esp_err_t server_client_post_alarm_json(const char *json_body,
                                   http_status);
 }
 
+esp_err_t server_client_post_habit_event_json(const char *json_body,
+                                              char *response_body,
+                                              size_t response_body_size,
+                                              int *http_status)
+{
+    if (json_body == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return perform_telemetry_json(HTTP_METHOD_POST,
+                                  "/api/habit-events",
+                                  json_body,
+                                  response_body,
+                                  response_body_size,
+                                  http_status);
+}
+
+esp_err_t server_client_post_weather_refresh_json(const char *json_body,
+                                                  char *response_body,
+                                                  size_t response_body_size,
+                                                  int *http_status)
+{
+    if (json_body == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return perform_snapshot_json(HTTP_METHOD_POST,
+                                 ESP111_PROTOCOL_SERVER_ROUTE_WEATHER_REFRESH,
+                                 json_body,
+                                 response_body,
+                                 response_body_size,
+                                 http_status);
+}
+
 esp_err_t server_client_probe_available(int *http_status)
 {
     if (http_status != NULL) {

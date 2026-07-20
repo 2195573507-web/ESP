@@ -18,7 +18,10 @@ extern "C" {
 #endif
 
 #define RADAR_INGEST_MAX_BODY_BYTES 1024U
-#define RADAR_INGEST_HISTORY_DEPTH 64U
+#define RADAR_INGEST_REMOTE_SOURCE_COUNT 2U
+#define RADAR_INGEST_HISTORY_DEPTH_PER_SOURCE 32U
+#define RADAR_INGEST_HISTORY_DEPTH \
+    (RADAR_INGEST_HISTORY_DEPTH_PER_SOURCE * RADAR_INGEST_REMOTE_SOURCE_COUNT)
 
 typedef enum {
     RADAR_INGEST_ACCEPTED = 0,
@@ -40,6 +43,7 @@ typedef struct {
 
 /* Starts the latest-frame worker after the stable radar domain is initialized. */
 esp_err_t radar_ingest_start(void);
+esp_err_t radar_ingest_stop(void);
 
 /* HTTP path: validate C5 v3 payload and atomically replace that source's pending frame. */
 radar_ingest_result_t radar_ingest_process_json(const char *json,

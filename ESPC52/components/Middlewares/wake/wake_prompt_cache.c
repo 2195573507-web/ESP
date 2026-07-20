@@ -11,6 +11,7 @@
 
 #include "wake_prompt_cache.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,6 +26,8 @@
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include "local_wake_word.h"
 #include "server_comm_config.h"
 #include "server_comm_errors.h"
@@ -49,6 +52,41 @@ typedef struct {
 } wake_prompt_spool_ctx_t;
 
 static bool s_wake_prompt_spiffs_mounted;
+static portMUX_TYPE s_wake_prompt_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_wake_prompt_transaction_active;
+
+static bool wake_prompt_transaction_try_begin(void)
+{
+    bool acquired = false;
+    portENTER_CRITICAL(&s_wake_prompt_lock);
+    if (!s_wake_prompt_transaction_active) {
+        s_wake_prompt_transaction_active = true;
+        acquired = true;
+    }
+    portEXIT_CRITICAL(&s_wake_prompt_lock);
+    return acquired;
+}
+
+static void wake_prompt_transaction_end(void)
+{
+    portENTER_CRITICAL(&s_wake_prompt_lock);
+    s_wake_prompt_transaction_active = false;
+    portEXIT_CRITICAL(&s_wake_prompt_lock);
+}
+
+static esp_err_t wake_prompt_remove_spool_file(const char *stage)
+{
+    if (remove(WAKE_PROMPT_SPOOL_PATH) == 0 || errno == ENOENT) {
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG,
+             "wake prompt spool remove failed stage=%s path=%s errno=%d",
+             stage != NULL ? stage : "<none>",
+             WAKE_PROMPT_SPOOL_PATH,
+             errno);
+    return ESP_FAIL;
+}
 
 static uint32_t wake_prompt_abs_i16(int16_t sample)
 {
@@ -75,6 +113,17 @@ static void wake_prompt_log_spool_heap(const char *marker)
              marker,
              (unsigned int)heap_caps_get_free_size(caps),
              (unsigned int)heap_caps_get_largest_free_block(caps));
+}
+
+static bool wake_prompt_check_heap_integrity(const char *stage)
+{
+    const bool integrity_ok = heap_caps_check_integrity_all(true);
+    ESP_LOG_LEVEL_LOCAL(integrity_ok ? ESP_LOG_INFO : ESP_LOG_ERROR,
+                        TAG,
+                        "RUNTIME_PROTECTION heap_integrity stage=%s result=%s",
+                        stage != NULL ? stage : "<none>",
+                        integrity_ok ? "ok" : "failed");
+    return integrity_ok;
 }
 
 static esp_err_t wake_prompt_spool_mount(void)
@@ -165,6 +214,11 @@ static esp_err_t wake_prompt_play_spool_file(FILE *file, size_t expected_bytes, 
     uint32_t peak = 0;
     esp_err_t ret = ESP_OK;
 
+    app_stack_monitor_log(TAG, "wake_prompt_stream", "before_playback");
+    if (!wake_prompt_check_heap_integrity("before_playback")) {
+        c5_mem_free(pcm_buf, "wake_prompt_spool_pcm");
+        return ESP_FAIL;
+    }
     wake_prompt_log_internal_heap("before_speaker_stream_open");
     ret = audio_player_stream_open();
     if (ret != ESP_OK) {
@@ -199,15 +253,37 @@ static esp_err_t wake_prompt_play_spool_file(FILE *file, size_t expected_bytes, 
         played_bytes += bytes_read;
     }
 
-    esp_err_t finish_ret = ret == ESP_OK ? audio_player_stream_finish() : audio_player_stream_abort();
-    if (ret == ESP_OK && finish_ret != ESP_OK) {
-        ret = finish_ret;
+    if (ret == ESP_OK) {
+        esp_err_t finish_ret = audio_player_stream_finish();
+        if (finish_ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "wake prompt stream finish failed ret=%s; requesting abort cleanup",
+                     esp_err_to_name(finish_ret));
+            esp_err_t abort_ret = audio_player_stream_abort();
+            if (abort_ret != ESP_OK) {
+                ESP_LOGE(TAG,
+                         "wake prompt stream abort after finish failure failed ret=%s",
+                         esp_err_to_name(abort_ret));
+            }
+            ret = finish_ret;
+        }
+    } else {
+        esp_err_t abort_ret = audio_player_stream_abort();
+        if (abort_ret != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "wake prompt stream abort failed ret=%s",
+                     esp_err_to_name(abort_ret));
+        }
     }
     if (ret == ESP_OK && played_bytes != expected_bytes) {
         ret = ESP_FAIL;
     }
     *out_peak = peak;
     c5_mem_free(pcm_buf, "wake_prompt_spool_pcm");
+    if (!wake_prompt_check_heap_integrity("after_playback") && ret == ESP_OK) {
+        ret = ESP_FAIL;
+    }
+    app_stack_monitor_log(TAG, "wake_prompt_stream", "after_playback");
     return ret;
 }
 
@@ -259,8 +335,13 @@ esp_err_t wake_prompt_cache_play(void)
         ESP_LOGW(TAG, "wake prompt stream rejected outside local_wake ack");
         return ESP_ERR_INVALID_STATE;
     }
+    if (!wake_prompt_transaction_try_begin()) {
+        ESP_LOGW(TAG, "wake prompt stream rejected while another transaction is active");
+        return ESP_ERR_INVALID_STATE;
+    }
     esp_err_t ret = wake_prompt_spool_mount();
     if (ret != ESP_OK) {
+        wake_prompt_transaction_end();
         return ret;
     }
 
@@ -302,6 +383,7 @@ esp_err_t wake_prompt_cache_play(void)
                  server_comm_err_to_name(ret),
                  (unsigned int)WAKE_PROMPT_CACHE_HTTP_HEADER_BUFFER_BYTES,
                  (unsigned int)WAKE_PROMPT_CACHE_HTTP_TX_BUFFER_BYTES);
+        wake_prompt_transaction_end();
         return ret;
     }
 
@@ -361,12 +443,17 @@ esp_err_t wake_prompt_cache_play(void)
                  (long long)response.content_length,
                  response.content_type[0] != '\0' ? response.content_type : "<none>",
                  (unsigned int)WAKE_PROMPT_SPOOL_BUFFER_BYTES);
-        (void)remove(WAKE_PROMPT_SPOOL_PATH);
-        spool.file = fopen(WAKE_PROMPT_SPOOL_PATH, "wb");
-        if (spool.file == NULL) {
-            ret = ESP_FAIL;
-            ESP_LOGW(TAG, "wake prompt spool open failed path=%s", WAKE_PROMPT_SPOOL_PATH);
+        ret = wake_prompt_remove_spool_file("before_write");
+        if (ret == ESP_OK) {
+            spool.file = fopen(WAKE_PROMPT_SPOOL_PATH, "wb");
+            if (spool.file == NULL) {
+                ret = ESP_FAIL;
+                ESP_LOGW(TAG, "wake prompt spool open failed path=%s", WAKE_PROMPT_SPOOL_PATH);
+            }
         } else {
+            ESP_LOGW(TAG, "wake prompt spool pre-write cleanup failed path=%s", WAKE_PROMPT_SPOOL_PATH);
+        }
+        if (spool.file != NULL) {
             spool_path_created = true;
             ret = server_comm_http_read_response(stream, wake_prompt_spool_chunk, &spool, &response);
         }
@@ -412,10 +499,16 @@ esp_err_t wake_prompt_cache_play(void)
         }
     }
     if (spool_reader != NULL) {
-        fclose(spool_reader);
+        if (fclose(spool_reader) != 0 && ret == ESP_OK) {
+            ret = ESP_FAIL;
+            ESP_LOGW(TAG, "wake prompt spool reader close failed path=%s", WAKE_PROMPT_SPOOL_PATH);
+        }
     }
     if (spool_path_created) {
-        (void)remove(WAKE_PROMPT_SPOOL_PATH);
+        esp_err_t remove_ret = wake_prompt_remove_spool_file("after_playback");
+        if (ret == ESP_OK && remove_ret != ESP_OK) {
+            ret = remove_ret;
+        }
         wake_prompt_log_spool_heap("WAKE_PROMPT_SPOOL_DELETE");
     }
     if (ret == ESP_OK && peak == 0) {
@@ -433,5 +526,6 @@ esp_err_t wake_prompt_cache_play(void)
              (unsigned int)spool.response_bytes,
              (unsigned int)spool.chunks,
              (unsigned int)peak);
+    wake_prompt_transaction_end();
     return ret;
 }

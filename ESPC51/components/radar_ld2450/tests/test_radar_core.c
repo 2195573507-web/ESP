@@ -122,6 +122,7 @@ static void test_v3_codec(void)
     assert(strstr(json, "\"t\":\"radar\"") != NULL);
     assert(strstr(json, "\"q\":10") != NULL);
     assert(strstr(json, "\"device_id\":\"sensair_shuttle_02\"") != NULL);
+    assert(strstr(json, "\"room_id\":\"bedroom\"") != NULL);
     assert(strstr(json, "\"target_id\":1") != NULL);
     assert(strstr(json, "\"x_mm\":1200") != NULL);
     assert(strstr(json, "\"velocity_cm_s\":15") != NULL);
@@ -132,6 +133,14 @@ static void test_v3_codec(void)
     assert(radar_result_encode_json(&sample, 123500U, 11U, json, sizeof(json)) > 0);
     sample.target_count = 1U;
     assert(radar_result_encode_json(&sample, 123500U, 12U, json, sizeof(json)) < 0);
+
+    sample.local_id = 1U;
+    sample.sample_valid = true;
+    sample.frame_seq = 235U;
+    sample.target_count = 0U;
+    assert(radar_result_encode_json(&sample, 123600U, 13U, json, sizeof(json)) > 0);
+    assert(strstr(json, "\"device_id\":\"sensair_shuttle_01\"") != NULL);
+    assert(strstr(json, "\"room_id\":\"living_room\"") != NULL);
 }
 
 static void test_edge_filter(void)

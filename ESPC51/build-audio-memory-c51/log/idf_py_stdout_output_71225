@@ -1,0 +1,16 @@
+Command: ninja all
+[1/7] Performing build step for 'bootloader'
+[1/1] cd "/Users/zhiqin/ESP 部分开发/ESPC51/build-audio-memory-c51/bootloader/esp-idf/esptool_py" && /Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x2000 /Users/zhiqin/ESP\ 部分开发/ESPC51/build-audio-memory-c51/bootloader/bootloader.bin
+Bootloader binary size 0x5670 bytes. 0x990 bytes (10%) free.
+[2/7] No install step for 'bootloader'
+[3/7] Completed 'bootloader'
+[4/7] Generating esp-idf/esp_system/ld/sections.ld
+[5/7] Linking CXX executable 00_Learn.elf
+[6/7] Generating binary image from built executable
+esptool.py v4.12.dev2
+Creating esp32c5 image...
+Merged 1 ELF section
+Successfully created esp32c5 image.
+Generated /Users/zhiqin/ESP 部分开发/ESPC51/build-audio-memory-c51/00_Learn.bin
+[7/7] cd "/Users/zhiqin/ESP 部分开发/ESPC51/build-audio-memory-c51/esp-idf/esptool_py" && /Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /Users/zhiqin/ESP\ 部分开发/ESPC51/build-audio-memory-c51/partition_table/partition-table.bin /Users/zhiqin/ESP\ 部分开发/ESPC51/build-audio-memory-c51/00_Learn.bin
+00_Learn.bin binary size 0x1ae150 bytes. Smallest app partition is 0x500000 bytes. 0x351eb0 bytes (66%) free.

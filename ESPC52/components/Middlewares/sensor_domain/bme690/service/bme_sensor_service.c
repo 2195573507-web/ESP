@@ -37,6 +37,27 @@ typedef struct {
 
 static bme_sensor_service_context_t s_bme_service;
 static portMUX_TYPE s_bme_service_lock = portMUX_INITIALIZER_UNLOCKED;
+static bme_sensor_service_reading_t s_latest_reading;
+
+static void bme_sensor_service_publish_reading(const bme690_data_t *sensor_data,
+                                               const bme_air_quality_result_t *air_quality)
+{
+    if (sensor_data == NULL || air_quality == NULL) {
+        return;
+    }
+    portENTER_CRITICAL(&s_bme_service_lock);
+    s_latest_reading.valid = true;
+    s_latest_reading.temperature_c = sensor_data->temperature_c;
+    s_latest_reading.humidity_percent = sensor_data->humidity_percent;
+    s_latest_reading.air_quality_score = air_quality->air_quality_score < 0 ? 0U :
+                                         air_quality->air_quality_score > UINT16_MAX ? UINT16_MAX :
+                                         (uint16_t)air_quality->air_quality_score;
+    ++s_latest_reading.generation;
+    if (s_latest_reading.generation == 0U) {
+        s_latest_reading.generation = 1U;
+    }
+    portEXIT_CRITICAL(&s_bme_service_lock);
+}
 
 static void bme_sensor_service_log_heap(const char *label)
 {
@@ -210,6 +231,8 @@ esp_err_t bme_sensor_service_tick(void)
         goto done;
     }
 
+    bme_sensor_service_publish_reading(&sensor_data, &air_quality);
+
     ret = bme_server_client_upload_reading(BME_SENSOR_DEVICE_ID,
                                            &sensor_data,
                                            &air_quality);
@@ -344,4 +367,14 @@ bool bme_sensor_service_is_paused(void)
     bool paused = false;
     (void)bme_sensor_service_snapshot(&paused, NULL, NULL, NULL);
     return paused;
+}
+
+void bme_sensor_service_get_latest_reading(bme_sensor_service_reading_t *out_reading)
+{
+    if (out_reading == NULL) {
+        return;
+    }
+    portENTER_CRITICAL(&s_bme_service_lock);
+    *out_reading = s_latest_reading;
+    portEXIT_CRITICAL(&s_bme_service_lock);
 }

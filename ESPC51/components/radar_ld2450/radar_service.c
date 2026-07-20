@@ -12,6 +12,8 @@ static const char *TAG = "radar_ld2450";
 
 static StaticSemaphore_t s_lock_storage;
 static SemaphoreHandle_t s_lock;
+static StaticSemaphore_t s_parser_lock_storage;
+static SemaphoreHandle_t s_parser_lock;
 static ld2450_parser_t s_parser;
 static radar_target_sample_t s_sample;
 static bool s_initialized;
@@ -72,7 +74,9 @@ esp_err_t radar_service_init(void)
         return ESP_OK;
     }
     s_lock = xSemaphoreCreateMutexStatic(&s_lock_storage);
-    if (s_lock == NULL) {
+    s_parser_lock = xSemaphoreCreateMutexStatic(&s_parser_lock_storage);
+    if (s_lock == NULL || s_parser_lock == NULL) {
+        radar_service_deinit();
         return ESP_ERR_NO_MEM;
     }
     ld2450_parser_init(&s_parser);
@@ -85,6 +89,28 @@ esp_err_t radar_service_init(void)
     s_last_frame_log_ms = 0U;
     s_initialized = true;
     return ESP_OK;
+}
+
+void radar_service_deinit(void)
+{
+    s_initialized = false;
+    if (s_parser_lock != NULL) {
+        vSemaphoreDelete(s_parser_lock);
+        s_parser_lock = NULL;
+    }
+    if (s_lock != NULL) {
+        vSemaphoreDelete(s_lock);
+        s_lock = NULL;
+    }
+    memset(&s_parser, 0, sizeof(s_parser));
+    memset(&s_sample, 0, sizeof(s_sample));
+    memset(&s_lock_storage, 0, sizeof(s_lock_storage));
+    memset(&s_parser_lock_storage, 0, sizeof(s_parser_lock_storage));
+    s_link_state = 0U;
+    s_snapshot_updates = 0U;
+    s_frame_received_count = 0U;
+    s_last_target_count = 0U;
+    s_last_frame_log_ms = 0U;
 }
 
 esp_err_t radar_service_start(void)
@@ -122,7 +148,10 @@ void radar_service_get_diagnostics(radar_service_diagnostics_t *out)
         return;
     }
     memset(out, 0, sizeof(*out));
-    ld2450_parser_get_diagnostics(&s_parser, &out->parser);
+    if (s_parser_lock != NULL && xSemaphoreTake(s_parser_lock, portMAX_DELAY) == pdTRUE) {
+        ld2450_parser_get_diagnostics(&s_parser, &out->parser);
+        xSemaphoreGive(s_parser_lock);
+    }
     if (s_lock != NULL && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
         out->snapshot_updates = s_snapshot_updates;
         out->frame_received_count = s_frame_received_count;
@@ -134,8 +163,10 @@ void radar_service_get_diagnostics(radar_service_diagnostics_t *out)
 
 void radar_service_ingest_ble_bytes(const uint8_t *data, size_t data_len, uint64_t received_at_ms)
 {
-    if (s_initialized && data != NULL && data_len > 0U) {
+    if (s_initialized && s_parser_lock != NULL && data != NULL && data_len > 0U &&
+        xSemaphoreTake(s_parser_lock, portMAX_DELAY) == pdTRUE) {
         (void)ld2450_parser_feed(&s_parser, data, data_len, received_at_ms, handle_frame, NULL);
+        xSemaphoreGive(s_parser_lock);
     }
 }
 
@@ -144,7 +175,10 @@ void radar_service_mark_ble_timeout(uint64_t timestamp_ms)
     if (!s_initialized || s_lock == NULL) {
         return;
     }
-    ld2450_parser_note_timeout(&s_parser, timestamp_ms);
+    if (s_parser_lock != NULL && xSemaphoreTake(s_parser_lock, portMAX_DELAY) == pdTRUE) {
+        ld2450_parser_note_timeout(&s_parser, timestamp_ms);
+        xSemaphoreGive(s_parser_lock);
+    }
     if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
         const uint32_t now = (uint32_t)timestamp_ms;
         if (s_sample.sample_valid && (uint32_t)(now - s_sample.frame_uptime_ms) > 1000U) {

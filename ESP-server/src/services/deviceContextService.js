@@ -6,9 +6,6 @@ const {
 const {
     trimText
 } = require("./deviceMetadata");
-const {
-    resolveDeviceId
-} = require("./deviceIdResolver");
 
 const ENVIRONMENT_FRESH_MS = 30000;
 
@@ -111,12 +108,11 @@ function moduleMapFromRows(rows) {
 }
 
 async function readLatestBmeRow(dbAll, deviceId) {
-    const resolvedDeviceId = resolveDeviceId(deviceId);
     const params = [];
     let where = "WHERE deleted_at IS NULL AND (payload_type='sensor.bme690' OR payload_type IS NULL OR payload_type='')";
-    if (resolvedDeviceId) {
+    if (deviceId) {
         where += " AND device_id=?";
-        params.push(resolvedDeviceId);
+        params.push(deviceId);
     }
 
     const rows = await dbAll(
@@ -131,7 +127,7 @@ async function readLatestBmeRow(dbAll, deviceId) {
 
 async function getDeviceContext(dbAll, deviceId = "", options = {}) {
     const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
-    const safeDeviceId = resolveDeviceId(deviceId);
+    const safeDeviceId = trimText(deviceId, 128);
     const device = await readDeviceStatus(dbAll, safeDeviceId, nowMs);
     const inferredDeviceId = safeDeviceId || device?.device_id || "";
     const moduleRows = await readModuleStatuses(dbAll, inferredDeviceId, nowMs);
@@ -142,12 +138,8 @@ async function getDeviceContext(dbAll, deviceId = "", options = {}) {
     return {
         device: device || {
             device_id: inferredDeviceId,
-            online: null,
-            device_online: null,
-            status: "unknown",
-            status_source: "not_observed",
-            observed: false,
-            offline_reason: null,
+            online: false,
+            device_online: false,
             last_seen_age_ms: null,
             latest_upload_delay_ms: null,
             avg_upload_delay_ms: null,

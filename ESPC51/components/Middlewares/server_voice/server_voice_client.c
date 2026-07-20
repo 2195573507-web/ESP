@@ -565,9 +565,11 @@ static void server_voice_response_process(void)
 static void server_voice_response_task(void *arg)
 {
     (void)arg;
+    app_stack_monitor_log(TAG, "server_voice_client", "task_entry");
     while (true) {
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         server_voice_response_process();
+        app_stack_monitor_log(TAG, "server_voice_client", "after_response_process");
     }
 }
 
@@ -587,11 +589,13 @@ esp_err_t server_voice_client_init(const server_voice_client_config_t *config)
     s_voice.playback_start_ctx = config->playback_start_ctx;
     s_voice.error_cb = config->error_cb;
     s_voice.error_ctx = config->error_ctx;
+    c5_mem_log("task_create_before_server_voice_rx");
     s_voice_response_task_stack = (StackType_t *)c5_mem_alloc(
         SERVER_VOICE_RESPONSE_TASK_STACK_WORDS * sizeof(*s_voice_response_task_stack),
-        C5_MEM_PSRAM,
+        C5_MEM_INTERNAL_CONTROL,
         "server_voice_rx_stack");
     if (s_voice_response_task_stack == NULL) {
+        c5_mem_log("task_create_after_server_voice_rx_failed");
         return ESP_ERR_NO_MEM;
     }
     s_voice.response_task = xTaskCreateStatic(server_voice_response_task,
@@ -604,11 +608,14 @@ esp_err_t server_voice_client_init(const server_voice_client_config_t *config)
     if (s_voice.response_task == NULL) {
         c5_mem_free(s_voice_response_task_stack, "server_voice_rx_stack");
         s_voice_response_task_stack = NULL;
+        c5_mem_log("task_create_after_server_voice_rx_failed");
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG,
-             "VOICE_TASK_STACK task=server_voice_rx bytes=%u source=psram_static",
+             "VOICE_TASK_STACK task=server_voice_rx bytes=%u source=internal_static",
              (unsigned int)SERVER_VOICE_RESPONSE_TASK_STACK);
+    ESP_LOGI(TAG, "TASK_CREATE task=server_voice_rx handle=%p", s_voice.response_task);
+    c5_mem_log("task_create_after_server_voice_rx");
     s_voice.initialized = true;
     s_voice.state = SERVER_VOICE_STATE_IDLE;
     server_voice_log_heap("server voice client initialized");

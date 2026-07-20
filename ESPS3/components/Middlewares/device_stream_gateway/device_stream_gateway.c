@@ -856,11 +856,15 @@ esp_err_t device_stream_gateway_start(void)
                                                  NULL,
                                                  DEVICE_STREAM_UDP_TASK_PRIORITY,
                                                  &s_udp_task,
-                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (created != pdPASS) {
             s_udp_task = NULL;
             return ESP_ERR_NO_MEM;
         }
+        app_stack_monitor_log_task_created(TAG,
+                                           "device_stream_udp",
+                                           s_udp_task,
+                                           DEVICE_STREAM_UDP_TASK_STACK);
     }
     s_stream_running = true;
     return ESP_OK;

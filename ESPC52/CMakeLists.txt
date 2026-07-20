@@ -6,7 +6,9 @@ set(EXTRA_COMPONENT_DIRS
     components/Middlewares
     components/Middlewares/server_comm
     components/BSP/IIS
-    components/BSP/IIC)
+    components/BSP/IIC
+    components/lcd
+    components/lcd_ui)
 add_compile_options(-fdiagnostics-color=always)
 
 

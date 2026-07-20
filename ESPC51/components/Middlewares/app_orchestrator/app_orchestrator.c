@@ -11,12 +11,16 @@
 
 #include "app_orchestrator.h"
 
+#include <string.h>
+
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "app_debug_config.h"
 #include "app_main_config.h"
@@ -24,9 +28,13 @@
 #include "bme_sensor_service.h"
 #include "c5_backpressure_controller.h"
 #include "c5_memory.h"
+#include "c5_resource_manager.h"
 #include "gateway_link.h"
+#include "lcd_service.h"
+#include "radar_board_config.h"
 #include "radar_service.h"
 #include "radar_ble_runtime.h"
+#include "screen_service.h"
 #include "speaker_player.h"
 #include "system_service.h"
 #include "voice_chain.h"
@@ -35,9 +43,286 @@
 /* 日志标签：只在本文件使用，不作为调试参数。 */
 static const char *TAG = "APP_MAIN";
 
+#define C5_GATEWAY_STARTUP_WAIT_MS 15000U
+#define C5_LCD_BOOTSTRAP_TASK_STACK 4096U
+#define C5_LCD_BOOTSTRAP_TASK_PRIORITY 1U
+#define C5_LCD_EVENT_TASK_STACK 2048U
+#define C5_LCD_EVENT_TASK_PRIORITY 1U
+#define C5_LCD_EVENT_POLL_MS 100U
+#define C5_LCD_BOOTSTRAP_RETRY_MS 1000U
+#define C5_LCD_INTERNAL_FREE_MIN (20U * 1024U)
+#define C5_LCD_INTERNAL_LARGEST_MIN (20U * 1024U)
+#define C5_LCD_DMA_FREE_MIN (30U * 1024U)
+#define C5_LCD_DMA_LARGEST_MIN (20U * 1024U)
+#define C5_LCD_PSRAM_FREE_MIN (100U * 1024U)
+#define C5_LCD_PSRAM_LARGEST_MIN (96U * 1024U)
+
+enum {
+    C5_LCD_DEGRADED_HOME_SNAPSHOT_UNAVAILABLE = 1U << 0,
+    C5_LCD_DEGRADED_RADAR_UNAVAILABLE = 1U << 1,
+};
+
+static TaskHandle_t s_lcd_bootstrap_task;
+static TaskHandle_t s_lcd_event_task;
+static StackType_t *s_lcd_bootstrap_stack;
+static StackType_t *s_lcd_event_stack;
+static StaticTask_t s_lcd_bootstrap_storage;
+static StaticTask_t s_lcd_event_storage;
+static uint32_t s_lcd_adapter_generation;
+static uint32_t s_lcd_snapshot_generation;
+
+static uint64_t c5_lcd_now_ms(void)
+{
+    return (uint64_t)esp_timer_get_time() / 1000U;
+}
+
+static lcd_voice_state_t c5_lcd_voice_state(voice_chain_state_t state)
+{
+    switch (state) {
+    case VOICE_WAKE_ACK: return LCD_VOICE_WAKE;
+    case VOICE_RECORDING: return LCD_VOICE_RECORDING;
+    case VOICE_WAITING_RESPONSE: return LCD_VOICE_WAITING;
+    case VOICE_PLAYING: return LCD_VOICE_PLAYING;
+    case VOICE_ERROR: return LCD_VOICE_ERROR;
+    case VOICE_IDLE:
+    case VOICE_LISTENING:
+    default: return LCD_VOICE_IDLE;
+    }
+}
+
+static esp_err_t c5_lcd_submit_screen_command(void *context,
+                                               const screen_service_command_t *command)
+{
+    (void)context;
+    if (command == NULL || !command->valid) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    lcd_command_t lcd_command = {0};
+    lcd_command.generation = command->generation;
+    strlcpy(lcd_command.title, command->title, sizeof(lcd_command.title));
+    strlcpy(lcd_command.text, command->clear ? "" : command->text, sizeof(lcd_command.text));
+    const uint64_t now_ms = c5_lcd_now_ms();
+    const uint64_t ttl_ms = command->clear || command->expires_at_ms <= now_ms ? 1U :
+                            command->expires_at_ms - now_ms;
+    lcd_command.ttl_ms = ttl_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)ttl_ms;
+    return lcd_service_post_command(&lcd_command);
+}
+
+static void c5_lcd_publish_snapshot(void)
+{
+    lcd_system_snapshot_t snapshot = {0};
+    snapshot.timestamp_ms = c5_lcd_now_ms();
+    snapshot.generation = ++s_lcd_snapshot_generation;
+    if (snapshot.generation == 0U) {
+        snapshot.generation = ++s_lcd_snapshot_generation;
+    }
+    snapshot.wifi_state = wifi_is_connected() ? LCD_WIFI_ONLINE : LCD_WIFI_OFFLINE;
+    snapshot.gateway_online = gateway_link_is_ready();
+
+    bme_sensor_service_reading_t bme = {0};
+    bme_sensor_service_get_latest_reading(&bme);
+    snapshot.bme_valid = bme.valid;
+    snapshot.temperature_c = bme.temperature_c;
+    snapshot.humidity_percent = bme.humidity_percent;
+    snapshot.iaq = bme.air_quality_score;
+
+    radar_target_sample_t radar = {0};
+    radar_service_get_target_sample(&radar);
+    const uint8_t source_index = RADAR_BOARD_LOCAL_ID < LCD_SYSTEM_SNAPSHOT_RADAR_SOURCES ?
+                                     RADAR_BOARD_LOCAL_ID : 0U;
+    lcd_radar_source_snapshot_t *const source = &snapshot.radar_sources[source_index];
+    source->healthy = radar.sample_valid;
+    source->presence = radar.sample_valid && radar.target_count > 0U;
+    source->person_count = radar.sample_valid ? radar.target_count : 0U;
+    for (uint8_t i = 0U; i < radar.target_count; ++i) {
+        source->motion = source->motion || radar.targets[i].speed_cm_s != 0;
+    }
+    snapshot.room_occupied = source->presence;
+    snapshot.home_occupied = false;
+    snapshot.home_person_count = 0U;
+    snapshot.degraded_flags = C5_LCD_DEGRADED_HOME_SNAPSHOT_UNAVAILABLE;
+    if (!radar_service_is_started()) {
+        snapshot.degraded_flags |= C5_LCD_DEGRADED_RADAR_UNAVAILABLE;
+    }
+
+    const voice_chain_state_t voice_state = voice_chain_get_state();
+    snapshot.voice_state = c5_lcd_voice_state(voice_state);
+    snapshot.speaker_active = voice_state == VOICE_PLAYING;
+    snapshot.wake_allowed = voice_state == VOICE_LISTENING && gateway_link_is_ready() &&
+                            !c5_resource_manager_is_voice_exclusive();
+    (void)lcd_service_post_snapshot(&snapshot);
+}
+
+static void c5_lcd_event_task(void *arg)
+{
+    (void)arg;
+    while (lcd_service_is_started()) {
+        lcd_wake_event_t wake_event = {0};
+        while (lcd_service_take_wake_event(&wake_event)) {
+            const voice_chain_state_t state = voice_chain_get_state();
+            if (state != VOICE_LISTENING || c5_resource_manager_is_voice_exclusive()) {
+                ESP_LOGW(TAG,
+                         "LCD_WAKE_EVENT_DROPPED generation=%lu voice=%s exclusive=%u",
+                         (unsigned long)wake_event.generation,
+                         voice_chain_state_name(state),
+                         c5_resource_manager_is_voice_exclusive() ? 1U : 0U);
+                continue;
+            }
+            const esp_err_t wake_ret = voice_chain_request_local_wake();
+            if (wake_ret != ESP_OK) {
+                ESP_LOGW(TAG, "LCD_WAKE_EVENT_REJECTED ret=%s", esp_err_to_name(wake_ret));
+            }
+        }
+        c5_lcd_publish_snapshot();
+        vTaskDelay(pdMS_TO_TICKS(C5_LCD_EVENT_POLL_MS));
+    }
+    s_lcd_event_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static bool c5_lcd_bootstrap_retryable(esp_err_t ret)
+{
+    return ret == ESP_ERR_NO_MEM || ret == ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t c5_lcd_start_once(void)
+{
+    esp_err_t ret = c5_mem_require(C5_MEM_INTERNAL_CONTROL,
+                                   C5_LCD_INTERNAL_FREE_MIN,
+                                   C5_LCD_INTERNAL_LARGEST_MIN,
+                                   "lcd_bootstrap_internal");
+    if (ret == ESP_OK) {
+        ret = c5_mem_require(C5_MEM_INTERNAL_DMA,
+                             C5_LCD_DMA_FREE_MIN,
+                             C5_LCD_DMA_LARGEST_MIN,
+                             "lcd_bootstrap_dma");
+    }
+    if (ret == ESP_OK) {
+        ret = c5_mem_require(C5_MEM_PSRAM,
+                             C5_LCD_PSRAM_FREE_MIN,
+                             C5_LCD_PSRAM_LARGEST_MIN,
+                             "lcd_bootstrap_ui_arena");
+    }
+    if (ret == ESP_OK && c5_resource_manager_is_voice_exclusive()) {
+        ret = ESP_ERR_INVALID_STATE;
+    }
+    if (ret == ESP_OK) {
+        ret = lcd_service_start();
+    }
+    if (ret == ESP_OK) {
+        const screen_service_lcd_adapter_t adapter = {
+            .submit = c5_lcd_submit_screen_command,
+            .context = NULL,
+        };
+        ret = screen_service_attach_lcd(&adapter);
+        s_lcd_adapter_generation = screen_service_lcd_generation();
+    }
+    if (ret == ESP_OK) {
+        c5_lcd_publish_snapshot();
+        c5_mem_log("task_create_before_lcd_events");
+        if (s_lcd_event_stack == NULL) {
+            s_lcd_event_stack = (StackType_t *)c5_mem_alloc(C5_LCD_EVENT_TASK_STACK,
+                                                             C5_MEM_INTERNAL_CONTROL,
+                                                             "lcd_events_stack");
+        }
+        if (s_lcd_event_stack == NULL) {
+            ret = ESP_ERR_NO_MEM;
+        } else {
+            s_lcd_event_task = xTaskCreateStatic(c5_lcd_event_task,
+                                                  "lcd_events",
+                                                  C5_LCD_EVENT_TASK_STACK,
+                                                  NULL,
+                                                  C5_LCD_EVENT_TASK_PRIORITY,
+                                                  s_lcd_event_stack,
+                                                  &s_lcd_event_storage);
+            if (s_lcd_event_task == NULL) {
+                ret = ESP_ERR_NO_MEM;
+            } else {
+                ESP_LOGI(TAG, "TASK_CREATE task=lcd_events stack=%u source=internal_static",
+                         (unsigned int)C5_LCD_EVENT_TASK_STACK);
+            }
+        }
+        c5_mem_log(ret == ESP_OK ? "task_create_after_lcd_events" :
+                                  "task_create_after_lcd_events_failed");
+    }
+    return ret;
+}
+
+static void c5_lcd_bootstrap_task(void *arg)
+{
+    (void)arg;
+    while (!lcd_service_is_started()) {
+        c5_mem_log("lcd_bootstrap_before");
+        esp_err_t ret = c5_scheduler_start_deferred_workers();
+        if (ret == ESP_OK) {
+            ret = c5_lcd_start_once();
+        }
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "LCD_START_FAILED ret=%s", esp_err_to_name(ret));
+            if (s_lcd_adapter_generation != 0U) {
+                screen_service_detach_lcd(s_lcd_adapter_generation);
+                s_lcd_adapter_generation = 0U;
+            }
+            (void)lcd_service_stop();
+            c5_mem_log("lcd_bootstrap_after_failed");
+            if (c5_lcd_bootstrap_retryable(ret)) {
+                ESP_LOGW(TAG,
+                         "LCD_BOOTSTRAP_RETRY ret=%s retry_ms=%u",
+                         esp_err_to_name(ret),
+                         (unsigned int)C5_LCD_BOOTSTRAP_RETRY_MS);
+                vTaskDelay(pdMS_TO_TICKS(C5_LCD_BOOTSTRAP_RETRY_MS));
+                continue;
+            }
+            break;
+        }
+        ESP_LOGI(TAG, "LCD_START_OK legacy_dma_released=1 draw_dma_bytes=4800");
+        c5_mem_log("lcd_bootstrap_after");
+    }
+    s_lcd_bootstrap_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void c5_schedule_lcd_bootstrap(void)
+{
+    if (s_lcd_bootstrap_task != NULL || lcd_service_is_started()) {
+        return;
+    }
+    c5_mem_log("task_create_before_lcd_bootstrap");
+    if (s_lcd_bootstrap_stack == NULL) {
+        s_lcd_bootstrap_stack = (StackType_t *)c5_mem_alloc(C5_LCD_BOOTSTRAP_TASK_STACK,
+                                                             C5_MEM_INTERNAL_CONTROL,
+                                                             "lcd_bootstrap_stack");
+    }
+    if (s_lcd_bootstrap_stack == NULL) {
+        s_lcd_bootstrap_task = NULL;
+        ESP_LOGW(TAG, "LCD_BOOTSTRAP_TASK_FAILED ret=%s", esp_err_to_name(ESP_ERR_NO_MEM));
+        c5_mem_log("task_create_after_lcd_bootstrap_failed");
+        return;
+    }
+    s_lcd_bootstrap_task = xTaskCreateStatic(c5_lcd_bootstrap_task,
+                                             "lcd_bootstrap",
+                                             C5_LCD_BOOTSTRAP_TASK_STACK,
+                                             NULL,
+                                             C5_LCD_BOOTSTRAP_TASK_PRIORITY,
+                                             s_lcd_bootstrap_stack,
+                                             &s_lcd_bootstrap_storage);
+    if (s_lcd_bootstrap_task == NULL) {
+        c5_mem_free(s_lcd_bootstrap_stack, "lcd_bootstrap_stack");
+        s_lcd_bootstrap_stack = NULL;
+        ESP_LOGW(TAG, "LCD_BOOTSTRAP_TASK_FAILED ret=%s", esp_err_to_name(ESP_ERR_NO_MEM));
+        c5_mem_log("task_create_after_lcd_bootstrap_failed");
+        return;
+    }
+    ESP_LOGI(TAG, "TASK_CREATE task=lcd_bootstrap stack=%u source=internal_static",
+             (unsigned int)C5_LCD_BOOTSTRAP_TASK_STACK);
+    c5_mem_log("task_create_after_lcd_bootstrap");
+}
+
 void app_orchestrator_start(void)
 {
     char connected_ssid[33] = {0};
+    bool gateway_ready = false;
 
     app_stack_monitor_log(TAG, "app_startup_task", "orchestrator_enter");
     c5_mem_log("startup");
@@ -50,41 +335,43 @@ void app_orchestrator_start(void)
      * 4. voice_chain 通过 /local/v1/voice/turn 发送 PCM，S3 再代理完整 Server 协议。
      */
 
-    // 初始化 WiFi 管理器：内部完成 NVS、网络接口、事件循环和 STA 模式初始化。
-    ESP_ERROR_CHECK(wifi_manager_init());
-    app_stack_monitor_log(TAG, "app_startup_task", "after_wifi_manager_init");
-
-    ESP_ERROR_CHECK(gateway_link_start());
-    app_stack_monitor_log(TAG, "app_startup_task", "after_gateway_link_start");
-
-    // C5 terminal 正式模式只连接 ESPS3 SoftAP，不连接家庭 WiFi。
-    if (wifi_connect_to_ap() != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi connect failed");
-        while (1) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+    // WiFi/link failure is observable but never prevents local sensors, radar, voice control or LCD from starting.
+    esp_err_t network_ret = wifi_manager_init();
+    if (network_ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi manager init failed: %s", esp_err_to_name(network_ret));
+    } else {
+        app_stack_monitor_log(TAG, "app_startup_task", "after_wifi_manager_init");
+        network_ret = gateway_link_start();
+        if (network_ret != ESP_OK) {
+            ESP_LOGE(TAG, "gateway link start failed: %s", esp_err_to_name(network_ret));
+        } else {
+            app_stack_monitor_log(TAG, "app_startup_task", "after_gateway_link_start");
+            network_ret = wifi_connect_to_ap();
+            if (network_ret != ESP_OK) {
+                ESP_LOGW(TAG, "WiFi initial connect deferred: %s", esp_err_to_name(network_ret));
+            } else {
+                if (wifi_get_connected_ssid(connected_ssid, sizeof(connected_ssid))) {
+                    ESP_LOGI(TAG, "WiFi connected: %s", connected_ssid);
+                } else {
+                    ESP_LOGI(TAG, "WiFi connected");
+                }
+                app_stack_monitor_log(TAG, "app_startup_task", "after_wifi_connect");
+                c5_mem_log("after_wifi_connect");
+                if (wifi_is_stable()) {
+                    network_ret = gateway_link_wait_ready(C5_GATEWAY_STARTUP_WAIT_MS);
+                    gateway_ready = network_ret == ESP_OK;
+                    if (!gateway_ready) {
+                        ESP_LOGW(TAG, "gateway initial readiness deferred: %s", esp_err_to_name(network_ret));
+                    }
+                } else {
+                    ESP_LOGW(TAG, "WiFi not stable during bounded startup window");
+                }
+            }
         }
     }
-
-    if (wifi_get_connected_ssid(connected_ssid, sizeof(connected_ssid))) {
-        ESP_LOGI(TAG, "WiFi connected: %s", connected_ssid);
-    } else {
-        ESP_LOGI(TAG, "WiFi connected");
-    }
-    app_stack_monitor_log(TAG, "app_startup_task", "after_wifi_connect");
-    c5_mem_log("after_wifi_connect");
-
-    // 等待 WiFi 连续稳定后再探测 S3 local HTTP，避免刚拿到 IP 时就发起业务请求。
-    while (!wifi_is_stable()) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    app_stack_monitor_log(TAG, "app_startup_task", "after_wifi_stable");
-
-    /*
-     * C5 与 S3 断联时，恢复 S3 连接是最高优先级。只有 health probe 和 child register
-     * 成功进入 LINK_READY 后，才允许 heartbeat/status/command、BME 上传和 server voice。
-     */
-    ESP_ERROR_CHECK(gateway_link_wait_ready(GATEWAY_LINK_WAIT_FOREVER_MS));
-    app_stack_monitor_log(TAG, "app_startup_task", "after_gateway_link_ready");
+    app_stack_monitor_log(TAG,
+                          "app_startup_task",
+                          gateway_ready ? "after_gateway_link_ready" : "gateway_degraded");
     ESP_LOGI(TAG,
              "heap summary: free=%u min_free=%u largest_8bit_block=%u",
              (unsigned int)heap_caps_get_free_size(MALLOC_CAP_8BIT),
@@ -164,8 +451,9 @@ void app_orchestrator_start(void)
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_voice_chain_start");
 
-    // WiFi 重连、Mic ADC/VAD、本地 voice turn、speaker PCM 播放和 C5 runtime 都在后台任务中运行。
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(MAIN_IDLE_DELAY_MS));
-    }
+    /* The lower-priority PSRAM-stack task cannot run until this startup task returns and deletes itself. */
+    c5_schedule_lcd_bootstrap();
+
+    // All long-running services own their background tasks. Returning releases app_startup's 12 KiB stack.
+    app_stack_monitor_log(TAG, "app_startup_task", "startup_complete");
 }

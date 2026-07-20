@@ -194,7 +194,7 @@ X-Payload-Type: voice.turn
 
 ```dotenv
 VOICE_TURN_MOCK=1
-VOICE_TURN_TIMEOUT_MS=60000
+VOICE_TURN_TIMEOUT_MS=45000
 VOICE_TURN_MAX_CONCURRENT=1
 VOICE_TURN_MAX_BYTES=4194304
 VOLC_GATEWAY_API_KEY=<火山网关API Key，仅 VOICE_TURN_MOCK=0 时需要>
@@ -222,7 +222,7 @@ VOLC_GATEWAY_TTS_VOLUME=1.0
 - 火山网关当前已知可用的是文本 Chat Completions：`https://ai-gateway.vei.volces.com/v1/chat/completions`，以及 Realtime WebSocket：`wss://ai-gateway.vei.volces.com/v1/realtime?model=bigmodel`。这些都不是 `/v1/voice` HTTP turn 上游。
 - 当前后端实现使用 `VOLC_GATEWAY_*` 配置完成 ASR -> LLM -> TTS 链式处理；`VOICE_TURN_MOCK=1` 时不调用外部 ASR/LLM/TTS。
 - HTTP TTS 上游响应允许 raw PCM、WAV PCM s16le mono 16kHz，或 JSON 中的 base64 PCM 字段（如 `pcm_base64`、`audio_base64`、`pcm`、`audio`、`data`）。
-- `VOICE_TURN_TIMEOUT_MS` 是 Server 侧单轮语音总超时，默认与 C5/S3 的 `VOICE_REQUEST_TIMEOUT_MS` 统一为 `60000ms`；环境变量仍可按部署需要覆盖。
+- `VOICE_TURN_TIMEOUT_MS` 是 Server 侧单轮语音总超时。ESP 侧上传超时应大于该值加网络余量，避免 Server 还在处理时设备提前断开。
 - Server 会在 SQLite 中创建并维护 `voice_turns` 表，用于记录每轮 `/api/voice/turn` 的请求 ID、设备 ID、模式、状态、错误码、输入/响应字节、ASR/LLM/TTS 耗时和总耗时。该表是后端诊断日志，不改变当前 HTTP 响应格式。
 
 失败响应会返回结构化错误码。缺少 `X-Audio-Format` 时返回 HTTP `415`：

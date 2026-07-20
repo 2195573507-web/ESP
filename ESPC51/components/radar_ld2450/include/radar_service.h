@@ -23,6 +23,7 @@ typedef struct {
 
 esp_err_t radar_service_init(void);
 esp_err_t radar_service_start(void);
+void radar_service_deinit(void);
 bool radar_service_is_started(void);
 void radar_service_get_target_sample(radar_target_sample_t *out);
 void radar_service_get_diagnostics(radar_service_diagnostics_t *out);

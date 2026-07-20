@@ -16,7 +16,9 @@
 #include "app_debug_config.h"
 #include "app_runtime.h"
 #include "app_stack_monitor.h"
+#include "c5_memory.h"
 #include "c5_resource_manager.h"
+#include "c5_task_lifecycle.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -32,12 +34,17 @@
 static const char *TAG = "voice_chain";
 static UBaseType_t s_voice_chain_stack_high_water_bytes;
 
+/* ESP-IDF on ESP32-C5 defines StackType_t as uint8_t, so task depths are bytes. */
+static StackType_t *s_voice_task_stack;
+static StaticTask_t s_voice_task_storage;
+
 #ifndef VOICE_CHAIN_RELEASE_RETRY_DELAY_MS
 #define VOICE_CHAIN_RELEASE_RETRY_DELAY_MS 250U
 #endif
 
 typedef enum {
     VOICE_CHAIN_EVENT_LOCAL_WAKE = 0,
+    VOICE_CHAIN_EVENT_LCD_WAKE_REQUEST,
     VOICE_CHAIN_EVENT_RECORDING_FINISHED,
     VOICE_CHAIN_EVENT_SERVER_DONE,
     VOICE_CHAIN_EVENT_SERVER_ERROR,
@@ -64,9 +71,12 @@ typedef struct {
 } voice_chain_context_t;
 
 static voice_chain_context_t s_voice;
+static portMUX_TYPE s_voice_task_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_terminal_event_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_terminal_event_pending;
 static voice_chain_item_t s_terminal_event;
+static portMUX_TYPE s_wake_prepare_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_wake_prepare_in_progress;
 
 static esp_err_t voice_chain_pause_mic(void);
 static esp_err_t voice_chain_quiesce_mic_for_speaker(const char *reason);
@@ -75,6 +85,22 @@ static esp_err_t voice_chain_queue_event(const voice_chain_item_t *item, const c
 static esp_err_t voice_chain_queue_terminal_event(const voice_chain_item_t *item,
                                                    const char *label);
 static void voice_chain_gateway_link_abort_cb(const char *reason);
+
+static void voice_chain_set_wake_prepare_in_progress(bool in_progress)
+{
+    portENTER_CRITICAL(&s_wake_prepare_lock);
+    s_wake_prepare_in_progress = in_progress;
+    portEXIT_CRITICAL(&s_wake_prepare_lock);
+}
+
+static bool voice_chain_wake_prepare_is_in_progress(void)
+{
+    bool in_progress;
+    portENTER_CRITICAL(&s_wake_prepare_lock);
+    in_progress = s_wake_prepare_in_progress;
+    portEXIT_CRITICAL(&s_wake_prepare_lock);
+    return in_progress;
+}
 
 const char *voice_chain_state_name(voice_chain_state_t state)
 {
@@ -149,6 +175,17 @@ static void voice_chain_log_audio_dma_heap(const char *phase)
              (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned int)heap_caps_get_free_size(MALLOC_CAP_DMA),
              (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+}
+
+static bool voice_chain_check_heap_integrity(const char *stage)
+{
+    const bool integrity_ok = heap_caps_check_integrity_all(true);
+    ESP_LOG_LEVEL_LOCAL(integrity_ok ? ESP_LOG_INFO : ESP_LOG_ERROR,
+                        TAG,
+                        "RUNTIME_PROTECTION heap_integrity stage=%s result=%s",
+                        stage != NULL ? stage : "<none>",
+                        integrity_ok ? "ok" : "failed");
+    return integrity_ok;
 }
 
 static void voice_chain_log_start_stage(const char *stage, const char *edge, esp_err_t ret)
@@ -296,6 +333,20 @@ static esp_err_t voice_chain_queue_local_wake_event(void)
         .type = VOICE_CHAIN_EVENT_LOCAL_WAKE,
     };
     return voice_chain_queue_event(&item, "local_wake");
+}
+
+esp_err_t voice_chain_request_local_wake(void)
+{
+    if (!s_voice.started || s_voice.event_queue == NULL ||
+        s_voice.state != VOICE_LISTENING || voice_chain_wake_prepare_is_in_progress()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const voice_chain_item_t item = {
+        .type = VOICE_CHAIN_EVENT_LCD_WAKE_REQUEST,
+        .generation = s_voice.mic_generation,
+    };
+    return voice_chain_queue_event(&item, "lcd_wake_request");
 }
 
 static esp_err_t voice_chain_server_done_sink(uint32_t lease_generation, void *user_ctx)
@@ -538,20 +589,32 @@ static esp_err_t voice_chain_prepare_for_server_voice_start(void *user_ctx)
         }
 
         ESP_LOGI(TAG, "enter voice exclusive reason=local_wake");
+        voice_chain_set_wake_prepare_in_progress(true);
         voice_chain_set_state(VOICE_WAKE_ACK);
         esp_err_t ret = c5_resource_manager_begin_voice("voice_chain", &s_voice.lease);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "voice resource quiesce failed before local wake ack: %s", esp_err_to_name(ret));
             local_wake_word_cancel_recording_window();
             voice_chain_set_state(VOICE_LISTENING);
+            voice_chain_set_wake_prepare_in_progress(false);
             return ret;
         }
         ESP_LOGI(TAG, "voice resources quiesced reason=local_wake generation=%lu",
                  (unsigned long)s_voice.lease.generation);
 
+        /* A link loss during QUIESCING has no published lease for the abort callback. */
+        if (!gateway_link_can_start_voice_turn()) {
+            ESP_LOGW(TAG, "gateway offline after voice resource quiesce");
+            voice_chain_set_wake_prepare_in_progress(false);
+            (void)voice_chain_queue_terminal_error(ESP_ERR_INVALID_STATE,
+                                                    "gateway offline after voice resource quiesce");
+            return ESP_ERR_INVALID_STATE;
+        }
+
         ret = server_voice_client_prepare_async();
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "server voice prepare failed: %s", esp_err_to_name(ret));
+            voice_chain_set_wake_prepare_in_progress(false);
             (void)voice_chain_queue_terminal_error(ret, "server voice prepare failed");
             return ret;
         }
@@ -559,14 +622,17 @@ static esp_err_t voice_chain_prepare_for_server_voice_start(void *user_ctx)
         ret = mic_adc_test_pause();
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Mic pause request before local wake ack failed: %s", esp_err_to_name(ret));
+            voice_chain_set_wake_prepare_in_progress(false);
             (void)voice_chain_queue_terminal_error(ret, "mic pause request failed");
             return ret;
         }
         ret = voice_chain_queue_local_wake_event();
         if (ret != ESP_OK) {
+            voice_chain_set_wake_prepare_in_progress(false);
             (void)voice_chain_queue_terminal_error(ret, "local wake event handoff failed");
             return ret;
         }
+        voice_chain_set_wake_prepare_in_progress(false);
         return ESP_ERR_NOT_FINISHED;
     }
 
@@ -663,9 +729,14 @@ static bool voice_chain_server_voice_is_ready(void *user_ctx)
 
 static void voice_chain_cleanup_start_failure(void)
 {
-    if (s_voice.task != NULL) {
-        vTaskDelete(s_voice.task);
-        s_voice.task = NULL;
+    (void)c5_task_delete_safe(&s_voice.task,
+                               &s_voice_task_lock,
+                               TAG,
+                               "voice_chain",
+                               "start_failure");
+    if (s_voice_task_stack != NULL) {
+        c5_mem_free(s_voice_task_stack, "voice_chain_stack");
+        s_voice_task_stack = NULL;
     }
     mic_adc_test_set_voice_stream_ops(NULL);
     local_wake_word_cancel_recording_window();
@@ -745,6 +816,11 @@ static void voice_chain_handle_local_wake(void)
     ret = c5_resource_manager_note_phase(s_voice.lease, "before_i2s_init");
     if (ret != ESP_OK) {
         voice_chain_abort_round("local_wake_before_i2s_phase_fail");
+        return;
+    }
+    app_stack_monitor_log(TAG, "wake_prompt_stream", "before_wake_prompt");
+    if (!voice_chain_check_heap_integrity("before_wake_prompt")) {
+        voice_chain_abort_round("wake_before_heap_integrity_failed");
         return;
     }
     ret = local_wake_word_on_local_wake_detected();
@@ -883,6 +959,11 @@ static void voice_chain_task(void *arg)
             continue;
         }
         if (voice_chain_event_requires_current_lease(item.type)) {
+            while (voice_chain_wake_prepare_is_in_progress()) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+        }
+        if (voice_chain_event_requires_current_lease(item.type)) {
             if (item.lease_generation == 0U ||
                 item.lease_generation != s_voice.lease.generation) {
                 ESP_LOGW(TAG,
@@ -905,6 +986,13 @@ static void voice_chain_task(void *arg)
             voice_chain_handle_local_wake();
             app_stack_monitor_log(TAG, "voice_chain", "after_local_wake");
             break;
+        case VOICE_CHAIN_EVENT_LCD_WAKE_REQUEST: {
+            const esp_err_t ret = voice_chain_prepare_for_server_voice_start(NULL);
+            if (ret != ESP_OK && ret != ESP_ERR_NOT_FINISHED) {
+                ESP_LOGW(TAG, "LCD wake request rejected: %s", esp_err_to_name(ret));
+            }
+            break;
+        }
         case VOICE_CHAIN_EVENT_RECORDING_FINISHED:
             voice_chain_handle_recording_finished();
             app_stack_monitor_log(TAG, "voice_chain", "after_recording_finished");
@@ -940,6 +1028,7 @@ esp_err_t voice_chain_start(void)
     }
 
     memset(&s_voice, 0, sizeof(s_voice));
+    voice_chain_set_wake_prepare_in_progress(false);
     portENTER_CRITICAL(&s_terminal_event_lock);
     memset(&s_terminal_event, 0, sizeof(s_terminal_event));
     s_terminal_event_pending = false;
@@ -1006,23 +1095,40 @@ esp_err_t voice_chain_start(void)
     voice_chain_log_start_stage("mic_voice_stream_ops_register", "after", ESP_OK);
 
     voice_chain_log_start_stage("voice_chain_task_create", "before", ESP_ERR_NOT_FINISHED);
-    BaseType_t created = xTaskCreate(voice_chain_task,
-                                     "voice_chain",
-                                     VOICE_CHAIN_TASK_STACK,
-                                     NULL,
-                                     VOICE_CHAIN_TASK_PRIORITY,
-                                     &s_voice.task);
-    if (created != pdPASS) {
+    c5_mem_log("task_create_before_voice_chain");
+    s_voice_task_stack = (StackType_t *)c5_mem_alloc(VOICE_CHAIN_TASK_STACK,
+                                                       C5_MEM_INTERNAL_CONTROL,
+                                                       "voice_chain_stack");
+    if (s_voice_task_stack == NULL) {
         ret = ESP_ERR_NO_MEM;
         voice_chain_log_start_stage("voice_chain_task_create", "after", ret);
-        voice_chain_log_start_failure("xTaskCreate(voice_chain)", ret);
+        voice_chain_log_start_failure("voice_chain_stack_alloc", ret);
         voice_chain_cleanup_start_failure();
+        c5_mem_log("task_create_after_voice_chain_failed");
         return ret;
     }
+    TaskHandle_t task = xTaskCreateStatic(voice_chain_task,
+                                          "voice_chain",
+                                          VOICE_CHAIN_TASK_STACK,
+                                          NULL,
+                                          VOICE_CHAIN_TASK_PRIORITY,
+                                          s_voice_task_stack,
+                                          &s_voice_task_storage);
+    if (task == NULL) {
+        ret = ESP_ERR_NO_MEM;
+        voice_chain_log_start_stage("voice_chain_task_create", "after", ret);
+        voice_chain_log_start_failure("xTaskCreateStatic(voice_chain)", ret);
+        voice_chain_cleanup_start_failure();
+        c5_mem_log("task_create_after_voice_chain_failed");
+        return ret;
+    }
+    c5_task_handle_publish(&s_voice.task, &s_voice_task_lock, task);
     voice_chain_log_start_stage("voice_chain_task_create", "after", ESP_OK);
+    ESP_LOGI(TAG, "TASK_CREATE task=voice_chain");
     ESP_LOGI(TAG,
-             "VOICE_TASK_STACK task=voice_chain bytes=%u source=internal_dynamic",
+             "VOICE_TASK_STACK task=voice_chain bytes=%u source=internal_static",
              (unsigned int)VOICE_CHAIN_TASK_STACK);
+    c5_mem_log("task_create_after_voice_chain");
 
     s_voice.started = true;
 

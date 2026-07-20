@@ -10,17 +10,11 @@ const {
 const {
     recordEvent
 } = require("./eventLogService");
-const {
-    isSupportedC5DeviceId,
-    resolveDeviceId
-} = require("./deviceIdResolver");
 
 const SENSOR_ID_MAX_LENGTH = 80;
 const AIR_QUALITY_LEVELS = new Set(["excellent", "good", "moderate", "poor", "bad", "unknown"]);
 const AIR_QUALITY_CONFIDENCE = new Set(["none", "low", "medium", "high"]);
-const V3_AIR_QUALITY_CONFIDENCE = new Set(["low", "medium", "high"]);
 const AIR_QUALITY_ALGO_VERSION = "esp-bme690-relative-v1";
-const C5_BME690_AIR_QUALITY_V3 = "c5_bme690_air_quality_v3";
 
 function clamp(value, min, max) {
     return Math.min(Math.max(value, min), max);
@@ -57,108 +51,7 @@ function levelForScore(score) {
     return "bad";
 }
 
-function readBooleanOrNull(value) {
-    if (typeof value === "boolean") {
-        return value;
-    }
-    if (typeof value === "number") {
-        return value === 1 ? true : (value === 0 ? false : null);
-    }
-    if (typeof value === "string") {
-        const normalized = value.trim().toLowerCase();
-        if (["true", "1", "yes", "y"].includes(normalized)) {
-            return true;
-        }
-        if (["false", "0", "no", "n"].includes(normalized)) {
-            return false;
-        }
-    }
-    return null;
-}
-
-function copyOpaqueObject(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-        return undefined;
-    }
-
-    return JSON.parse(JSON.stringify(value));
-}
-
-function logAirQualityDecision(logger, source, reason = "") {
-    const target = logger || console;
-    if (source === "fallback") {
-        const message = `[sensor.bme690] AIR_QUALITY_FALLBACK_USED reason=${reason || "invalid_or_missing_air_quality"}`;
-        if (typeof target.warn === "function") {
-            target.warn(message);
-        } else {
-            target.log(message);
-        }
-        return;
-    }
-
-    target.log(`[sensor.bme690] AIR_QUALITY_SOURCE=${source}`);
-}
-
-function normalizeV3AirQuality(payload) {
-    const input = copyOpaqueObject(payload.air_quality);
-    if (!input) {
-        return {
-            ok: false,
-            reason: "v3_air_quality_missing"
-        };
-    }
-
-    const algorithm = trimText(input.algorithm, 80);
-    const rawScore = toFiniteNumber(input.score);
-    const level = trimText(input.level, 40);
-    const confidence = trimText(input.confidence, 40);
-    const gasRatio = toFiniteNumber(input.gas_ratio);
-    const stabilityScore = toFiniteNumber(input.stability_score);
-    const sensorState = trimText(input.sensor_state, 80);
-    const baselineReady = readBooleanOrNull(input.baseline_ready);
-
-    if (algorithm !== C5_BME690_AIR_QUALITY_V3) {
-        return {
-            ok: false,
-            reason: "v3_algorithm_unsupported"
-        };
-    }
-    const score = rawScore !== null && rawScore >= 0 && rawScore <= 100
-        ? rawScore
-        : null;
-    const normalizedLevel = AIR_QUALITY_LEVELS.has(level) ? level : null;
-    const normalizedConfidence = V3_AIR_QUALITY_CONFIDENCE.has(confidence) ? confidence : null;
-
-    if (score === null && normalizedLevel === null && normalizedConfidence === null) {
-        return {
-            ok: false,
-            reason: "v3_core_fields_missing_or_invalid"
-        };
-    }
-
-    // C5 owns this object. Keep every supplied field, including future v3 fields.
-    return {
-        ok: true,
-        airQuality: input
-    };
-}
-
-function readAirQualityCompatibility(airQuality) {
-    const source = airQuality && typeof airQuality === "object" ? airQuality : {};
-    return {
-        air_quality_score: toFiniteNumber(source.air_quality_score ?? source.score),
-        air_quality_level: trimText(source.air_quality_level ?? source.level, 40) || null,
-        air_quality_confidence: trimText(source.air_quality_confidence ?? source.confidence, 40) || null,
-        air_quality_algo_version: trimText(source.air_quality_algo_version ?? source.algorithm, 80) || null,
-        air_quality_source: trimText(source.air_quality_source ?? source.source, 40) || null,
-        gas_baseline_ohm: toFiniteNumber(source.gas_baseline_ohm),
-        gas_ratio: toFiniteNumber(source.gas_ratio),
-        gas_score: roundOrNull(toFiniteNumber(source.gas_score)),
-        humidity_score: roundOrNull(toFiniteNumber(source.humidity_score))
-    };
-}
-
-function normalizeLegacyAirQuality(payload) {
+function normalizeAirQuality(payload, readings) {
     const gasBaseline = toFiniteNumber(payload.gas_baseline_ohm);
     const gasRatio = toFiniteNumber(payload.gas_ratio);
     const gasScore = roundOrNull(toFiniteNumber(payload.gas_score));
@@ -174,80 +67,61 @@ function normalizeLegacyAirQuality(payload) {
         AIR_QUALITY_LEVELS.has(espLevel) &&
         AIR_QUALITY_CONFIDENCE.has(espConfidence)) {
         return {
-            ok: true,
-            airQuality: {
-                air_quality_score: espScore,
-                air_quality_level: espLevel,
-                air_quality_confidence: espConfidence,
-                air_quality_algo_version: trimText(payload.air_quality_algo_version, 80) || AIR_QUALITY_ALGO_VERSION,
-                air_quality_source: espSource === "server_fallback" ? "server_fallback" : "esp",
-                gas_baseline_ohm: gasBaseline,
-                gas_ratio: gasRatio,
-                gas_score: gasScore,
-                humidity_score: humidityScore,
-                baseline_ready: Boolean(payload.baseline_ready),
-                warmup_done: Boolean(payload.warmup_done),
-                sample_count: Number.isFinite(Number(payload.sample_count)) ? Math.trunc(Number(payload.sample_count)) : null
-            }
+            air_quality_score: espScore,
+            air_quality_level: espLevel,
+            air_quality_confidence: espConfidence,
+            air_quality_algo_version: trimText(payload.air_quality_algo_version, 80) || AIR_QUALITY_ALGO_VERSION,
+            air_quality_source: espSource === "server_fallback" ? "server_fallback" : "esp",
+            gas_baseline_ohm: gasBaseline,
+            gas_ratio: gasRatio,
+            gas_score: gasScore,
+            humidity_score: humidityScore,
+            baseline_ready: Boolean(payload.baseline_ready),
+            warmup_done: Boolean(payload.warmup_done),
+            sample_count: Number.isFinite(Number(payload.sample_count)) ? Math.trunc(Number(payload.sample_count)) : null
         };
     }
 
-    if (rawScore === null) {
+    const fallbackBaseline = gasBaseline && gasBaseline > 0
+        ? gasBaseline
+        : (readings.gas_resistance_ohm > 0 ? readings.gas_resistance_ohm : null);
+    if (!fallbackBaseline) {
         return {
-            ok: false,
-            reason: "legacy_score_missing"
+            air_quality_score: null,
+            air_quality_level: "unknown",
+            air_quality_confidence: "none",
+            air_quality_algo_version: AIR_QUALITY_ALGO_VERSION,
+            air_quality_source: "server_fallback",
+            gas_baseline_ohm: null,
+            gas_ratio: null,
+            gas_score: null,
+            humidity_score: null,
+            baseline_ready: false,
+            warmup_done: false,
+            sample_count: null
         };
     }
-    if (!espScoreValid) {
-        return {
-            ok: false,
-            reason: "legacy_score_invalid"
-        };
-    }
-    if (!AIR_QUALITY_LEVELS.has(espLevel)) {
-        return {
-            ok: false,
-            reason: "legacy_level_invalid"
-        };
-    }
-    return {
-        ok: false,
-        reason: "legacy_confidence_invalid"
-    };
-}
 
-function buildFallbackAirQuality(payload, readings) {
+    const fallbackGasRatio = clamp(readings.gas_resistance_ohm / fallbackBaseline, 0, 1.5);
+    const fallbackGasScore = Math.round(clamp(fallbackGasRatio * 100, 0, 100));
+    const humidityDeviation = Math.abs(readings.humidity_percent - 50);
+    const fallbackHumidityScore = Math.round(clamp(100 - humidityDeviation * 2.5, 0, 100));
+    const fallbackScore = Math.round(clamp(fallbackGasScore * 0.75 + fallbackHumidityScore * 0.25, 0, 100));
+
     return {
-        air_quality_score: toFiniteNumber(payload.air_quality_score),
-        air_quality_level: trimText(payload.air_quality_level, 40) || "unknown",
-        air_quality_confidence: trimText(payload.air_quality_confidence, 40) || "none",
-        air_quality_algo_version: trimText(payload.air_quality_algo_version, 80) || null,
-        air_quality_source: "unavailable",
-        gas_baseline_ohm: toFiniteNumber(payload.gas_baseline_ohm),
-        gas_ratio: toFiniteNumber(payload.gas_ratio),
-        gas_score: roundOrNull(toFiniteNumber(payload.gas_score)),
-        humidity_score: roundOrNull(toFiniteNumber(payload.humidity_score)),
-        baseline_ready: readBooleanOrNull(payload.baseline_ready),
-        warmup_done: readBooleanOrNull(payload.warmup_done),
+        air_quality_score: fallbackScore,
+        air_quality_level: levelForScore(fallbackScore),
+        air_quality_confidence: "low",
+        air_quality_algo_version: AIR_QUALITY_ALGO_VERSION,
+        air_quality_source: "server_fallback",
+        gas_baseline_ohm: fallbackBaseline,
+        gas_ratio: fallbackGasRatio,
+        gas_score: fallbackGasScore,
+        humidity_score: fallbackHumidityScore,
+        baseline_ready: false,
+        warmup_done: false,
         sample_count: Number.isFinite(Number(payload.sample_count)) ? Math.trunc(Number(payload.sample_count)) : null
     };
-}
-
-function normalizeAirQuality(payload, readings, options = {}) {
-    const v3 = normalizeV3AirQuality(payload);
-    if (v3.ok) {
-        logAirQualityDecision(options.logger, "v3");
-        return v3.airQuality;
-    }
-
-    const legacy = normalizeLegacyAirQuality(payload);
-    if (legacy.ok) {
-        logAirQualityDecision(options.logger, "legacy");
-        return legacy.airQuality;
-    }
-
-    logAirQualityDecision(options.logger, "fallback", v3.reason !== "v3_air_quality_missing" ? v3.reason : legacy.reason);
-    return buildFallbackAirQuality(payload, readings);
 }
 
 function validateBmeEnvelope(body) {
@@ -308,22 +182,20 @@ function validateBmeEnvelope(body) {
     };
 }
 
-function prepareBme690Ingest(body, options = {}) {
+async function ingestBme690(dbRun, dbAll, body, options = {}) {
     const validation = validateBmeEnvelope(body);
     const serverRecvMs = Number.isFinite(options.serverRecvMs) ? options.serverRecvMs : Date.now();
-    const requestedDeviceId = resolveDeviceId(body?.device_id);
-    const trustedDeviceId = resolveDeviceId(options.trustedDeviceId);
     const metadata = readDeviceMetadata({
         body,
         headers: options.headers,
         query: options.query,
-        deviceId: trustedDeviceId,
+        deviceId: options.trustedDeviceId,
         payloadType: "sensor.bme690",
         serverRecvMs
     });
     metadata.gateway_id = trimText(options.trustedGatewayId, 128);
-    if (trustedDeviceId) {
-        metadata.device_id = trustedDeviceId;
+    if (options.trustedDeviceId) {
+        metadata.device_id = trimText(options.trustedDeviceId, 128);
     }
 
     if (!validation.ok) {
@@ -336,95 +208,23 @@ function prepareBme690Ingest(body, options = {}) {
         };
     }
 
-    if (trustedDeviceId && requestedDeviceId !== trustedDeviceId) {
-        return {
-            ok: false,
-            status: 400,
-            code: "DEVICE_ID_MISMATCH",
-            error: "device_id must match authenticated gateway metadata",
-            metadata
-        };
-    }
-
-    if (options.requireSupportedC5DeviceId === true && !isSupportedC5DeviceId(metadata.device_id)) {
-        return {
-            ok: false,
-            status: 400,
-            code: "DEVICE_ID_NOT_ALLOWED",
-            error: "device_id must be sensair_shuttle_01 or sensair_shuttle_02",
-            metadata
-        };
-    }
-
     const payload = body.payload;
     const sensorId = trimText(payload.sensor_id || payload.module_id || "bme690_01", SENSOR_ID_MAX_LENGTH);
-    const airQuality = normalizeAirQuality(payload, validation.readings, {
-        logger: options.logger
-    });
-    const airQualityCompatibility = readAirQualityCompatibility(airQuality);
-    // These C5-owned objects remain opaque throughout the server pipeline.
-    const bmeDiag = copyOpaqueObject(payload.bme_diag);
-    const baselineState = copyOpaqueObject(payload.baseline_state);
+    const airQuality = normalizeAirQuality(payload, validation.readings);
     const rawJson = JSON.stringify(body);
     const metadataJson = JSON.stringify(metadataForStorage(metadata));
     const airQualityJson = JSON.stringify(airQuality);
 
-    return {
-        ok: true,
-        status: 201,
-        metadata,
-        body,
-        readings: validation.readings,
-        sensorId,
-        airQuality,
-        airQualityCompatibility,
-        bmeDiag,
-        baselineState,
-        rawJson,
-        metadataJson,
-        airQualityJson,
-        hasAlarm: Boolean(body.alarm || body.payload?.alarm || body.payload?.alarm_type),
-        data: {
-            id: null,
-            device_id: metadata.device_id,
-            payload_type: "sensor.bme690",
-            sensor_id: sensorId,
-            server_recv_ms: metadata.server_recv_ms,
-            server_time_iso: metadata.server_time_iso,
-            upload_delay_ms: metadata.upload_delay_ms,
-            air_quality: airQuality,
-            air_quality_score: airQualityCompatibility.air_quality_score,
-            air_quality_level: airQualityCompatibility.air_quality_level,
-            air_quality_confidence: airQualityCompatibility.air_quality_confidence
-        }
-    };
-}
-
-async function persistBme690Ingest(dbRun, dbAll, prepared, options = {}) {
-    if (!prepared?.ok) {
-        return null;
-    }
-
-    const metadata = prepared.metadata;
-    const useTransaction = options.transactional === true;
-    let transactionStarted = false;
-
-    try {
-        if (useTransaction) {
-            await dbRun("BEGIN IMMEDIATE TRANSACTION");
-            transactionStarted = true;
-        }
-
-        const result = await dbRun(
+    const result = await dbRun(
         `INSERT INTO sensor_records
         (timestamp,temperature,humidity,pressure,gas_resistance,device_id,esp_time_ms,esp_uptime_ms,server_recv_ms,server_time_iso,upload_delay_ms,schema_version,device_type,firmware_version,request_seq,time_synced,payload_type,sensor_id,metadata_json,raw_json,air_quality_json,air_quality_score,air_quality_level,air_quality_confidence,air_quality_algo_version,air_quality_source,gas_baseline_ohm,gas_ratio,gas_score,humidity_score)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
-            metadata.server_recv_ms,
-            prepared.readings.temperature_c,
-            prepared.readings.humidity_percent,
-            prepared.readings.pressure_hpa,
-            prepared.readings.gas_resistance_ohm,
+            serverRecvMs,
+            validation.readings.temperature_c,
+            validation.readings.humidity_percent,
+            validation.readings.pressure_hpa,
+            validation.readings.gas_resistance_ohm,
             metadata.device_id,
             metadata.esp_time_ms,
             metadata.esp_uptime_ms,
@@ -437,26 +237,25 @@ async function persistBme690Ingest(dbRun, dbAll, prepared, options = {}) {
             metadata.request_seq,
             metadata.time_synced === null ? null : (metadata.time_synced ? 1 : 0),
             "sensor.bme690",
-            prepared.sensorId,
-            prepared.metadataJson,
-            prepared.rawJson,
-            prepared.airQualityJson,
-            prepared.airQualityCompatibility.air_quality_score,
-            prepared.airQualityCompatibility.air_quality_level,
-            prepared.airQualityCompatibility.air_quality_confidence,
-            prepared.airQualityCompatibility.air_quality_algo_version,
-            prepared.airQualityCompatibility.air_quality_source,
-            prepared.airQualityCompatibility.gas_baseline_ohm,
-            prepared.airQualityCompatibility.gas_ratio,
-            prepared.airQualityCompatibility.gas_score,
-            prepared.airQualityCompatibility.humidity_score
+            sensorId,
+            metadataJson,
+            rawJson,
+            airQualityJson,
+            airQuality.air_quality_score,
+            airQuality.air_quality_level,
+            airQuality.air_quality_confidence,
+            airQuality.air_quality_algo_version,
+            airQuality.air_quality_source,
+            airQuality.gas_baseline_ohm,
+            airQuality.gas_ratio,
+            airQuality.gas_score,
+            airQuality.humidity_score
         ]
-        );
+    );
 
-        await refreshDeviceActivity(dbRun, dbAll, metadata, "sensor.bme690");
-        if (prepared.hasAlarm) {
-            const body = prepared.body;
-            await recordEvent(dbRun, {
+    await refreshDeviceActivity(dbRun, dbAll, metadata, "sensor.bme690");
+    if (body.alarm || body.payload?.alarm || body.payload?.alarm_type) {
+        await recordEvent(dbRun, {
             event_type: "alarm",
             event_name: "alarm_created",
             device_id: metadata.device_id,
@@ -465,47 +264,29 @@ async function persistBme690Ingest(dbRun, dbAll, prepared, options = {}) {
             payload: body.payload?.alarm || body.alarm || body.payload || {},
             source: "device_ingest",
             server_recv_ms: metadata.server_recv_ms
-            });
-        }
-
-        if (transactionStarted) {
-            await dbRun("COMMIT");
-            transactionStarted = false;
-        }
-
-        prepared.data.id = result.lastID;
-        return {
-            ok: true,
-            status: 201,
-            metadata,
-            data: prepared.data
-        };
-    } catch (error) {
-        if (transactionStarted) {
-            try {
-                await dbRun("ROLLBACK");
-            } catch (rollbackError) {
-                throw new Error(`[device-v1] BME transaction failed: ${error?.message || error}; rollback failed: ${rollbackError?.message || rollbackError}`);
-            }
-        }
-        throw error;
-    }
-}
-
-async function ingestBme690(dbRun, dbAll, body, options = {}) {
-    const prepared = prepareBme690Ingest(body, options);
-    if (!prepared.ok) {
-        return prepared;
+        });
     }
 
-    return persistBme690Ingest(dbRun, dbAll, prepared);
+    return {
+        ok: true,
+        status: 201,
+        metadata,
+        data: {
+            id: result.lastID,
+            device_id: metadata.device_id,
+            payload_type: "sensor.bme690",
+            sensor_id: sensorId,
+            server_recv_ms: metadata.server_recv_ms,
+            server_time_iso: metadata.server_time_iso,
+            upload_delay_ms: metadata.upload_delay_ms,
+            air_quality: airQuality
+        }
+    };
 }
 
 module.exports = {
     AIR_QUALITY_ALGO_VERSION,
     ingestBme690,
     normalizeAirQuality,
-    prepareBme690Ingest,
-    persistBme690Ingest,
     validateBmeEnvelope
 };

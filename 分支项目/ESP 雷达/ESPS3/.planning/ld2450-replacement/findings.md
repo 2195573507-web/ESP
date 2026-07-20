@@ -1,0 +1,30 @@
+# LD2450 替换调查记录
+
+- 目标仓库为独立工作区 `/Users/zhiqin/ESP 雷达`。
+- 工作树已有大量用户改动，涉及三套固件和禁止修改的 `ESP-server/`；本任务必须以增量方式兼容。
+- 最终计划共 1288 行，已确认 C51、C52、S3 各接一颗 LD2450，三源独立且不得跨房间融合。
+- active CSI 必须从采集、算法、触发、融合、本地接口和上传链路完整移除，不能只关宏。
+- C5 通过 `POST /local/v1/radar/state` 上报；S3 registry 分别维护 `C51`、`C52`、`S3_LOCAL`。
+- LD2450 基线为 UART 256000 8N1、30 字节数据帧、最多 3 个目标，特殊方向编码不能按普通 `int16_t` 解码。
+- presence 状态必须为 UNKNOWN/MOTION/HOLD/VACANT_INFERRED，默认 2-of-3 进入 MOTION、1 秒进入 HOLD、15 分钟在线有效空帧后推断空房、3 秒无有效帧进入 UNKNOWN。
+- C5 HTTP 上报必须固定上限、latest-only；状态变化立即、目标变化最高 2 Hz、稳定状态 1 秒 heartbeat，语音期间只暂停网络上报。
+- S3 remote ingest 必须校验 body、身份、local_id、session、sequence；S3 local source 直接进入同一 registry API。
+- active CSI 负向词和三固件 build/资源统计/范围审计均为软件完成门槛。
+- 因顶层仅 `ESPC51/`、`ESPC52/`、`ESPS3/` 获准修改，迁移基线、执行日志和硬件清单将存放在 `ESPS3/docs/`。
+- C51/C52 active CSI 文件集合一致：`csi_phase_a`、`csi_edge_detector`、`csi_placeholder`，并由 `Middlewares/CMakeLists.txt` 编译；`sdkconfig.defaults` 均启用 `CONFIG_ESP_WIFI_CSI_ENABLED=y`。
+- C5 共享引用分布在 `app_orchestrator`、`app_runtime`、`c5_backpressure_controller`、`c5_event_bus`、`c5_resource_manager`、`c5_runtime_workers`、device protocol 和 protocol common；必须逐分支清理。
+- S3 active CSI 主链为 `csi_placeholder_gateway`、`csi_fusion`、local HTTP、protocol adapter、sensor aggregator、scheduler/event bus、network worker、server client，并由 Middlewares CMake 编译。
+- 工作树中 C51/C52 runtime、voice、audio、HTTP 等已有大规模对称用户改动；S3 local HTTP/runtime/server client 也已有用户改动，删除 CSI 时必须保留这些非 CSI 增量。
+- C5 语音资源租约当前显式 pause CSI、BME 和共享 workers；雷达必须改为独立 UART/service task，语音只通过公共 non-voice HTTP gate 暂停 radar report。
+- C5 可复用 `server_comm_http_post_json_with_headers()`，其 URL builder 已禁止 `/api/*` 和完整公网 URL；radar client 无需新网络栈。
+- S3 radar remote identity gate 将复用 `child_registry` 注册/在线/peer IP 与 `resource_manager` session generation，但 radar 不调用 confirm/restore/touch，因此不能建立身份或替代 heartbeat。
+- live room 映射为 C51=`living_room`、C52=`bedroom`；S3 local 将使用独立 `s3_local`。
+- S3 CSI server path 分散在 `protocol_adapter`、`sensor_aggregator`、`network_worker`、`server_client`；删除时必须同时移除 JSON type、latest slot/cadence/validator 和 `/kernel/csi_event` transport。
+- 隔离 baseline build 已通过：C51/C52 bin 均为 1376976 bytes，HP SRAM 196880 bytes，flash 分别为 1248682/1248690 bytes；S3 bin 1132640 bytes，DIRAM 175375 bytes，total image 1132529 bytes。
+- 三套雷达 UART 板级配置当前均为 port/TX/RX `-1`，驱动保持禁用；真实 GPIO 只能由硬件资料补齐，属于明确 blocked 项。
+- 三套 `radar_ld2450` parser/presence/codec host tests 已通过；C51/C52 CSI-only 文件和 active runtime/CMake/protocol 引用已移除。
+- S3 已移除 CSI fusion/placeholder 组件、orchestrator/CMake/event bus/resource manager/protocol adapter/sensor aggregator/server client 主链，剩余集中在 network worker、scheduler、local HTTP 与 stream gateway。
+- S3-P1 已完成：network worker latest/upload、scheduler fusion/trigger/cache、local HTTP endpoint、stream type 和 gateway config 均无 active CSI 引用；拆除后及新增 radar domain 后两次 S3 build 均通过。
+- S3 radar remote admission 不调用 child touch/confirm/update，也不建立身份；它要求 child registered+online、local ID 映射、peer IP、live resource session 和 generation 同时匹配。
+- C51/C52 公共 `radar_ld2450`、测试和 radar client 校验和一致；板级配置仅 local ID 和板名不同，UART port/TX/RX 同为等待用户填写的 `-1`。
+- C5 公网词扫描命中仅为 S3 本地 `http://<gateway-ip>` 构造和拒绝完整 URL 的 guard；`/api/` 无命中。

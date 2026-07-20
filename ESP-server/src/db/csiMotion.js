@@ -11,7 +11,6 @@ const CSI_MOTION_COLUMNS = [
     { name: "variance", type: "REAL" },
     { name: "rssi", type: "INTEGER" },
     { name: "motion_score", type: "REAL" },
-    { name: "confidence", type: "REAL" },
     { name: "timestamp", type: "INTEGER NOT NULL" },
     { name: "gateway_id", type: "TEXT" },
     { name: "server_recv_ms", type: "INTEGER NOT NULL" },
@@ -48,8 +47,8 @@ async function ensureCsiMotionTables(dbRun, dbAll) {
 async function insertCsiMotionEvent(dbRun, record) {
     const result = await dbRun(
         `INSERT INTO csi_motion_events
-        (device_id,link_id,state,frame_energy,variance,rssi,motion_score,confidence,timestamp,gateway_id,server_recv_ms,server_time_iso,raw_json,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        (device_id,link_id,state,frame_energy,variance,rssi,motion_score,timestamp,gateway_id,server_recv_ms,server_time_iso,raw_json,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
             record.device_id,
             record.link_id,
@@ -58,7 +57,6 @@ async function insertCsiMotionEvent(dbRun, record) {
             record.variance,
             record.rssi,
             record.motion_score,
-            record.confidence,
             record.timestamp,
             record.gateway_id,
             record.server_recv_ms,

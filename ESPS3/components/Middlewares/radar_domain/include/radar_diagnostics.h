@@ -47,6 +47,7 @@ typedef struct {
 } radar_diag_snapshot_t;
 
 esp_err_t radar_diagnostics_start(void);
+esp_err_t radar_diagnostics_stop(void);
 bool radar_diag_snapshot_copy(radar_diag_snapshot_t *out);
 void radar_diagnostics_log_transition(radar_source_id_t source,
                                       radar_diagnostics_transition_reason_t reason);

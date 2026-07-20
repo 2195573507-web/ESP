@@ -122,7 +122,7 @@ function validateCanonicalCsiEventV2(body) {
             frame_energy: null,
             variance: null,
             rssi: null,
-            motion_score: null,
+            motion_score: confidence,
             confidence,
             timestamp: timestampMs,
             links
@@ -130,7 +130,7 @@ function validateCanonicalCsiEventV2(body) {
     };
 }
 
-function prepareCanonicalCsiEventV2(body, options = {}) {
+async function ingestCanonicalCsiEventV2(dbRun, dbAll, body, options = {}) {
     const serverRecvMs = Number.isFinite(options.serverRecvMs) ? options.serverRecvMs : Date.now();
     const gatewayId = trimText(options.trustedGatewayId, 128);
     const metadata = readDeviceMetadata({
@@ -164,53 +164,16 @@ function prepareCanonicalCsiEventV2(body, options = {}) {
         variance: validation.csi.variance,
         rssi: validation.csi.rssi,
         motion_score: validation.csi.motion_score,
-        confidence: validation.csi.confidence,
         timestamp: validation.csi.timestamp,
         server_recv_ms: metadata.server_recv_ms,
         server_time_iso: metadata.server_time_iso,
         raw_json: body
     };
 
-    return {
-        ok: true,
-        status: 202,
-        metadata,
-        validation,
-        fact,
-        data: {
-            id: null,
-            trace_id: validation.csi.trace_id,
-            tick_id: validation.csi.tick_id,
-            device_id: fact.device_id,
-            payload_type: CSI_MOTION_PAYLOAD_TYPE,
-            link_id: fact.link_id,
-            state: fact.state,
-            frame_energy: fact.frame_energy,
-            variance: fact.variance,
-            rssi: fact.rssi,
-            motion_score: fact.motion_score,
-            confidence: validation.csi.confidence,
-            timestamp: fact.timestamp,
-            server_recv_ms: metadata.server_recv_ms,
-            server_time_iso: metadata.server_time_iso,
-            dashboard_recorded: false
-        }
-    };
-}
-
-async function persistCanonicalCsiEventV2(dbRun, dbAll, prepared) {
-    if (!prepared?.ok) {
-        return null;
-    }
-
-    const metadata = prepared.metadata;
-    const validation = prepared.validation;
-    const fact = prepared.fact;
-
     await refreshDeviceActivity(dbRun, dbAll, metadata, CSI_MOTION_PAYLOAD_TYPE);
     const id = await insertCsiMotionEvent(dbRun, fact);
     const dashboardRecord = recordCsiMotion(fact, {
-        serverRecvMs: metadata.server_recv_ms
+        serverRecvMs
     });
 
     await recordEvent(dbRun, {
@@ -230,23 +193,29 @@ async function persistCanonicalCsiEventV2(dbRun, dbAll, prepared) {
 
     broadcastEvent("csi_motion", fact);
 
-    prepared.data.id = id;
-    prepared.data.dashboard_recorded = Boolean(dashboardRecord);
     return {
         ok: true,
         status: 202,
         metadata,
-        data: prepared.data
+        data: {
+            id,
+            trace_id: validation.csi.trace_id,
+            tick_id: validation.csi.tick_id,
+            device_id: fact.device_id,
+            payload_type: CSI_MOTION_PAYLOAD_TYPE,
+            link_id: fact.link_id,
+            state: fact.state,
+            frame_energy: fact.frame_energy,
+            variance: fact.variance,
+            rssi: fact.rssi,
+            motion_score: fact.motion_score,
+            confidence: validation.csi.confidence,
+            timestamp: fact.timestamp,
+            server_recv_ms: metadata.server_recv_ms,
+            server_time_iso: metadata.server_time_iso,
+            dashboard_recorded: Boolean(dashboardRecord)
+        }
     };
-}
-
-async function ingestCanonicalCsiEventV2(dbRun, dbAll, body, options = {}) {
-    const prepared = prepareCanonicalCsiEventV2(body, options);
-    if (!prepared.ok) {
-        return prepared;
-    }
-
-    return persistCanonicalCsiEventV2(dbRun, dbAll, prepared);
 }
 
 module.exports = {
@@ -254,7 +223,5 @@ module.exports = {
     CSI_MOTION_PAYLOAD_TYPE,
     CSI_STATES,
     ingestCanonicalCsiEventV2,
-    persistCanonicalCsiEventV2,
-    prepareCanonicalCsiEventV2,
     validateCanonicalCsiEventV2
 };

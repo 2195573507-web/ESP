@@ -4,9 +4,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app_stack_monitor.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "radar_config.h"
 #include "radar_local_adapter.h"
@@ -19,9 +22,46 @@
 
 static const char TAG[] = "radar_diag";
 static TaskHandle_t s_task;
+static volatile bool s_stop_requested;
+static StaticSemaphore_t s_exit_storage;
+static SemaphoreHandle_t s_exit;
+/* Keep the static task control block and its internal-RAM stack alive across
+ * every radar_diag start/stop cycle.  ESP32-S3 StackType_t is byte-sized, but
+ * derive the FreeRTOS depth from the byte contract to keep that explicit. */
+#define RADAR_DIAG_TASK_STACK_BYTES ((size_t)RADAR_CONFIG_DIAGNOSTICS_TASK_STACK)
+#define RADAR_DIAG_TASK_STACK_DEPTH \
+    ((configSTACK_DEPTH_TYPE)(RADAR_DIAG_TASK_STACK_BYTES / sizeof(StackType_t)))
+_Static_assert((RADAR_DIAG_TASK_STACK_BYTES % sizeof(StackType_t)) == 0U,
+               "radar_diag stack bytes must align to StackType_t");
+static StaticTask_t s_task_storage;
+static StackType_t s_task_stack[RADAR_DIAG_TASK_STACK_DEPTH];
 /* The full value snapshot is larger than the diagnostics task's safe stack budget. */
-static radar_diag_snapshot_t s_task_snapshot;
+static radar_diag_snapshot_t *s_task_snapshot;
 static radar_registry_entry_t s_registry_entries[RADAR_SOURCE_COUNT];
+
+static void log_static_stack_admission(void)
+{
+    ESP_LOGI(TAG,
+             "RADAR_MEMORY_ADMISSION stage=radar_diag_stack requested=%u memory=internal storage=static admitted=1",
+             (unsigned int)sizeof(s_task_stack));
+}
+
+static bool psram_workspace_admitted(size_t workspace_bytes)
+{
+    const size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t largest_bytes =
+        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t required = workspace_bytes + RADAR_CONFIG_PSRAM_ALLOCATION_HEADROOM_BYTES;
+    const size_t largest_required = workspace_bytes;
+    const bool admitted = free_bytes >= required && largest_bytes >= largest_required;
+    ESP_LOGI(TAG,
+             "RADAR_MEMORY_ADMISSION stage=radar_diag_workspace requested=%u memory=psram psram_free=%u psram_largest=%u admitted=%u",
+             (unsigned int)workspace_bytes,
+             (unsigned int)free_bytes,
+             (unsigned int)largest_bytes,
+             admitted ? 1U : 0U);
+    return admitted;
+}
 
 static uint64_t now_ms(void)
 {
@@ -231,15 +271,17 @@ void radar_diagnostics_log_transition(radar_source_id_t source,
     char transition_reason[RADAR_DIAG_REASON_TEXT_LEN];
     write_transition_reason(transition_reason, reason);
     ESP_LOGI(TAG,
-             "source transition source=%s room=%s state=%s targets=%u online=%d uart_online=%d frame_fresh=%d sequence=%lu session=%lu reason=%s",
+             "RADAR_SOURCE_STATE event=transition source_id=%u source=%s device_id=%s room=%s sequence=%lu state=%s targets=%u online=%d uart_online=%d frame_fresh=%d session=%lu reason=%s",
+             (unsigned int)entry.source,
              entry.source_name,
+             entry.device_id,
              entry.room_id,
+             (unsigned long)entry.sequence,
              entry.state,
              (unsigned int)entry.snapshot.current_target_count,
              entry.source_online ? 1 : 0,
              entry.snapshot.uart_online ? 1 : 0,
              entry.snapshot.frame_fresh ? 1 : 0,
-             (unsigned long)entry.sequence,
              (unsigned long)entry.session_generation,
              transition_reason);
 }
@@ -249,10 +291,12 @@ static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_
     for (size_t i = 0U; i < snapshot->registry_count; ++i) {
         const radar_diag_registry_snapshot_t *entry = &snapshot->registry[i];
         ESP_LOGI(TAG,
-                 "source=%s device_id=%s room=%s state=%s targets=%u online=%d uart_online=%d valid_age_ms=%" PRIu64 " motion_age_ms=%" PRIu64 " parse_errors=%lu sequence_rejects=%lu identity_mismatches=%lu freshness_expiry=%lu",
+                 "RADAR_SOURCE_STATE event=diagnostic source_id=%u source=%s device_id=%s room=%s sequence=%lu state=%s targets=%u online=%d uart_online=%d valid_age_ms=%" PRIu64 " motion_age_ms=%" PRIu64 " parse_errors=%lu sequence_rejects=%lu identity_mismatches=%lu freshness_expiry=%lu",
+                 (unsigned int)entry->source,
                  entry->source_name,
                  entry->device_id,
                  entry->room_id,
+                 (unsigned long)entry->sequence,
                  entry->state,
                  (unsigned int)entry->snapshot.current_target_count,
                  entry->source_online ? 1 : 0,
@@ -267,7 +311,7 @@ static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_
                  (unsigned long)entry->diagnostics.freshness_expiry_count);
     }
     ESP_LOGI(TAG,
-             "unattributed_parse_errors=%lu",
+             "RADAR_SOURCE_STATE event=unattributed source_id=255 source=UNKNOWN device_id=unknown room=unknown sequence=0 unattributed_parse_errors=%lu",
              (unsigned long)snapshot->unattributed_parse_errors);
 
     if (!snapshot->has_local_spatial) {
@@ -275,8 +319,15 @@ static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_
     }
 
     const radar_spatial_snapshot_t *spatial = &snapshot->local_spatial;
+    const radar_source_id_t local_source = RADAR_SOURCE_S3_LOCAL;
+    const char *local_source_name = radar_registry_source_name(local_source);
+    const char *local_device_id = radar_registry_device_id(local_source);
+    const char *local_room_id = radar_registry_room_id(local_source);
+    radar_source_context_log_view_t local_view = {0};
+    const unsigned long local_sequence = (unsigned long)(
+        radar_source_context_get_log_view(local_source, &local_view) ? local_view.sequence : 0U);
     ESP_LOGI(TAG,
-             "local sensor=%s occupancy=%s motion=%s raw=%u accepted=%u tracks=%u frame_age_ms=%lu confidence=%lu parser[bytes=%lu valid=%lu bad_header=%lu bad_length=%lu bad_tail=%lu skipped=%lu invalid_slots=%lu coord_outliers=%lu resync=%lu] tracker[coord_outliers=%lu jump_outliers=%lu] uart[read_timeout=%lu read_zero=%lu read_driver_error=%lu fifo_overflow=%lu queue_full=%lu] recovery[state=%s count=%lu init_fail=%lu errors=%lu no_valid=%lu no_rx_timeout=%lu]",
+             "RADAR_SOURCE_STATE event=local_sensor sensor=%s occupancy=%s motion=%s raw=%u accepted=%u tracks=%u frame_age_ms=%lu confidence=%lu source_id=%u source=%s device_id=%s room=%s sequence=%lu parser[bytes=%lu valid=%lu bad_header=%lu bad_length=%lu bad_tail=%lu skipped=%lu invalid_slots=%lu coord_outliers=%lu resync=%lu] tracker[coord_outliers=%lu jump_outliers=%lu] uart[read_timeout=%lu read_zero=%lu read_driver_error=%lu fifo_overflow=%lu queue_full=%lu] recovery[state=%s count=%lu init_fail=%lu errors=%lu no_valid=%lu no_rx_timeout=%lu]",
              snapshot->sensor_state,
              snapshot->occupancy_state,
              snapshot->motion_state,
@@ -285,6 +336,11 @@ static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_
              (unsigned int)spatial->active_track_count,
              (unsigned long)spatial->frame_age_ms,
              (unsigned long)spatial->occupancy_confidence,
+             (unsigned int)local_source,
+             local_source_name,
+             local_device_id != NULL ? local_device_id : "unknown",
+             local_room_id != NULL ? local_room_id : "unknown",
+             local_sequence,
              (unsigned long)spatial->diagnostics.parser.bytes_received,
              (unsigned long)spatial->diagnostics.parser.valid_frames,
              (unsigned long)spatial->diagnostics.parser.bad_header,
@@ -308,14 +364,19 @@ static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_
              (unsigned long)spatial->diagnostics.recovery.consecutive_no_valid_count,
              (unsigned long)spatial->diagnostics.recovery.consecutive_no_rx_timeout_count);
     ESP_LOGI(TAG,
-             "radar_tracker: active=%lu created=%lu matched=%lu deleted=%lu stale=%lu velocity_outliers=%lu dropped=%lu",
+             "RADAR_TRACK_UPDATE event=diagnostic active=%lu created=%lu matched=%lu deleted=%lu stale=%lu velocity_outliers=%lu dropped=%lu source_id=%u source=%s device_id=%s room=%s sequence=%lu",
              (unsigned long)spatial->diagnostics.tracker.active_track_count,
              (unsigned long)spatial->diagnostics.tracker.new_track_count,
              (unsigned long)spatial->diagnostics.tracker.association_count,
              (unsigned long)spatial->diagnostics.tracker.deleted_track_count,
              (unsigned long)spatial->diagnostics.tracker.stale_track_count,
              (unsigned long)spatial->diagnostics.tracker.velocity_outliers,
-             (unsigned long)spatial->diagnostics.tracker.dropped_target_count);
+             (unsigned long)spatial->diagnostics.tracker.dropped_target_count,
+             (unsigned int)local_source,
+             local_source_name,
+             local_device_id != NULL ? local_device_id : "unknown",
+             local_room_id != NULL ? local_room_id : "unknown",
+             local_sequence);
 
     for (size_t i = 0U; i < LD2450_MAX_TARGETS; ++i) {
         const radar_target_t *raw = &spatial->raw_targets[i];
@@ -323,24 +384,34 @@ static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_
             continue;
         }
         ESP_LOGI(TAG,
-                 "local raw slot=%u x=%d y=%d speed=%d resolution=%u distance=%lu",
+                 "RADAR_RX_FRAME event=raw_slot slot=%u x=%d y=%d speed=%d resolution=%u distance=%lu source_id=%u source=%s device_id=%s room=%s sequence=%lu",
                  (unsigned int)i,
                  (int)raw->x_mm,
                  (int)raw->y_mm,
                  (int)raw->speed_cm_s,
                  (unsigned int)raw->resolution_mm,
-                 (unsigned long)raw->distance_mm);
+                 (unsigned long)raw->distance_mm,
+                 (unsigned int)local_source,
+                 local_source_name,
+                 local_device_id != NULL ? local_device_id : "unknown",
+                 local_room_id != NULL ? local_room_id : "unknown",
+                 local_sequence);
     }
     for (size_t i = 0U; i < spatial->accepted_target_count; ++i) {
         const radar_spatial_target_t *target = &spatial->accepted_targets[i];
         ESP_LOGI(TAG,
-                 "local accepted index=%u x=%ld y=%ld distance=%lu angle=%d speed=%d",
+                 "RADAR_TRACK_UPDATE event=accepted index=%u x=%ld y=%ld distance=%lu angle=%d speed=%d source_id=%u source=%s device_id=%s room=%s sequence=%lu",
                  (unsigned int)i,
                  (long)target->x_mm,
                  (long)target->y_mm,
                  (unsigned long)target->distance_mm,
                  (int)target->angle_deg,
-                 (int)target->speed_cm_s);
+                 (int)target->speed_cm_s,
+                 (unsigned int)local_source,
+                 local_source_name,
+                 local_device_id != NULL ? local_device_id : "unknown",
+                 local_room_id != NULL ? local_room_id : "unknown",
+                 local_sequence);
     }
     for (size_t i = 0U; i < RADAR_TRACKER_MAX_TRACKS; ++i) {
         const radar_track_snapshot_t *track = &spatial->tracks[i];
@@ -348,7 +419,7 @@ static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_
             continue;
         }
         ESP_LOGI(TAG,
-                 "local track=%lu visible=%d raw_x=%ld raw_y=%ld filtered_x=%ld filtered_y=%ld distance=%lu angle=%d speed=%d direction=%d confidence=%lu seen=%lu missed=%lu",
+                 "RADAR_TRACK_UPDATE_COMPAT local track=%lu visible=%d raw_x=%ld raw_y=%ld filtered_x=%ld filtered_y=%ld distance=%lu angle=%d speed=%d direction=%d confidence=%lu seen=%lu missed=%lu source_id=%u source=%s device_id=%s room=%s sequence=%lu",
                  (unsigned long)track->track_id,
                  track->visible ? 1 : 0,
                  (long)track->raw_x_mm,
@@ -361,13 +432,22 @@ static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_
                  (int)track->direction_deg,
                  (unsigned long)track->confidence,
                  (unsigned long)track->consecutive_seen,
-                 (unsigned long)track->missed_frames);
+                 (unsigned long)track->missed_frames,
+                 (unsigned int)local_source,
+                 local_source_name,
+                 local_device_id != NULL ? local_device_id : "unknown",
+                 local_room_id != NULL ? local_room_id : "unknown",
+                 local_sequence);
     }
 }
 
 static void diagnostics_task(void *arg)
 {
     (void)arg;
+    app_stack_monitor_report(TAG,
+                             "radar_diag",
+                             sizeof(s_task_stack),
+                             "entry");
     radar_presence_state_t previous_state[RADAR_SOURCE_COUNT] = {0};
     bool previous_online[RADAR_SOURCE_COUNT] = {0};
     radar_sensor_state_t previous_sensor = RADAR_SENSOR_OFFLINE;
@@ -377,13 +457,13 @@ static void diagnostics_task(void *arg)
     bool have_previous = false;
     uint64_t last_log_ms = 0U;
 
-    while (true) {
+    while (!s_stop_requested) {
         const uint64_t current_ms = now_ms();
         radar_registry_refresh(current_ms);
 
-        if (radar_diag_snapshot_copy(&s_task_snapshot)) {
-            for (size_t i = 0U; i < s_task_snapshot.registry_count; ++i) {
-                const radar_diag_registry_snapshot_t *entry = &s_task_snapshot.registry[i];
+        if (radar_diag_snapshot_copy(s_task_snapshot)) {
+            for (size_t i = 0U; i < s_task_snapshot->registry_count; ++i) {
+                const radar_diag_registry_snapshot_t *entry = &s_task_snapshot->registry[i];
                 if (have_previous &&
                     (entry->snapshot.state != previous_state[i] ||
                      entry->source_online != previous_online[i])) {
@@ -393,21 +473,25 @@ static void diagnostics_task(void *arg)
                 previous_state[i] = entry->snapshot.state;
                 previous_online[i] = entry->source_online;
             }
-            have_previous = s_task_snapshot.registry_count == RADAR_SOURCE_COUNT;
+            have_previous = s_task_snapshot->registry_count == RADAR_SOURCE_COUNT;
 
-            if (s_task_snapshot.has_local_spatial) {
-                const radar_spatial_snapshot_t *spatial = &s_task_snapshot.local_spatial;
+            if (s_task_snapshot->has_local_spatial) {
+                const radar_spatial_snapshot_t *spatial = &s_task_snapshot->local_spatial;
                 if (have_previous &&
                     (spatial->sensor_state != previous_sensor ||
                      spatial->occupancy_state != previous_occupancy ||
                      spatial->motion_state != previous_motion ||
                      spatial->diagnostics.recovery.state != previous_recovery)) {
+                    radar_source_context_log_view_t local_view = {0};
+                    const bool have_local = radar_source_context_get_log_view(
+                        RADAR_SOURCE_S3_LOCAL, &local_view);
                     ESP_LOGI(TAG,
-                             "local transition sensor=%s occupancy=%s motion=%s recovery=%s frame_age_ms=%lu",
-                             s_task_snapshot.sensor_state,
-                             s_task_snapshot.occupancy_state,
-                             s_task_snapshot.motion_state,
-                             s_task_snapshot.recovery_state,
+                             "RADAR_SOURCE_STATE event=local_transition source_id=0 source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local sequence=%lu sensor=%s occupancy=%s motion=%s recovery=%s frame_age_ms=%lu",
+                             (unsigned long)(have_local ? local_view.sequence : 0U),
+                             s_task_snapshot->sensor_state,
+                             s_task_snapshot->occupancy_state,
+                             s_task_snapshot->motion_state,
+                             s_task_snapshot->recovery_state,
                              (unsigned long)spatial->frame_age_ms);
                 }
                 previous_sensor = spatial->sensor_state;
@@ -422,13 +506,23 @@ static void diagnostics_task(void *arg)
             if (false && (last_log_ms == 0U ||
                           current_ms - last_log_ms >= RADAR_CONFIG_DIAGNOSTICS_LOG_MS)) {
                 last_log_ms = current_ms;
-                log_summary(&s_task_snapshot, current_ms);
+                log_summary(s_task_snapshot, current_ms);
+                radar_source_context_log_view_t local_view = {0};
+                const bool have_local = radar_source_context_get_log_view(
+                    RADAR_SOURCE_S3_LOCAL, &local_view);
                 ESP_LOGI(TAG,
-                         "RADAR_DIAG_STACK_MONITOR free_words=%u",
-                         (unsigned int)uxTaskGetStackHighWaterMark(NULL));
+                         "RADAR_STACK task=radar_diag free_bytes=%u source_id=0 source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local sequence=%lu",
+                         (unsigned int)app_stack_monitor_high_water(),
+                         (unsigned long)(have_local ? local_view.sequence : 0U));
             }
         }
         vTaskDelay(pdMS_TO_TICKS(RADAR_CONFIG_DIAGNOSTICS_POLL_MS));
+    }
+    if (s_exit != NULL) {
+        xSemaphoreGive(s_exit);
+    }
+    for (;;) {
+        vTaskSuspend(NULL);
     }
 }
 
@@ -440,18 +534,71 @@ esp_err_t radar_diagnostics_start(void)
     if (!radar_registry_init()) {
         return ESP_ERR_NO_MEM;
     }
-    BaseType_t created = xTaskCreate(diagnostics_task,
-                                     "radar_diag",
-                                     RADAR_CONFIG_DIAGNOSTICS_TASK_STACK,
-                                     NULL,
-                                     RADAR_CONFIG_DIAGNOSTICS_TASK_PRIORITY,
-                                     &s_task);
-    if (created != pdPASS) {
-        s_task = NULL;
+    if (s_exit == NULL) {
+        s_exit = xSemaphoreCreateBinaryStatic(&s_exit_storage);
+        if (s_exit == NULL) return ESP_ERR_NO_MEM;
+    }
+    log_static_stack_admission();
+    if (!psram_workspace_admitted(sizeof(*s_task_snapshot))) {
         return ESP_ERR_NO_MEM;
     }
+    bool allocated_here = false;
+    if (s_task_snapshot == NULL) {
+        s_task_snapshot = heap_caps_calloc(1U,
+                                           sizeof(*s_task_snapshot),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_task_snapshot == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+        allocated_here = true;
+    }
+    while (xSemaphoreTake(s_exit, 0) == pdTRUE) {
+    }
+    s_stop_requested = false;
+    s_task = xTaskCreateStatic(diagnostics_task,
+                               "radar_diag",
+                               RADAR_DIAG_TASK_STACK_DEPTH,
+                               NULL,
+                               RADAR_CONFIG_DIAGNOSTICS_TASK_PRIORITY,
+                               s_task_stack,
+                               &s_task_storage);
+    if (s_task == NULL) {
+        s_task = NULL;
+        s_stop_requested = false;
+        if (allocated_here) {
+            heap_caps_free(s_task_snapshot);
+            s_task_snapshot = NULL;
+        }
+        return ESP_ERR_NO_MEM;
+    }
+    app_stack_monitor_log_task_created(TAG,
+                                       "radar_diag",
+                                       s_task,
+                                       sizeof(s_task_stack));
     ESP_LOGI(TAG,
-             "diagnostics task started summary_interval_ms=%u",
-             (unsigned int)RADAR_CONFIG_DIAGNOSTICS_LOG_MS);
+             "RADAR_SOURCE_STATE event=diagnostics_started source_id=255 source=SYSTEM device_id=system room=system sequence=0 summary_interval_ms=%u snapshot=psram bytes=%u",
+             (unsigned int)RADAR_CONFIG_DIAGNOSTICS_LOG_MS,
+             (unsigned int)sizeof(*s_task_snapshot));
+    return ESP_OK;
+}
+
+esp_err_t radar_diagnostics_stop(void)
+{
+    TaskHandle_t task = s_task;
+    if (task != NULL) {
+        if (task == xTaskGetCurrentTaskHandle()) return ESP_ERR_INVALID_STATE;
+        s_stop_requested = true;
+        if (s_exit == NULL ||
+            xSemaphoreTake(s_exit, pdMS_TO_TICKS(RADAR_CONFIG_TASK_STOP_TIMEOUT_MS)) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelete(task);
+        s_task = NULL;
+    }
+    s_stop_requested = false;
+    if (s_task_snapshot != NULL) {
+        heap_caps_free(s_task_snapshot);
+        s_task_snapshot = NULL;
+    }
     return ESP_OK;
 }

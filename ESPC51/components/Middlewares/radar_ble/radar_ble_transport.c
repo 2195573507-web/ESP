@@ -19,6 +19,18 @@
 #endif
 
 static const char *TAG = "radar_ble_transport";
+#define RADAR_BLE_IDENTITY_FORMAT \
+    " source_id=%u source=%s device_id=%s room=%s sequence=%lu"
+#define RADAR_BLE_IDENTITY_ARGS(sequence_value) \
+    (unsigned int)RADAR_BLE_BINDING_LOCAL_ID, \
+    (RADAR_BLE_BINDING_LOCAL_ID == 1 ? "C51" : "C52"), \
+    RADAR_BLE_BINDING_DEVICE_ID, \
+    RADAR_BLE_BINDING_ROOM_ID, \
+    (unsigned long)(sequence_value)
+#define RADAR_BLE_LOGI0(format, ...) \
+    ESP_LOGI(TAG, format RADAR_BLE_IDENTITY_FORMAT, __VA_ARGS__, RADAR_BLE_IDENTITY_ARGS(0U))
+#define RADAR_BLE_LOGW0(format, ...) \
+    ESP_LOGW(TAG, format RADAR_BLE_IDENTITY_FORMAT, __VA_ARGS__, RADAR_BLE_IDENTITY_ARGS(0U))
 static radar_ble_transport_status_t s_status;
 static radar_ble_notify_cb_t s_notify_cb;
 static void *s_notify_ctx;
@@ -125,10 +137,11 @@ static void schedule_retry(void)
     if (s_backoff_ms > 30000U) s_backoff_ms = 30000U;
     s_status.state = RADAR_BLE_STATE_BACKOFF;
     s_status.backoff_ms = s_backoff_ms;
-    ESP_LOGI(TAG, "RADAR_RECONNECT local_id=%u retry_ms=%lu count=%lu",
+    ESP_LOGI(TAG, "RADAR_RECONNECT local_id=%u retry_ms=%lu count=%lu" RADAR_BLE_IDENTITY_FORMAT,
              (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
              (unsigned long)s_backoff_ms,
-             (unsigned long)s_status.reconnect_count);
+             (unsigned long)s_status.reconnect_count,
+             RADAR_BLE_IDENTITY_ARGS(0U));
     if (s_callout_initialized) {
         (void)ble_npl_callout_reset(&s_backoff_callout,
                                     ble_npl_time_ms_to_ticks32(s_backoff_ms));
@@ -148,8 +161,9 @@ static void start_scan(void)
     params.window = 0x0010;
     params.filter_duplicates = 1;
     s_status.state = RADAR_BLE_STATE_SCANNING;
-    ESP_LOGI(TAG, "RADAR_SCAN_START local_id=%u radar_id=%s", (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
-             RADAR_BLE_BINDING_RADAR_ID);
+    ESP_LOGI(TAG, "RADAR_SCAN_START local_id=%u radar_id=%s" RADAR_BLE_IDENTITY_FORMAT,
+             (unsigned int)RADAR_BLE_BINDING_LOCAL_ID, RADAR_BLE_BINDING_RADAR_ID,
+             RADAR_BLE_IDENTITY_ARGS(0U));
     const int rc = ble_gap_disc(s_own_addr_type, 5000, &params, gap_event, NULL);
     if (rc != 0) schedule_retry();
 }
@@ -235,16 +249,22 @@ static int subscribe_write_cb(uint16_t conn, const struct ble_gatt_error *error,
     s_status.state = RADAR_BLE_STATE_READY;
     s_backoff_ms = 0U;
     s_status.backoff_ms = 0U;
-    ESP_LOGI(TAG, "RADAR_NOTIFY_READY local_id=%u handle=%u", (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
-             (unsigned int)s_notify_handle);
+    ESP_LOGI(TAG, "RADAR_NOTIFY_READY local_id=%u handle=%u" RADAR_BLE_IDENTITY_FORMAT,
+             (unsigned int)RADAR_BLE_BINDING_LOCAL_ID, (unsigned int)s_notify_handle,
+             RADAR_BLE_IDENTITY_ARGS(0U));
     char notify_uuid[37];
     format_uuid(&s_notify_uuid.u, notify_uuid);
-    ESP_LOGI(TAG, "RADAR_NOTIFY_ENABLED local_id=%u notify_uuid=%s handle=%u",
+    ESP_LOGI(TAG, "RADAR_NOTIFY_ENABLED local_id=%u notify_uuid=%s handle=%u" RADAR_BLE_IDENTITY_FORMAT,
              (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
              notify_uuid,
-             (unsigned int)s_notify_handle);
-    ESP_LOGI(TAG, "RADAR_BLE_NOTIFY_SUBSCRIBED service=FFF0 notify=FFF1");
-    ESP_LOGI(TAG, "RADAR_BLE_WAIT_DATA");
+             (unsigned int)s_notify_handle, RADAR_BLE_IDENTITY_ARGS(0U));
+    char service_uuid[37];
+    format_uuid(&s_notify_service_uuid.u, service_uuid);
+    ESP_LOGI(TAG, "RADAR_BLE_NOTIFY_SUBSCRIBED local_id=%u service=%s notify=%s" RADAR_BLE_IDENTITY_FORMAT,
+             (unsigned int)RADAR_BLE_BINDING_LOCAL_ID, service_uuid, notify_uuid,
+             RADAR_BLE_IDENTITY_ARGS(0U));
+    ESP_LOGI(TAG, "RADAR_BLE_WAIT_DATA" RADAR_BLE_IDENTITY_FORMAT,
+             RADAR_BLE_IDENTITY_ARGS(0U));
     return 0;
 }
 
@@ -288,7 +308,7 @@ static int survey_next_service(uint16_t conn)
         format_uuid(&s_notify_service_uuid.u, service_uuid);
         format_uuid(&s_write_uuid.u, write_uuid);
         format_uuid(&s_notify_uuid.u, notify_uuid);
-        ESP_LOGI(TAG,
+        RADAR_BLE_LOGI0(
                  "RADAR_BLE_PROFILE_FOUND service=%s write_uuid=%s write_handle=%u "
                  "notify_uuid=%s notify_handle=%u",
                  service_uuid, s_write_handle == 0U ? "none" : write_uuid,
@@ -316,7 +336,7 @@ static int survey_chr_cb(uint16_t conn, const struct ble_gatt_error *error,
     }
     if (error->status == 0 && chr != NULL) {
         char uuid[37];
-        ESP_LOGI(TAG, "RADAR_GATT_CHARACTERISTIC service_index=%u uuid=%s props=0x%02x",
+        RADAR_BLE_LOGI0("RADAR_GATT_CHARACTERISTIC service_index=%u uuid=%s props=0x%02x",
                  (unsigned int)s_survey_index, ble_uuid_to_str(&chr->uuid.u, uuid),
                  (unsigned int)chr->properties);
         select_profile_characteristics(&s_survey_services[s_survey_index], chr);
@@ -339,7 +359,7 @@ static int survey_svc_cb(uint16_t conn, const struct ble_gatt_error *error,
     }
     if (error->status == 0 && svc != NULL && s_survey_count < RADAR_BLE_SURVEY_MAX_SERVICES) {
         char uuid[37];
-        ESP_LOGI(TAG, "RADAR_GATT_SERVICE index=%u uuid=%s start=%u end=%u",
+        RADAR_BLE_LOGI0("RADAR_GATT_SERVICE index=%u uuid=%s start=%u end=%u",
                  (unsigned int)s_survey_count, ble_uuid_to_str(&svc->uuid.u, uuid),
                  (unsigned int)svc->start_handle, (unsigned int)svc->end_handle);
         s_survey_services[s_survey_count++] = (radar_ble_service_range_t){
@@ -360,13 +380,13 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         const uint64_t timestamp = now_ms();
         if (s_last_device_log_ms == 0U || timestamp - s_last_device_log_ms >= 1000U) {
             format_address(&event->disc.addr, address);
-            ESP_LOGI(TAG, "RADAR_DEVICE_FOUND mac=%s addr_type=%u rssi=%d", address,
+            RADAR_BLE_LOGI0("RADAR_DEVICE_FOUND mac=%s addr_type=%u rssi=%d", address,
                      (unsigned int)event->disc.addr.type, (int)event->disc.rssi);
             s_last_device_log_ms = timestamp;
         }
         if (!peer_matches(&event->disc.addr)) return 0;
         format_address(&event->disc.addr, address);
-        ESP_LOGI(TAG, "RADAR_MAC_MATCH local_id=%u radar_id=%s mac=%s addr_type=%u",
+        RADAR_BLE_LOGI0("RADAR_MAC_MATCH local_id=%u radar_id=%s mac=%s addr_type=%u",
                  (unsigned int)RADAR_BLE_BINDING_LOCAL_ID, RADAR_BLE_BINDING_RADAR_ID, address,
                  (unsigned int)event->disc.addr.type);
         (void)ble_gap_disc_cancel();
@@ -396,7 +416,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_status.notify_subscribed = false;
         s_status.data_ready = false;
         s_status.state = RADAR_BLE_STATE_DISCOVERING;
-        ESP_LOGI(TAG, "RADAR_CONNECTED local_id=%u conn=%u", (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
+        RADAR_BLE_LOGI0("RADAR_CONNECTED local_id=%u conn=%u", (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
                  (unsigned int)s_conn_handle);
         s_survey_count = 0U;
         if (ble_gattc_disc_all_svcs(s_conn_handle, survey_svc_cb, NULL) != 0) schedule_retry();
@@ -412,7 +432,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_notify_summary_bytes += notify_length;
         s_notify_summary_last_len = notify_length;
         if (timestamp - s_notify_summary_window_start_ms >= 1000U) {
-            ESP_LOGI(TAG,
+            RADAR_BLE_LOGI0(
                      "RADAR_NOTIFY_RX_SUMMARY local_id=%u notify_count=%lu last_len=%u "
                      "bytes_per_sec=%lu",
                      (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
@@ -432,7 +452,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         return 0;
     }
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGW(TAG, "RADAR_DISCONNECTED local_id=%u reason=%d", (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
+        RADAR_BLE_LOGW0("RADAR_DISCONNECTED local_id=%u reason=%d", (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
                  event->disconnect.reason);
         s_status.connected = false;
         s_status.notify_subscribed = false;
@@ -482,12 +502,15 @@ int radar_ble_send_control_command(void)
     if (!s_status.connected || s_write_handle == 0U ||
         ble_uuid_cmp(&s_write_uuid.u, BLE_UUID16_DECLARE(0xfff2)) != 0 ||
         s_control_command_length == 0U) {
-        ESP_LOGW(TAG, "RADAR_BLE_CONTROL_COMMAND_REQUIRED local_id=%u handle=%u len=%u",
+        RADAR_BLE_LOGW0("RADAR_BLE_CONTROL_COMMAND_REQUIRED local_id=%u handle=%u len=%u",
                  (unsigned int)RADAR_BLE_BINDING_LOCAL_ID, (unsigned int)s_write_handle,
                  (unsigned int)s_control_command_length);
         return -1;
     }
-    ESP_LOGI(TAG, "RADAR_BLE_CONTROL_TX uuid=FFF2 len=%u",
+    char write_uuid[37];
+    format_uuid(&s_write_uuid.u, write_uuid);
+    RADAR_BLE_LOGI0("RADAR_BLE_CONTROL_TX local_id=%u uuid=%s len=%u",
+             (unsigned int)RADAR_BLE_BINDING_LOCAL_ID, write_uuid,
              (unsigned int)s_control_command_length);
     if (s_write_without_response) {
         const int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_write_handle,
@@ -529,7 +552,7 @@ int radar_ble_transport_start(radar_ble_notify_cb_t callback, void *ctx)
     s_notify_summary_count = 0U;
     s_notify_summary_bytes = 0U;
     s_notify_summary_last_len = 0U;
-    ESP_LOGI(TAG, "RADAR_BLE_INIT device_id=%s room_id=%s radar_id=%s local_id=%u gatt_discovery=all",
+    RADAR_BLE_LOGI0("RADAR_BLE_INIT device_id=%s room_id=%s radar_id=%s local_id=%u gatt_discovery=all",
              RADAR_BLE_BINDING_DEVICE_ID, RADAR_BLE_BINDING_ROOM_ID, RADAR_BLE_BINDING_RADAR_ID,
              (unsigned int)RADAR_BLE_BINDING_LOCAL_ID);
     ble_hs_cfg.sync_cb = on_sync;
@@ -557,6 +580,8 @@ int radar_ble_transport_write(const uint8_t *data, size_t length)
 
 void radar_ble_transport_stop(void)
 {
+    s_notify_cb = NULL;
+    s_notify_ctx = NULL;
     s_status.state = RADAR_BLE_STATE_DISABLED;
     s_status.connected = false;
     s_status.notify_subscribed = false;

@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ESP32C5 Dashboard</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230f172a'/%3E%3Cpath d='M10 7h12v3h3v12h-3v3H10v-3H7V10h3V7Zm3 6v6h6v-6h-6Z' fill='%2322c55e'/%3E%3C/svg%3E">
     <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -15,7 +16,7 @@
                         <path d="M8 3h8v2h3v3h2v8h-2v3h-3v2H8v-2H5v-3H3V8h2V5h3V3Zm1.5 4.5v9h5v-9h-5ZM11 9h3v5h-3V9Z"/>
                     </svg>
                 </div>
-                <span>ESP32C5</span>
+                <span>ESP</span>
             </div>
 
             <nav class="nav-list" aria-label="主导航">
@@ -36,6 +37,18 @@
                         <svg viewBox="0 0 24 24"><path d="M5 4h14a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1h-5v2h3v2H7v-2h3v-2H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Zm1 2v9h12V6H6Zm3 2h6v2H9V8Z"/></svg>
                     </span>
                     C52
+                </a>
+                <a class="nav-item" href="#settings" data-dashboard-page="settings">
+                    <span class="nav-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24"><path d="M19.4 13.5a7.6 7.6 0 0 0 .1-1.5 7.6 7.6 0 0 0-.1-1.5l2.1-1.6-2-3.5-2.5 1a8.7 8.7 0 0 0-2.5-1.5L14.1 2h-4l-.4 2.9A8.7 8.7 0 0 0 7.2 6.4l-2.5-1-2 3.5 2.1 1.6A7.6 7.6 0 0 0 4.7 12c0 .5 0 1 .1 1.5l-2.1 1.6 2 3.5 2.5-1a8.7 8.7 0 0 0 2.5 1.5l.4 2.9h4l.4-2.9a8.7 8.7 0 0 0 2.5-1.5l2.5 1 2-3.5-2.1-1.6ZM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></svg>
+                    </span>
+                    家庭地址
+                </a>
+                <a class="nav-item" href="#habit-rules" data-dashboard-page="habit-rules">
+                    <span class="nav-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24"><path d="M5 4h14v3H5V4Zm0 6h14v3H5v-3Zm0 6h14v3H5v-3Zm2-11v1h10V5H7Zm0 6v1h10v-1H7Zm0 6v1h10v-1H7Z"/></svg>
+                    </span>
+                    习惯规则
                 </a>
             </nav>
 
@@ -161,16 +174,17 @@
                                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9 5 5 5-5 1.4 1.4L12 16.8 5.6 10.4 7 9Z"/></svg>
                             </button>
                             <div class="range-menu" data-range-menu role="listbox" aria-label="选择数据曲线时间范围" hidden>
-                                <button type="button" role="option" data-range="5m">最近 5 分钟</button>
-                                <button type="button" role="option" data-range="1h">最近 1 小时</button>
-                                <button type="button" role="option" data-range="24h">最近 24 小时</button>
-                                <button type="button" role="option" data-range="7d">最近 7 天</button>
+                                <button type="button" role="option" data-range-hours="12">最近 12 小时</button>
+                                <button type="button" role="option" data-range-hours="24">最近 24 小时</button>
+                                <button type="button" role="option" data-range-hours="36">最近 36 小时</button>
+                                <button type="button" role="option" data-range-hours="48">最近 48 小时</button>
                             </div>
                         </div>
                     </div>
                     <div class="legend">
                         <span><i class="legend-dot blue"></i>温度 (°C)</span>
                         <span><i class="legend-dot green"></i>湿度 (%)</span>
+                        <span><i class="legend-dot orange"></i>气压 (hPa)</span>
                         <span><i class="legend-dot purple"></i>空气质量历史</span>
                     </div>
                     <div class="chart-wrap">
@@ -216,6 +230,44 @@
                             <span class="sparkline-empty">暂无数据</span>
                         </div>
                     </div>
+                </article>
+            </section>
+
+            <section class="csi-grid" aria-label="CSI 状态趋势">
+                <article class="panel csi-panel">
+                    <div class="panel-header">
+                        <h2>CSI 状态中心</h2>
+                        <span class="state-badge state-normal" data-csi-state-badge>IDLE</span>
+                    </div>
+                    <div class="csi-kpi-grid">
+                        <div class="csi-kpi">
+                            <span>motion_score</span>
+                            <strong data-csi-score>--</strong>
+                        </div>
+                        <div class="csi-kpi">
+                            <span>frame_energy</span>
+                            <strong data-csi-energy>--</strong>
+                        </div>
+                        <div class="csi-kpi">
+                            <span>variance</span>
+                            <strong data-csi-variance>--</strong>
+                        </div>
+                        <div class="csi-kpi">
+                            <span>RSSI</span>
+                            <strong data-csi-rssi>--</strong>
+                        </div>
+                    </div>
+                    <div class="csi-trend-grid">
+                        <div class="csi-trend">
+                            <div class="csi-trend-label">motion_score 趋势</div>
+                            <div class="csi-sparkline" data-csi-score-trend></div>
+                        </div>
+                        <div class="csi-trend">
+                            <div class="csi-trend-label">frame_energy 趋势</div>
+                            <div class="csi-sparkline" data-csi-energy-trend></div>
+                        </div>
+                    </div>
+                    <div class="csi-timeline" data-csi-timeline></div>
                 </article>
             </section>
 
@@ -280,8 +332,47 @@
                 </article>
             </section>
 
-            <footer class="footer">© 2024 ESP32C5 Dashboard</footer>
             </section>
+
+            <section class="dashboard-page settings-page" data-page="settings" hidden aria-labelledby="homeLocationTitle">
+                <header class="settings-heading">
+                    <p>家庭设置</p>
+                    <h1 id="homeLocationTitle">家庭地址</h1>
+                    <span>用于未指定地点时的天气查询。</span>
+                </header>
+                <form class="home-location-form" data-home-location-form>
+                    <div class="home-location-grid">
+                        <label>国家<input name="country" autocomplete="country-name" maxlength="128"></label>
+                        <label>省/州<input name="province" autocomplete="address-level1" maxlength="128"></label>
+                        <label>城市<input name="city" autocomplete="address-level2" maxlength="128"></label>
+                        <label>区域<input name="district" autocomplete="address-level3" maxlength="128"></label>
+                        <label>纬度<input name="latitude" type="number" min="-90" max="90" step="any" inputmode="decimal"></label>
+                        <label>经度<input name="longitude" type="number" min="-180" max="180" step="any" inputmode="decimal"></label>
+                        <label class="timezone-field">时区<input name="timezone" placeholder="Asia/Shanghai" maxlength="128"></label>
+                    </div>
+                    <div class="home-location-actions">
+                        <span data-home-location-status role="status">正在读取位置配置...</span>
+                        <button class="primary-action" type="submit">保存位置</button>
+                    </div>
+                </form>
+            </section>
+
+            <section class="dashboard-page habit-rules-page" data-page="habit-rules" hidden aria-labelledby="habitRulesTitle">
+                <header class="settings-heading">
+                    <p>家庭自动化</p>
+                    <h1 id="habitRulesTitle">习惯规则</h1>
+                    <span>此页面仅保存和管理规则，不会向设备发送规则或触发告警。</span>
+                </header>
+                <form data-habit-rules-form>
+                    <div class="habit-rules-list" data-habit-rules-list aria-live="polite"></div>
+                    <div class="habit-rules-actions">
+                        <span data-habit-rules-status role="status">正在读取习惯规则...</span>
+                        <button class="primary-action" type="submit">保存规则</button>
+                    </div>
+                </form>
+            </section>
+
+            <footer class="footer">© 2026 ESP Dashboard</footer>
         </main>
     </div>
     <div class="log-modal-overlay" data-log-modal hidden>
@@ -313,6 +404,7 @@
     </div>
 
     <script src="/pages/s3.js" defer></script>
+    <script src="/pages/habitRules.js" defer></script>
     <script src="/app.js" defer></script>
 </body>
 </html>

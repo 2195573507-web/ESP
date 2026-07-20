@@ -1,0 +1,2051 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>CSI Motion State</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1318;
+      --surface: #171d25;
+      --surface-2: #202833;
+      --surface-3: #0b0f14;
+      --line: #2b3642;
+      --line-soft: rgba(255, 255, 255, 0.08);
+      --text: #edf2f7;
+      --muted: #93a4b6;
+      --muted-2: #67768a;
+      --green: #4ade80;
+      --amber: #f4b84a;
+      --cyan: #5eead4;
+      --red: #fb7185;
+      --violet: #8b9cff;
+      --shadow: rgba(0, 0, 0, 0.36);
+      font-family: "Avenir Next", "DIN Alternate", "SF Pro Text", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background:
+        linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px) 0 0 / 32px 32px,
+        linear-gradient(0deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px) 0 0 / 32px 32px,
+        linear-gradient(180deg, #11161c, var(--bg));
+      color: var(--text);
+    }
+
+    button, input, select, textarea {
+      font: inherit;
+    }
+
+    button, .download-link {
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 12px;
+      background: var(--surface-2);
+      color: var(--text);
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      white-space: nowrap;
+    }
+
+    button:hover, .download-link:hover {
+      border-color: var(--cyan);
+    }
+
+    button.primary {
+      background: var(--green);
+      border-color: var(--green);
+      color: #06100a;
+      font-weight: 800;
+    }
+
+    button.danger {
+      border-color: rgba(255, 107, 90, 0.62);
+      color: #ffd8d2;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+
+    input, select, textarea {
+      min-width: 0;
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      background: #0b0a08;
+      color: var(--text);
+    }
+
+    textarea {
+      min-height: 112px;
+      resize: vertical;
+      line-height: 1.45;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    main {
+      width: min(1640px, calc(100vw - 28px));
+      margin: 0 auto;
+      padding: 20px 0 34px;
+    }
+
+    .topline {
+      display: grid;
+      grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.2fr);
+      gap: 16px;
+      align-items: stretch;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1, h2, h3 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 30px;
+      line-height: 1.05;
+    }
+
+    h2 {
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .muted {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .stat {
+      min-height: 82px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(26, 24, 18, 0.94);
+      padding: 10px;
+      box-shadow: 0 14px 36px var(--shadow);
+    }
+
+    .stat-label {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .stat-value {
+      margin-top: 7px;
+      font-size: 18px;
+      font-weight: 800;
+      line-height: 1.2;
+      overflow-wrap: anywhere;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 340px minmax(0, 1fr);
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .rail, .stage {
+      display: grid;
+      gap: 18px;
+      align-content: start;
+    }
+
+    .section {
+      border-top: 1px solid var(--line);
+      padding-top: 4px;
+    }
+
+    .tool-box {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(26, 24, 18, 0.96);
+      box-shadow: 0 18px 42px var(--shadow);
+      overflow: hidden;
+    }
+
+    .tool-body {
+      padding: 14px;
+    }
+
+    .form-grid {
+      display: grid;
+      gap: 10px;
+    }
+
+    .action-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .action-row.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .notice {
+      display: none;
+      margin-top: 14px;
+      border: 1px solid rgba(242, 184, 75, 0.45);
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: #ffe4a4;
+      background: rgba(92, 61, 13, 0.34);
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
+    .notice.visible {
+      display: block;
+    }
+
+    .run-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 11px;
+      background: #0d0d0b;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--red);
+    }
+
+    .run-pill.running .dot {
+      background: var(--green);
+      box-shadow: 0 0 18px rgba(74, 222, 128, 0.62);
+    }
+
+    .run-pill.warn .dot {
+      background: var(--amber);
+      box-shadow: 0 0 16px rgba(242, 184, 75, 0.48);
+    }
+
+    .serial-hint {
+      margin-top: 12px;
+      border-top: 1px dashed var(--line-soft);
+      padding-top: 10px;
+      color: var(--muted);
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+
+    .port-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .port-button {
+      width: 100%;
+      display: grid;
+      justify-items: stretch;
+      gap: 4px;
+      text-align: left;
+      background: var(--surface-3);
+    }
+
+    .port-button.active {
+      border-color: var(--cyan);
+      color: var(--cyan);
+    }
+
+    .port-meta {
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+
+    .kv {
+      display: grid;
+      gap: 8px;
+    }
+
+    .kv-row {
+      display: grid;
+      grid-template-columns: minmax(108px, 0.48fr) minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      border-bottom: 1px dashed var(--line-soft);
+      padding-bottom: 8px;
+    }
+
+    .kv-row:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    .kv-key {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .kv-value {
+      overflow-wrap: anywhere;
+      line-height: 1.4;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .motion-grid {
+      display: grid;
+      gap: 18px;
+    }
+
+    .canvas-shell,
+    .log-pane {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0b0a08;
+    }
+
+    .canvas-shell {
+      overflow: hidden;
+    }
+
+    .canvas-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 260px;
+    }
+
+    #timelineCanvas {
+      height: 150px;
+    }
+
+    .link-card-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .link-card {
+      border: 1px solid var(--line);
+      border-top-width: 3px;
+      border-radius: 8px;
+      background: rgba(26, 24, 18, 0.82);
+      padding: 10px 12px 12px;
+      min-width: 0;
+    }
+
+    .link-card.legacy {
+      border-style: dashed;
+      opacity: 0.82;
+    }
+
+    .link-name,
+    .link-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .link-name {
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+
+    .link-card-state {
+      margin-top: 6px;
+      font-size: 20px;
+      font-weight: 800;
+      line-height: 1.1;
+    }
+
+    .link-card-meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+
+    .log-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .curve-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    #motionCurveCanvas,
+    #metricCurveCanvas {
+      height: 230px;
+    }
+
+    .log-pane {
+      padding: 12px;
+      overflow: hidden;
+    }
+
+    .log-pane .canvas-title {
+      border-bottom-color: var(--line-soft);
+      margin-bottom: 10px;
+    }
+
+    .log-list {
+      display: grid;
+      gap: 8px;
+      max-height: 280px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+
+    .log-row {
+      border-bottom: 1px dashed var(--line-soft);
+      padding-bottom: 8px;
+    }
+
+    .log-row:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    .log-head {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 8px;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .log-line {
+      margin-top: 6px;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #eee8d6;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+
+    .log-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 6px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 20px;
+      padding: 0 6px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(26, 24, 18, 0.9);
+      color: var(--text);
+      font-size: 10px;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+
+    .tag.active {
+      border-color: rgba(74, 222, 128, 0.65);
+      color: #b9f7cd;
+    }
+
+    .tag.warn {
+      border-color: rgba(242, 184, 75, 0.65);
+      color: #ffe1a4;
+    }
+
+    .tag.off {
+      border-color: rgba(109, 214, 232, 0.45);
+      color: #c0f4ff;
+    }
+
+    pre {
+      min-height: 220px;
+      max-height: 420px;
+      margin: 0;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: #eee8d6;
+      background: #0b0a08;
+      padding: 14px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      line-height: 1.45;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .empty-state {
+      display: none;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      color: var(--muted);
+      text-align: center;
+      background: rgba(13, 13, 11, 0.74);
+    }
+
+    body.no-data .empty-state {
+      display: block;
+    }
+
+    body.no-data .data-zone {
+      opacity: 0.58;
+    }
+
+    .toast {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 10;
+      display: none;
+      max-width: min(420px, calc(100vw - 32px));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: #17140f;
+      color: var(--text);
+      box-shadow: 0 18px 44px var(--shadow);
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
+    .toast.visible {
+      display: block;
+    }
+
+    .toast.error {
+      border-color: rgba(255, 107, 90, 0.65);
+      color: #ffd8d2;
+    }
+
+    .toast.ok {
+      border-color: rgba(74, 222, 128, 0.55);
+      color: #dcffe3;
+    }
+
+    @media (max-width: 1240px) {
+      .workspace, .topline, .fusion-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .status-grid, .link-card-grid, .log-grid, .curve-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 680px) {
+      main {
+        width: min(100vw - 20px, 1640px);
+        padding-top: 14px;
+      }
+
+      h1 {
+        font-size: 24px;
+      }
+
+      .status-grid, .link-card-grid, .log-grid, .curve-grid, .action-row, .action-row.three {
+        grid-template-columns: 1fr;
+      }
+
+      #timelineCanvas,
+      #motionCurveCanvas,
+      #metricCurveCanvas {
+        height: 340px;
+      }
+    }
+  </style>
+</head>
+<body class="no-data">
+  <main>
+    <header class="topline">
+      <div>
+        <h1>CSI Motion State</h1>
+        <div class="muted">ESPS3 logs: CSI_RESULT_V2 / CSI_RX / CSI_FUSION_TELEMETRY / CSI_LATEST</div>
+      </div>
+      <div class="status-grid">
+        <div class="stat">
+          <div class="stat-label">Current State</div>
+          <div class="stat-value" id="fusionState">UNKNOWN</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Motion Score</div>
+          <div class="stat-value" id="motionScoreValue">-</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Confidence</div>
+          <div class="stat-value" id="confidenceValue">-</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Active Links</div>
+          <div class="stat-value" id="activeLinksValue">S3_TO_C51 / S3_TO_C52</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Last Update</div>
+          <div class="stat-value" id="lastUpdateValue">-</div>
+        </div>
+      </div>
+    </header>
+
+    <div id="globalNotice" class="notice"></div>
+
+    <div class="workspace">
+      <aside class="rail">
+        <section class="tool-box">
+          <h2 class="tool-body">串口 <button type="button" id="refreshPorts">刷新端口</button></h2>
+          <div class="tool-body">
+            <form id="serialForm" class="form-grid">
+              <label>串口路径
+                <input id="serialPort" name="port" list="serialPortList" placeholder="/dev/cu.usbmodemxxx" autocomplete="off">
+                <datalist id="serialPortList"></datalist>
+              </label>
+              <label>波特率
+                <select id="serialBaud" name="baudRate">
+                  <option value="115200">115200</option>
+                  <option value="230400">230400</option>
+                  <option value="460800">460800</option>
+                  <option value="921600">921600</option>
+                </select>
+              </label>
+              <div class="action-row">
+                <button type="submit" id="connectSerial" class="primary">连接</button>
+                <button type="button" id="stopSerial">断开</button>
+              </div>
+            </form>
+            <div id="serialHint" class="serial-hint">读取串口状态...</div>
+            <div id="serialPorts" class="port-list"></div>
+          </div>
+        </section>
+
+        <section class="tool-box">
+          <h2 class="tool-body"><span>运行状态</span><span id="runState" class="run-pill"><span class="dot"></span><span>未连接串口</span></span></h2>
+          <div class="tool-body kv" id="serialStatus"></div>
+        </section>
+
+        <section class="tool-box">
+          <h2 class="tool-body">数据</h2>
+          <div class="tool-body form-grid">
+            <label>历史窗口
+              <select id="historyLimit">
+                <option value="200">200</option>
+                <option value="500">500</option>
+                <option value="1000" selected>1000</option>
+                <option value="2000">2000</option>
+                <option value="5000">5000</option>
+              </select>
+            </label>
+            <div class="action-row">
+              <a class="download-link" href="/api/csi/export.json" download>导出 JSON</a>
+              <a class="download-link" href="/api/csi/export.csv" download>导出 CSV</a>
+            </div>
+            <button type="button" id="clearHistory" class="danger">清空历史</button>
+          </div>
+        </section>
+
+        <section class="tool-box">
+          <h2 class="tool-body">导入</h2>
+          <div class="tool-body form-grid">
+            <label>JSON
+              <textarea id="jsonImport" spellcheck="false">{"type":"csi_fusion","schema_version":2,"trace_id":"csi-v2-42","tick_id":42,"links":["S3_TO_C51","S3_TO_C52"],"fused_state":{"state":"HOLD","confidence":0.58,"motion_score":0.58},"confidence":0.58,"motion_score":0.58,"timestamp_ms":4200}</textarea>
+            </label>
+            <button type="button" id="importJson" class="primary">导入 JSON</button>
+            <label>日志行
+              <textarea id="manualLine" spellcheck="false">I (45678) csi_gateway: CSI_RESULT_V2 link_id=S3_TO_C51 device=C51 energy=18.200 variance=0.150 cv=0.090 rssi=-44 quality=0.930 state=MOTION</textarea>
+            </label>
+            <div class="action-row">
+              <button type="button" id="parseLine">解析日志</button>
+              <button type="button" id="mockSample">模拟帧</button>
+            </div>
+          </div>
+        </section>
+      </aside>
+
+      <section class="stage">
+        <div class="empty-state">等待 motion-state telemetry</div>
+
+        <section class="section data-zone">
+          <h2>State Timeline <span id="timelineMeta" class="muted">IDLE / MOTION / HOLD / UNKNOWN</span></h2>
+          <div class="canvas-shell">
+            <canvas id="timelineCanvas"></canvas>
+          </div>
+        </section>
+
+        <section class="section data-zone">
+          <h2>Data Curves <span id="curveMeta" class="muted">0 points</span></h2>
+          <div class="curve-grid">
+            <div class="canvas-shell">
+              <div class="canvas-title"><span>Motion Score</span><span id="motionCurveMeta"></span></div>
+              <canvas id="motionCurveCanvas"></canvas>
+            </div>
+            <div class="canvas-shell">
+              <div class="canvas-title"><span>Feature Metrics</span><span id="metricCurveMeta"></span></div>
+              <canvas id="metricCurveCanvas"></canvas>
+            </div>
+          </div>
+        </section>
+
+        <section class="section data-zone">
+          <h2>Link Cards <span id="sampleBadge" class="muted">0 samples</span></h2>
+          <div id="activeLinkCards" class="link-card-grid"></div>
+          <div id="legacyLinkCards" class="link-card-grid" hidden></div>
+        </section>
+
+        <section class="section data-zone">
+          <h2>Recent CSI_RESULT_V2 Features <span id="parserMeta" class="muted"></span></h2>
+          <div id="resultFeatureList" class="log-list"></div>
+        </section>
+
+        <section class="section data-zone">
+          <h2>Raw Parsed Events / Latest Logs <span id="historyCount" class="muted">0 logs</span></h2>
+          <div class="log-grid">
+            <div class="log-pane">
+              <div class="canvas-title"><span>Raw Parsed Events</span><span id="rawEventMeta"></span></div>
+              <div id="rawEventList" class="log-list"></div>
+            </div>
+            <div class="log-pane">
+              <div class="canvas-title"><span>Latest Logs</span><span id="latestLogMeta"></span></div>
+              <div id="latestLogList" class="log-list"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="section data-zone">
+          <h2>Motion State Model JSON <span id="modelMeta" class="muted"></span></h2>
+          <pre id="telemetryJson">{}</pre>
+        </section>
+      </section>
+    </div>
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    var REFRESH_INTERVAL_DEFAULT_MS = 1000;
+    var REFRESH_INTERVAL_MIN_MS = 100;
+    var REFRESH_INTERVAL_MAX_MS = 5000;
+    var REFRESH_INTERVAL_HISTORY_SIZE = 12;
+    var HISTORY_LIMIT_DEFAULT = 1000;
+    var SERIAL_STATUS_REFRESH_INTERVAL_MS = 1000;
+    var SERIAL_PORTS_REFRESH_INTERVAL_MS = 5000;
+    var TELEMETRY_WINDOW_MS = 400;
+    var ACTIVE_LINK_IDS = ['S3_TO_C51', 'S3_TO_C52'];
+    var LEGACY_LINK_IDS = ['C51_TO_C52', 'C52_TO_C51'];
+    var LINK_COLORS = {
+      S3_TO_C51: '#4ade80',
+      S3_TO_C52: '#6dd6e8',
+      C51_TO_C52: '#f2b84b',
+      C52_TO_C51: '#b6a0ff',
+      fused: '#ff6b5a'
+    };
+
+    var state = {
+      telemetry: null,
+      latestSample: null,
+      totalCount: 0,
+      status: {},
+      ports: [],
+      historyLimit: HISTORY_LIMIT_DEFAULT,
+      refreshInFlight: false,
+      refreshTimer: 0,
+      refreshIntervalMs: REFRESH_INTERVAL_DEFAULT_MS,
+      statusRefreshInFlight: false,
+      statusRefreshTimer: 0,
+      portsRefreshInFlight: false,
+      portsRefreshTimer: 0
+    };
+
+    var el = {
+      fusionState: document.getElementById('fusionState'),
+      motionScoreValue: document.getElementById('motionScoreValue'),
+      confidenceValue: document.getElementById('confidenceValue'),
+      activeLinksValue: document.getElementById('activeLinksValue'),
+      lastUpdateValue: document.getElementById('lastUpdateValue'),
+      sampleBadge: document.getElementById('sampleBadge'),
+      globalNotice: document.getElementById('globalNotice'),
+      runState: document.getElementById('runState'),
+      serialStatus: document.getElementById('serialStatus'),
+      serialForm: document.getElementById('serialForm'),
+      serialPort: document.getElementById('serialPort'),
+      serialPortList: document.getElementById('serialPortList'),
+      serialBaud: document.getElementById('serialBaud'),
+      connectSerial: document.getElementById('connectSerial'),
+      stopSerial: document.getElementById('stopSerial'),
+      refreshPorts: document.getElementById('refreshPorts'),
+      serialHint: document.getElementById('serialHint'),
+      serialPorts: document.getElementById('serialPorts'),
+      historyLimit: document.getElementById('historyLimit'),
+      clearHistory: document.getElementById('clearHistory'),
+      jsonImport: document.getElementById('jsonImport'),
+      importJson: document.getElementById('importJson'),
+      manualLine: document.getElementById('manualLine'),
+      parseLine: document.getElementById('parseLine'),
+      mockSample: document.getElementById('mockSample'),
+      timelineCanvas: document.getElementById('timelineCanvas'),
+      timelineMeta: document.getElementById('timelineMeta'),
+      curveMeta: document.getElementById('curveMeta'),
+      motionCurveCanvas: document.getElementById('motionCurveCanvas'),
+      motionCurveMeta: document.getElementById('motionCurveMeta'),
+      metricCurveCanvas: document.getElementById('metricCurveCanvas'),
+      metricCurveMeta: document.getElementById('metricCurveMeta'),
+      historyCount: document.getElementById('historyCount'),
+      parserMeta: document.getElementById('parserMeta'),
+      activeLinkCards: document.getElementById('activeLinkCards'),
+      legacyLinkCards: document.getElementById('legacyLinkCards'),
+      resultFeatureList: document.getElementById('resultFeatureList'),
+      rawEventMeta: document.getElementById('rawEventMeta'),
+      latestLogMeta: document.getElementById('latestLogMeta'),
+      rawEventList: document.getElementById('rawEventList'),
+      latestLogList: document.getElementById('latestLogList'),
+      modelMeta: document.getElementById('modelMeta'),
+      telemetryJson: document.getElementById('telemetryJson'),
+      toast: document.getElementById('toast')
+    };
+
+    function numeric(value) {
+      var number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function clamp01(value) {
+      var number = Number(value);
+      if (!Number.isFinite(number)) {
+        return 0;
+      }
+      return Math.max(0, Math.min(1, number));
+    }
+
+    function formatValue(value) {
+      if (value === undefined || value === null || value === '') {
+        return '-';
+      }
+      if (typeof value === 'number') {
+        return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+      }
+      if (typeof value === 'boolean') {
+        return value ? '是' : '否';
+      }
+      return String(value);
+    }
+
+    function formatPercent(value) {
+      return String(Math.round(clamp01(value) * 100)) + '%';
+    }
+
+    function formatAge(value) {
+      var age = numeric(value);
+      if (age === null) {
+        return '-';
+      }
+      if (age < 1000) {
+        return String(Math.round(age)) + 'ms';
+      }
+      return (age / 1000).toFixed(1).replace(/\.0$/, '') + 's';
+    }
+
+    function formatIsoFromMs(value) {
+      var number = numeric(value);
+      if (number === null) {
+        return '-';
+      }
+      return new Date(number).toISOString();
+    }
+
+    function firstNumeric() {
+      for (var i = 0; i < arguments.length; i += 1) {
+        var value = numeric(arguments[i]);
+        if (value !== null) {
+          return value;
+        }
+      }
+      return null;
+    }
+
+    function compareLogRows(a, b) {
+      var aTime = numeric(a.updated_at_ms || a.timestamp_ms || 0) || 0;
+      var bTime = numeric(b.updated_at_ms || b.timestamp_ms || 0) || 0;
+      if (aTime !== bTime) {
+        return aTime - bTime;
+      }
+      return String(a.source_format || '').localeCompare(String(b.source_format || ''));
+    }
+
+    function describeLogSource(sample) {
+      var source = String(sample.source_format || '').trim();
+      if (!source) {
+        return 'parsed';
+      }
+      return source;
+    }
+
+    function stateLabel(state) {
+      var value = String(state || 'UNKNOWN').trim().toUpperCase();
+      if (!value) {
+        return 'UNKNOWN';
+      }
+      return value;
+    }
+
+    function latestModel() {
+      return state.telemetry && state.telemetry.motion_state_model ? state.telemetry.motion_state_model : {};
+    }
+
+    function rawParsedEvents() {
+      var model = latestModel();
+      return Array.isArray(model.raw_parsed_events) ? model.raw_parsed_events : [];
+    }
+
+    function latestLogs() {
+      var model = latestModel();
+      return Array.isArray(model.latest_logs) ? model.latest_logs : [];
+    }
+
+    function recentResultFeatures() {
+      var model = latestModel();
+      return Array.isArray(model.recent_result_v2_features) ? model.recent_result_v2_features : [];
+    }
+
+    function telemetryEvents() {
+      return state.telemetry && Array.isArray(state.telemetry.telemetry_events)
+        ? state.telemetry.telemetry_events
+        : [];
+    }
+
+    function eventTimestampMs(event) {
+      return firstNumeric(event.timestamp_ms, event.timestamp, event.updated_at_ms, event.observed_at_ms);
+    }
+
+    function activeTelemetryEvents() {
+      return telemetryEvents().filter(function (event) {
+        return event &&
+          event.supported !== false &&
+          ACTIVE_LINK_IDS.indexOf(event.link_id) >= 0 &&
+          eventTimestampMs(event) !== null;
+      }).sort(function (a, b) {
+        return eventTimestampMs(a) - eventTimestampMs(b);
+      }).slice(-240);
+    }
+
+    function renderCard(container, card, extraClass) {
+      var classes = ['link-card'];
+      if (extraClass) {
+        classes.push(extraClass);
+      }
+      var tags = [
+        '<span class="tag ' + (card.supported ? 'active' : 'off') + '">' + escapeHtml(card.supported ? 'active' : 'not_implemented') + '</span>',
+        card.disabled ? '<span class="tag off">disabled</span>' : '',
+        card.healthy ? '<span class="tag active">healthy</span>' : card.status ? '<span class="tag warn">' + escapeHtml(card.status) + '</span>' : ''
+      ].filter(Boolean).join('');
+      return '<div class="' + classes.join(' ') + '">' +
+        '<div class="link-card-head"><div class="link-name"><span>' + escapeHtml(card.link_id) + '</span><span>' + escapeHtml(card.last_update_iso ? card.last_update_iso : '-') + '</span></div><span class="tag">' + escapeHtml(card.source + ' -> ' + card.target) + '</span></div>' +
+        '<div class="link-card-state">' + escapeHtml(stateLabel(card.state)) + '</div>' +
+        '<div class="link-card-meta">' +
+        '<span>motion ' + escapeHtml(formatValue(card.motion_score)) + '</span>' +
+        '<span>confidence ' + escapeHtml(formatValue(card.confidence)) + '</span>' +
+        '<span>quality ' + escapeHtml(formatValue(card.quality)) + '</span>' +
+        '<span>age ' + escapeHtml(formatAge(card.age_ms)) + '</span>' +
+        '<span>freshness ' + escapeHtml(formatValue(card.freshness)) + '</span>' +
+        '<span>sample_count ' + escapeHtml(formatValue(card.sample_count)) + '</span>' +
+        '</div>' +
+        '<div class="log-tags">' + tags + '</div>' +
+        '</div>';
+    }
+
+    function renderLogList(container, items, emptyText, options) {
+      var rows = Array.isArray(items) ? items : [];
+      if (!rows.length) {
+        container.innerHTML = '<div class="muted">' + escapeHtml(emptyText) + '</div>';
+        return;
+      }
+      container.innerHTML = rows.map(function (item) {
+        var headline = options && options.headline ? options.headline(item) : '';
+        var subline = options && options.subline ? options.subline(item) : '';
+        var tags = options && options.tags ? options.tags(item) : [];
+        return '<div class="log-row">' +
+          '<div class="log-head"><span>' + escapeHtml(headline) + '</span><span>' + escapeHtml(subline) + '</span></div>' +
+          '<div class="log-line">' + escapeHtml(options && options.line ? options.line(item) : JSON.stringify(item, null, 2)) + '</div>' +
+          '<div class="log-tags">' + tags.map(function (tag) {
+            return '<span class="tag ' + escapeHtml(tag.kind || '') + '">' + escapeHtml(tag.label) + '</span>';
+          }).join('') + '</div>' +
+          '</div>';
+      }).join('');
+    }
+
+    async function fetchJson(url, options) {
+      var response = await fetch(url, options || {});
+      var text = await response.text();
+      var data = {};
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (error) {
+          throw new Error('服务返回了非 JSON 内容: ' + text.slice(0, 120));
+        }
+      }
+      if (!response.ok || data.ok === false) {
+        throw new Error(data.error || ('HTTP ' + response.status));
+      }
+      return data;
+    }
+
+    function localizeMessage(message) {
+      var text = String(message || '').trim();
+      if (!text) {
+        return '';
+      }
+      var exact = {
+        'serial port is required': '请填写串口路径',
+        'serial port must match /dev/cu.*': '串口路径必须是 /dev/cu.*',
+        'baudRate must be a positive integer': '波特率必须是正整数',
+        'line is empty': '日志行不能为空',
+        'line did not contain a supported CSI marker': '这一行不包含支持的 CSI 标记',
+        'JSON payload must be an object': 'JSON 负载必须是对象',
+        'request body must be JSON': '请求体必须是 JSON',
+        'Not found': '接口不存在'
+      };
+      if (exact[text]) {
+        return exact[text];
+      }
+      return text
+        .replace('line did not contain JSON or key=value fields', '日志行中没有 JSON 或 key=value 字段')
+        .replace('parse error', '解析失败')
+        .replace('failed to list serial ports', '读取串口列表失败')
+        .replace('failed to open', '打开串口失败')
+        .replace('failed to close serial port', '关闭串口失败')
+        .replace('serial port error', '串口错误')
+        .replace('serial mode unavailable', '串口模式不可用')
+        .replace(/^HTTP (\d+)$/, 'HTTP 错误 $1');
+    }
+
+    function showToast(message, kind) {
+      el.toast.textContent = localizeMessage(message);
+      el.toast.className = 'toast visible ' + (kind || '');
+      window.clearTimeout(showToast.timer);
+      showToast.timer = window.setTimeout(function () {
+        el.toast.className = 'toast';
+      }, 3400);
+    }
+
+    function renderNotice() {
+      var message = '';
+      if (state.status && state.status.serialport_available === false) {
+        message = '未安装 serialport，串口功能不可用，但可使用导入或模拟帧。';
+      } else if (state.status && (state.status.lastError || state.status.last_error)) {
+        message = localizeMessage(state.status.lastError || state.status.last_error);
+      }
+      el.globalNotice.textContent = message;
+      el.globalNotice.classList.toggle('visible', Boolean(message));
+    }
+
+    function renderSerialStatus() {
+      var connected = Boolean(state.status.connected || state.status.running);
+      var serialAvailable = state.status.serialport_available !== false;
+      el.runState.classList.toggle('running', connected);
+      el.runState.classList.toggle('warn', !connected && !serialAvailable);
+      el.runState.querySelector('span:last-child').textContent = connected ? '串口运行中' : serialAvailable ? '未连接串口' : '串口不可用';
+      el.connectSerial.disabled = !serialAvailable;
+      el.stopSerial.disabled = !serialAvailable;
+
+      var rows = [
+        ['连接状态', connected ? '已连接' : '未连接'],
+        ['串口路径', state.status.port || '-'],
+        ['波特率', state.status.baudRate || state.status.baud || '-'],
+        ['串口依赖', serialAvailable ? '可用' : '缺失'],
+        ['打开时间', state.status.opened_at_iso || '-'],
+        ['已读行数', state.status.lines_seen || 0],
+        ['样本数', state.status.samples_seen || 0],
+        ['最后一行', state.status.last_line || '-'],
+        ['最后错误', state.status.lastError || state.status.last_error || '-']
+      ];
+
+      el.serialStatus.innerHTML = rows.map(function (row) {
+        return '<div class="kv-row"><div class="kv-key">' + escapeHtml(row[0]) + '</div><div class="kv-value">' + escapeHtml(formatValue(row[1])) + '</div></div>';
+      }).join('');
+      renderNotice();
+    }
+
+    function renderSerialPorts() {
+      var ports = state.ports || [];
+      var activePort = state.status.port || '';
+      var connected = Boolean(state.status.connected || state.status.running);
+      var serialAvailable = state.status.serialport_available !== false;
+
+      el.serialPortList.innerHTML = ports.map(function (port) {
+        return '<option value="' + escapeAttr(port.path) + '"></option>';
+      }).join('');
+
+      if (!serialAvailable) {
+        el.serialHint.textContent = 'serialport 缺失';
+      } else if (connected) {
+        el.serialHint.textContent = activePort + ' @ ' + formatValue(state.status.baudRate || state.status.baud);
+      } else if (ports.length) {
+        el.serialHint.textContent = String(ports.length) + ' 个串口';
+      } else {
+        el.serialHint.textContent = '未发现 /dev/cu.* 串口';
+      }
+
+      el.serialPorts.innerHTML = ports.length
+        ? ports.map(function (port) {
+          var active = port.path === activePort ? ' active' : '';
+          var meta = [
+            port.manufacturer,
+            port.vendorId && port.productId ? 'VID:' + port.vendorId + ' PID:' + port.productId : '',
+            port.serialNumber ? 'SN:' + port.serialNumber : '',
+            port.unavailable_reason || ''
+          ].filter(Boolean).join(' / ');
+          return '<button class="port-button' + active + '" type="button" data-port="' + escapeAttr(port.path) + '"><span>' + escapeHtml(port.path) + '</span><span class="port-meta">' + escapeHtml(meta || 'serial') + '</span></button>';
+        }).join('')
+        : '<div class="muted">暂无串口</div>';
+    }
+
+    function latestFrames() {
+      var model = latestModel();
+      return Array.isArray(model.state_timeline) ? model.state_timeline : [];
+    }
+
+    function renderFusionStatus() {
+      var model = latestModel();
+      var status = state.telemetry && state.telemetry.fusion_status ? state.telemetry.fusion_status : {};
+      var frames = latestFrames();
+      var hasData = frames.length > 0 || rawParsedEvents().length > 0 || latestLogs().length > 0;
+      document.body.classList.toggle('no-data', !hasData);
+      el.fusionState.textContent = stateLabel(model.current_state || status.current_state || 'UNKNOWN');
+      el.motionScoreValue.textContent = formatValue(model.motion_score !== undefined ? model.motion_score : status.motion_score);
+      el.confidenceValue.textContent = formatValue(model.confidence !== undefined ? model.confidence : status.confidence);
+      el.activeLinksValue.textContent = model.active_link_ids && model.active_link_ids.length
+        ? model.active_link_ids.join(' / ')
+        : (status.active_links && status.active_links.length ? status.active_links.join(' / ') : '-');
+      el.lastUpdateValue.textContent = model.last_update_ms ? formatIsoFromMs(model.last_update_ms) : (status.last_update_iso || '-');
+      el.sampleBadge.textContent = String(state.totalCount || 0) + ' samples';
+      el.historyCount.textContent = String(latestLogs().length || 0) + ' logs';
+      el.timelineMeta.textContent = frames.length ? String(frames.length) + ' state points' : 'IDLE / MOTION / HOLD / UNKNOWN';
+      el.curveMeta.textContent = String(activeTelemetryEvents().length || 0) + ' points';
+      el.parserMeta.textContent = state.telemetry && state.telemetry.parser
+        ? String(state.telemetry.parser.result_v2_count || 0) + ' recent features'
+        : '';
+      el.modelMeta.textContent = state.telemetry && state.telemetry.generated_at_ms
+        ? 'generated ' + formatIsoFromMs(state.telemetry.generated_at_ms)
+        : '';
+      el.rawEventMeta.textContent = String(rawParsedEvents().length || 0) + ' parsed events';
+      el.latestLogMeta.textContent = String(latestLogs().length || 0) + ' latest rows';
+    }
+
+    function renderLinkStrip() {
+      var model = latestModel();
+      var activeLinks = Array.isArray(model.active_links) ? model.active_links : [];
+      var legacyLinks = Array.isArray(model.legacy_links) ? model.legacy_links : [];
+      el.activeLinkCards.innerHTML = activeLinks.length
+        ? activeLinks.map(function (card) {
+          return renderCard(el.activeLinkCards, card, '');
+        }).join('')
+        : '<div class="muted">暂无 active links</div>';
+      if (legacyLinks.length) {
+        el.legacyLinkCards.hidden = false;
+        el.legacyLinkCards.innerHTML = legacyLinks.map(function (card) {
+          return renderCard(el.legacyLinkCards, card, 'legacy');
+        }).join('');
+      } else {
+        el.legacyLinkCards.innerHTML = '';
+        el.legacyLinkCards.hidden = true;
+      }
+    }
+
+    function renderTelemetryJson() {
+      var model = state.telemetry || {};
+      var motion = model.motion_state_model || {};
+      var preview = {
+        motion_state_model: {
+          current_state: motion.current_state || 'UNKNOWN',
+          motion_score: motion.motion_score,
+          confidence: motion.confidence,
+          active_link_ids: motion.active_link_ids || [],
+          last_update_ms: motion.last_update_ms || null,
+          state_timeline: Array.isArray(motion.state_timeline) ? motion.state_timeline.slice(-8) : [],
+          recent_result_v2_features: Array.isArray(motion.recent_result_v2_features) ? motion.recent_result_v2_features.slice(-4) : [],
+          latest_logs: Array.isArray(motion.latest_logs) ? motion.latest_logs.slice(-4) : []
+        },
+        fusion_status: model.fusion_status || null,
+        parser: model.parser || null,
+        data_model: model.data_model || null
+      };
+      el.telemetryJson.textContent = JSON.stringify(preview, null, 2);
+    }
+
+    function renderResultFeatureList() {
+      var rows = recentResultFeatures();
+      renderLogList(el.resultFeatureList, rows, '暂无 CSI_RESULT_V2 feature', {
+        headline: function (item) {
+          return [item.link_id || '-', item.state || 'UNKNOWN'].join(' · ');
+        },
+        subline: function (item) {
+          return formatIsoFromMs(item.updated_at_ms || item.timestamp_ms);
+        },
+        line: function (item) {
+          return [
+            'motion_score=' + formatValue(item.motion_score),
+            'confidence=' + formatValue(item.confidence),
+            'quality=' + formatValue(item.quality),
+            'energy=' + formatValue(item.energy),
+            'variance=' + formatValue(item.variance),
+            'rssi=' + formatValue(item.rssi),
+            'cv=' + formatValue(item.cv)
+          ].join(' ');
+        },
+        tags: function (item) {
+          return [
+            { label: describeLogSource(item), kind: 'active' },
+            { label: item.disabled ? 'disabled' : 'active', kind: item.disabled ? 'warn' : 'active' }
+          ];
+        }
+      });
+    }
+
+    function renderRawParsedEvents() {
+      var rows = rawParsedEvents().slice().sort(function (a, b) {
+        return compareLogRows(b, a);
+      }).slice(0, 12);
+      renderLogList(el.rawEventList, rows, '暂无解析事件', {
+        headline: function (item) {
+          return [describeLogSource(item), item.link_id || '-', item.state || 'UNKNOWN'].join(' · ');
+        },
+        subline: function (item) {
+          return formatIsoFromMs(item.updated_at_ms || item.timestamp_ms);
+        },
+        line: function (item) {
+          return item.raw_line || JSON.stringify({
+            link_id: item.link_id,
+            motion_score: item.motion_score,
+            confidence: item.confidence,
+            quality: item.quality,
+            age_ms: item.age_ms
+          });
+        },
+        tags: function (item) {
+          var linkLabel = item.link_id ? (item.supported ? 'active' : 'legacy') : 'parsed';
+          return [
+            { label: 'events ' + formatValue(item.event_count), kind: 'off' },
+            { label: 'fusion ' + formatValue(item.fusion_event_count), kind: 'off' },
+            { label: linkLabel, kind: item.link_id ? (item.supported ? 'active' : 'warn') : 'off' }
+          ];
+        }
+      });
+    }
+
+    function renderLatestLogList() {
+      var rows = latestLogs();
+      renderLogList(el.latestLogList, rows, '暂无最新日志', {
+        headline: function (item) {
+          return [describeLogSource(item), item.device_id || '-', item.link_id || '-'].join(' · ');
+        },
+        subline: function (item) {
+          return formatIsoFromMs(item.updated_at_ms || item.timestamp_ms);
+        },
+        line: function (item) {
+          return item.raw_line || JSON.stringify(item, null, 2);
+        },
+        tags: function (item) {
+          return [
+            { label: item.state || 'UNKNOWN', kind: 'active' },
+            { label: 'motion ' + formatValue(item.motion_score), kind: 'off' },
+            { label: 'age ' + formatAge(item.age_ms), kind: 'off' }
+          ];
+        }
+      });
+    }
+
+    function renderAllVisuals() {
+      renderFusionStatus();
+      renderLinkStrip();
+      renderTelemetryJson();
+      drawTimeline();
+      drawDataCurves();
+      renderResultFeatureList();
+      renderRawParsedEvents();
+      renderLatestLogList();
+    }
+
+    function prepareCanvas(canvas) {
+      var rect = canvas.getBoundingClientRect();
+      var width = Math.max(320, Math.round(rect.width));
+      var height = Math.max(120, Math.round(rect.height));
+      var dpr = window.devicePixelRatio || 1;
+      if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+      }
+      var ctx = canvas.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      return { ctx: ctx, width: width, height: height };
+    }
+
+    function drawTimeline() {
+      var prepared = prepareCanvas(el.timelineCanvas);
+      var ctx = prepared.ctx;
+      var width = prepared.width;
+      var height = prepared.height;
+      var timeline = latestFrames();
+      ctx.fillStyle = '#0b0a08';
+      ctx.fillRect(0, 0, width, height);
+      drawGrid(ctx, width, height, 36);
+      if (!timeline.length) {
+        drawEmpty(ctx, width, height, 'waiting for state timeline');
+        return;
+      }
+      var minTs = timeline[0].timestamp_ms || 0;
+      var maxTs = timeline[timeline.length - 1].timestamp_ms || (minTs + 1);
+      if (maxTs <= minTs) {
+        maxTs = minTs + 1;
+      }
+      var y = 38;
+      var barHeight = 36;
+      timeline.forEach(function (item, index) {
+        var next = timeline[index + 1] || item;
+        var x1 = 24 + ((item.timestamp_ms - minTs) / (maxTs - minTs)) * (width - 48);
+        var x2 = 24 + (((next.timestamp_ms || item.timestamp_ms) - minTs) / (maxTs - minTs)) * (width - 48);
+        var w = Math.max(3, x2 - x1);
+        ctx.fillStyle = stateColor(item.state);
+        ctx.globalAlpha = 0.88;
+        ctx.fillRect(x1, y, w, barHeight);
+      });
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#f4f1e8';
+      ctx.font = '12px SFMono-Regular, Menlo, monospace';
+      ctx.fillText('IDLE', 24, 102);
+      ctx.fillText('MOTION', 92, 102);
+      ctx.fillText('HOLD', 182, 102);
+      ctx.fillText('UNKNOWN', 272, 102);
+      drawLegendDot(ctx, 70, 98, stateColor('IDLE'));
+      drawLegendDot(ctx, 152, 98, stateColor('MOTION'));
+      drawLegendDot(ctx, 224, 98, stateColor('HOLD'));
+      drawLegendDot(ctx, 252, 98, stateColor('UNKNOWN'));
+    }
+
+    function pointsForEventField(events, linkId, field) {
+      return coalesceCurvePoints(events.filter(function (event) {
+        return event.link_id === linkId && numeric(event[field]) !== null;
+      }).map(function (event) {
+        return {
+          timestamp_ms: eventTimestampMs(event),
+          value: numeric(event[field]),
+          raw_value: numeric(event[field])
+        };
+      }));
+    }
+
+    function pointsForTimelineField(frames, field, fallbackField) {
+      return coalesceCurvePoints(frames.map(function (frame) {
+        var value = firstNumeric(frame[field], fallbackField ? frame[fallbackField] : null);
+        var timestamp = firstNumeric(frame.timestamp_ms, frame.observed_at_ms);
+        return value !== null && timestamp !== null
+          ? { timestamp_ms: timestamp, value: value, raw_value: value }
+          : null;
+      }).filter(Boolean)).slice(-240);
+    }
+
+    function metricRowsFromEvents(events) {
+      var buckets = new Map();
+      events.forEach(function (event) {
+        var timestamp = eventTimestampMs(event);
+        if (timestamp === null) {
+          return;
+        }
+        var key = String(Math.round(timestamp));
+        if (!buckets.has(key)) {
+          buckets.set(key, { timestamp_ms: timestamp, counts: {}, sums: {} });
+        }
+        var bucket = buckets.get(key);
+        ['energy', 'variance', 'quality', 'rssi'].forEach(function (field) {
+          var value = numeric(event[field]);
+          if (value === null) {
+            return;
+          }
+          bucket.sums[field] = (bucket.sums[field] || 0) + value;
+          bucket.counts[field] = (bucket.counts[field] || 0) + 1;
+        });
+      });
+      return Array.from(buckets.values()).map(function (bucket) {
+        var row = { timestamp_ms: bucket.timestamp_ms };
+        Object.keys(bucket.sums).forEach(function (field) {
+          row[field] = bucket.sums[field] / bucket.counts[field];
+        });
+        return row;
+      }).sort(function (a, b) {
+        return a.timestamp_ms - b.timestamp_ms;
+      }).slice(-240);
+    }
+
+    function metricSeriesFromRows(rows, field, label, color) {
+      return {
+        label: label,
+        color: color,
+        normalize: true,
+        points: coalesceCurvePoints(rows.map(function (row) {
+          var value = numeric(row[field]);
+          return value !== null
+            ? { timestamp_ms: row.timestamp_ms, value: value, raw_value: value }
+            : null;
+        }).filter(Boolean))
+      };
+    }
+
+    function coalesceCurvePoints(points) {
+      var buckets = new Map();
+      points.forEach(function (point) {
+        var timestamp = numeric(point.timestamp_ms);
+        var value = numeric(point.value);
+        var rawValue = numeric(point.raw_value);
+        if (timestamp === null || value === null) {
+          return;
+        }
+        var key = String(Math.round(timestamp));
+        if (!buckets.has(key)) {
+          buckets.set(key, { timestamp_ms: timestamp, value_sum: 0, raw_sum: 0, count: 0 });
+        }
+        var bucket = buckets.get(key);
+        bucket.timestamp_ms = Math.min(bucket.timestamp_ms, timestamp);
+        bucket.value_sum += value;
+        bucket.raw_sum += rawValue !== null ? rawValue : value;
+        bucket.count += 1;
+      });
+      return Array.from(buckets.values()).map(function (bucket) {
+        return {
+          timestamp_ms: bucket.timestamp_ms,
+          value: bucket.value_sum / bucket.count,
+          raw_value: bucket.raw_sum / bucket.count
+        };
+      }).sort(function (a, b) {
+        return a.timestamp_ms - b.timestamp_ms;
+      }).slice(-240);
+    }
+
+    function seriesBounds(seriesList) {
+      var minTs = null;
+      var maxTs = null;
+      var minValue = null;
+      var maxValue = null;
+      seriesList.forEach(function (series) {
+        series.points.forEach(function (point) {
+          minTs = minTs === null ? point.timestamp_ms : Math.min(minTs, point.timestamp_ms);
+          maxTs = maxTs === null ? point.timestamp_ms : Math.max(maxTs, point.timestamp_ms);
+          if (!series.normalize) {
+            minValue = minValue === null ? point.value : Math.min(minValue, point.value);
+            maxValue = maxValue === null ? point.value : Math.max(maxValue, point.value);
+          }
+        });
+      });
+      if (minTs === null || maxTs === null) {
+        return null;
+      }
+      if (maxTs <= minTs) {
+        maxTs = minTs + 1;
+      }
+      if (minValue === null || maxValue === null) {
+        minValue = 0;
+        maxValue = 1;
+      }
+      if (maxValue <= minValue) {
+        maxValue = minValue + 1;
+      }
+      return { minTs: minTs, maxTs: maxTs, minValue: minValue, maxValue: maxValue };
+    }
+
+    function normalizeSeriesPoints(seriesList) {
+      seriesList.forEach(function (series) {
+        if (!series.normalize || !series.points.length) {
+          return;
+        }
+        var values = series.points.map(function (point) {
+          return point.raw_value;
+        });
+        var min = Math.min.apply(Math, values);
+        var max = Math.max.apply(Math, values);
+        var span = max > min ? max - min : 1;
+        series.rangeLabel = formatValue(min) + '..' + formatValue(max);
+        series.points.forEach(function (point) {
+          point.value = (point.raw_value - min) / span;
+        });
+      });
+      return seriesList;
+    }
+
+    function drawLineChart(canvas, options) {
+      var prepared = prepareCanvas(canvas);
+      var ctx = prepared.ctx;
+      var width = prepared.width;
+      var height = prepared.height;
+      var seriesList = normalizeSeriesPoints((options.series || []).filter(function (series) {
+        return series.points && series.points.length;
+      }));
+      ctx.fillStyle = '#0b0a08';
+      ctx.fillRect(0, 0, width, height);
+      drawGrid(ctx, width, height, 36);
+      if (!seriesList.length) {
+        drawEmpty(ctx, width, height, options.emptyText || 'waiting for curve data');
+        return { pointCount: 0, label: '' };
+      }
+
+      var bounds = seriesBounds(seriesList);
+      var padLeft = 46;
+      var padRight = 28;
+      var padTop = 28;
+      var padBottom = 34;
+      var plotWidth = width - padLeft - padRight;
+      var plotHeight = height - padTop - padBottom;
+
+      ctx.strokeStyle = 'rgba(244,241,232,0.22)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padLeft, padTop);
+      ctx.lineTo(padLeft, padTop + plotHeight);
+      ctx.lineTo(padLeft + plotWidth, padTop + plotHeight);
+      ctx.stroke();
+
+      ctx.fillStyle = '#93a4b6';
+      ctx.font = '11px SFMono-Regular, Menlo, monospace';
+      ctx.fillText(options.yMinLabel || formatValue(bounds.minValue), 8, padTop + plotHeight);
+      ctx.fillText(options.yMaxLabel || formatValue(bounds.maxValue), 8, padTop + 4);
+
+      seriesList.forEach(function (series) {
+        var points = series.points.map(function (point) {
+          var x = padLeft + ((point.timestamp_ms - bounds.minTs) / (bounds.maxTs - bounds.minTs)) * plotWidth;
+          var y = padTop + (1 - ((point.value - bounds.minValue) / (bounds.maxValue - bounds.minValue))) * plotHeight;
+          return { x: x, y: y, raw_value: point.raw_value };
+        });
+        ctx.strokeStyle = series.color;
+        ctx.lineWidth = series.width || 2;
+        ctx.beginPath();
+        drawPolylinePath(ctx, points);
+        ctx.stroke();
+        var last = points[points.length - 1];
+        if (last) {
+          ctx.fillStyle = series.color;
+          ctx.beginPath();
+          ctx.arc(last.x, last.y, 3.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      });
+
+      var legendX = padLeft;
+      var legendY = height - 13;
+      seriesList.forEach(function (series) {
+        var label = series.label + (series.rangeLabel ? ' ' + series.rangeLabel : '');
+        drawLegendDot(ctx, legendX + 4, legendY, series.color);
+        ctx.fillStyle = '#edf2f7';
+        ctx.font = '11px SFMono-Regular, Menlo, monospace';
+        ctx.fillText(label, legendX + 12, legendY);
+        legendX += Math.min(210, Math.max(88, label.length * 7 + 26));
+        if (legendX > width - 150) {
+          legendX = padLeft;
+          legendY -= 16;
+        }
+      });
+
+      return {
+        pointCount: seriesList.reduce(function (sum, series) {
+          return sum + series.points.length;
+        }, 0),
+        label: String(seriesList.length) + ' series'
+      };
+    }
+
+    function drawPolylinePath(ctx, points) {
+      if (!points.length) {
+        return;
+      }
+      ctx.moveTo(points[0].x, points[0].y);
+      for (var i = 1; i < points.length; i += 1) {
+        ctx.lineTo(points[i].x, points[i].y);
+      }
+    }
+
+    function drawDataCurves() {
+      var events = activeTelemetryEvents();
+      var frames = latestFrames();
+      var motionSeries = ACTIVE_LINK_IDS.map(function (linkId) {
+        return {
+          label: linkId,
+          color: LINK_COLORS[linkId],
+          points: pointsForEventField(events, linkId, 'motion_score')
+        };
+      });
+      motionSeries.push({
+        label: 'fused',
+        color: LINK_COLORS.fused,
+        width: 2.5,
+        points: pointsForTimelineField(frames, 'motion_score', 'score')
+      });
+
+      var motionResult = drawLineChart(el.motionCurveCanvas, {
+        series: motionSeries,
+        yMinLabel: '0',
+        yMaxLabel: '1',
+        emptyText: 'waiting for motion data'
+      });
+      var metricRows = metricRowsFromEvents(events);
+      var metricResult = drawLineChart(el.metricCurveCanvas, {
+        series: [
+          metricSeriesFromRows(metricRows, 'energy', 'energy', '#f2b84b'),
+          metricSeriesFromRows(metricRows, 'variance', 'variance', '#b6a0ff'),
+          metricSeriesFromRows(metricRows, 'quality', 'quality', '#4ade80'),
+          metricSeriesFromRows(metricRows, 'rssi', 'rssi', '#6dd6e8')
+        ],
+        yMinLabel: 'min',
+        yMaxLabel: 'max',
+        emptyText: 'waiting for feature metrics'
+      });
+      el.motionCurveMeta.textContent = motionResult.label;
+      el.metricCurveMeta.textContent = metricResult.label;
+    }
+
+    function stateColor(value) {
+      if (value === 'MOTION') {
+        return '#ff6b5a';
+      }
+      if (value === 'HOLD') {
+        return '#f2b84b';
+      }
+      if (value === 'UNKNOWN') {
+        return '#6b7280';
+      }
+      return '#4ade80';
+    }
+
+    function drawGrid(ctx, width, height, step) {
+      ctx.strokeStyle = 'rgba(244,241,232,0.08)';
+      ctx.lineWidth = 1;
+      for (var x = 0; x <= width; x += step) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+      }
+      for (var y = 0; y <= height; y += step) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+      }
+    }
+
+    function drawSmoothPath(ctx, points) {
+      if (!points.length) {
+        return;
+      }
+      ctx.moveTo(points[0].x, points[0].y);
+      if (points.length === 1) {
+        return;
+      }
+      if (points.length === 2) {
+        ctx.lineTo(points[1].x, points[1].y);
+        return;
+      }
+      for (var i = 0; i < points.length - 1; i += 1) {
+        var previous = points[Math.max(0, i - 1)];
+        var current = points[i];
+        var next = points[i + 1];
+        var following = points[Math.min(points.length - 1, i + 2)];
+        var cp1x = current.x + (next.x - previous.x) / 8;
+        var cp1y = current.y + (next.y - previous.y) / 8;
+        var cp2x = next.x - (following.x - current.x) / 8;
+        var cp2y = next.y - (following.y - current.y) / 8;
+        ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, next.x, next.y);
+      }
+    }
+
+    function drawEmpty(ctx, width, height, text) {
+      ctx.fillStyle = '#aaa390';
+      ctx.font = '13px SFMono-Regular, Menlo, monospace';
+      ctx.fillText(text, 24, height / 2);
+    }
+
+    function drawLegendDot(ctx, x, y, color) {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(x, y - 4, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    function colorWithAlpha(color, alpha) {
+      var text = String(color || '').trim();
+      if (text.charAt(0) !== '#' || (text.length !== 4 && text.length !== 7)) {
+        return text;
+      }
+      var r;
+      var g;
+      var b;
+      if (text.length === 4) {
+        r = Number.parseInt(text.charAt(1) + text.charAt(1), 16);
+        g = Number.parseInt(text.charAt(2) + text.charAt(2), 16);
+        b = Number.parseInt(text.charAt(3) + text.charAt(3), 16);
+      } else {
+        r = Number.parseInt(text.slice(1, 3), 16);
+        g = Number.parseInt(text.slice(3, 5), 16);
+        b = Number.parseInt(text.slice(5, 7), 16);
+      }
+      if (![r, g, b].every(Number.isFinite)) {
+        return text;
+      }
+      return 'rgba(' + r + ', ' + g + ', ' + b + ', ' + alpha + ')';
+    }
+
+    function clampRefreshInterval(value) {
+      var number = Number(value);
+      if (!Number.isFinite(number)) {
+        return REFRESH_INTERVAL_DEFAULT_MS;
+      }
+      return Math.max(REFRESH_INTERVAL_MIN_MS, Math.min(REFRESH_INTERVAL_MAX_MS, Math.round(number)));
+    }
+
+    function median(values) {
+      if (!values.length) {
+        return null;
+      }
+      var sorted = values.slice().sort(function (a, b) { return a - b; });
+      var middle = Math.floor(sorted.length / 2);
+      if (sorted.length % 2) {
+        return sorted[middle];
+      }
+      return (sorted[middle - 1] + sorted[middle]) / 2;
+    }
+
+    function estimateRefreshIntervalMs() {
+      var frames = latestFrames().slice(-REFRESH_INTERVAL_HISTORY_SIZE);
+      var timestamps = frames.map(function (frame) {
+        return numeric(frame.observed_at_ms || frame.timestamp_ms);
+      }).filter(function (value) {
+        return value !== null;
+      });
+      var deltas = [];
+      for (var i = 1; i < timestamps.length; i += 1) {
+        var delta = timestamps[i] - timestamps[i - 1];
+        if (delta > 0 && delta <= REFRESH_INTERVAL_MAX_MS * 4) {
+          deltas.push(delta);
+        }
+      }
+      return clampRefreshInterval(median(deltas) || REFRESH_INTERVAL_DEFAULT_MS);
+    }
+
+    function scheduleNextRefresh() {
+      window.clearTimeout(state.refreshTimer);
+      state.refreshIntervalMs = estimateRefreshIntervalMs();
+      state.refreshTimer = window.setTimeout(refreshDataLoop, state.refreshIntervalMs);
+    }
+
+    function scheduleStatusRefresh() {
+      window.clearTimeout(state.statusRefreshTimer);
+      state.statusRefreshTimer = window.setTimeout(refreshStatusLoop, SERIAL_STATUS_REFRESH_INTERVAL_MS);
+    }
+
+    function schedulePortsRefresh() {
+      window.clearTimeout(state.portsRefreshTimer);
+      state.portsRefreshTimer = window.setTimeout(refreshPortsLoop, SERIAL_PORTS_REFRESH_INTERVAL_MS);
+    }
+
+    async function refreshTelemetry() {
+      var params = new URLSearchParams({
+        limit: String(state.historyLimit),
+        window_ms: String(TELEMETRY_WINDOW_MS)
+      });
+      state.telemetry = await fetchJson('/api/csi/telemetry?' + params.toString());
+      renderAllVisuals();
+    }
+
+    async function refreshLatest() {
+      var data = await fetchJson('/api/csi/latest');
+      state.latestSample = data.latest_sample || data.sample || null;
+      state.totalCount = data.count || 0;
+      if (!state.telemetry && data.telemetry) {
+        state.telemetry = data.telemetry;
+      }
+      renderFusionStatus();
+    }
+
+    async function refreshStatus() {
+      state.status = await fetchJson('/api/serial/status');
+      renderSerialStatus();
+      renderSerialPorts();
+    }
+
+    async function refreshPorts() {
+      var data = await fetchJson('/api/serial/ports');
+      state.ports = data.ports || [];
+      if (data.status) {
+        state.status = data.status;
+        renderSerialStatus();
+      }
+      renderSerialPorts();
+    }
+
+    async function refreshAll() {
+      if (state.refreshInFlight) {
+        return;
+      }
+      state.refreshInFlight = true;
+      try {
+        await Promise.all([refreshLatest(), refreshTelemetry(), refreshStatus(), refreshPorts()]);
+      } catch (error) {
+        state.status = Object.assign({}, state.status, { lastError: error.message });
+        renderSerialStatus();
+        renderSerialPorts();
+      } finally {
+        state.refreshInFlight = false;
+        scheduleNextRefresh();
+        scheduleStatusRefresh();
+        schedulePortsRefresh();
+      }
+    }
+
+    async function refreshDataLoop() {
+      if (state.refreshInFlight) {
+        scheduleNextRefresh();
+        return;
+      }
+      state.refreshInFlight = true;
+      try {
+        await Promise.all([refreshLatest(), refreshTelemetry()]);
+      } catch (error) {
+        state.status = Object.assign({}, state.status, { lastError: error.message });
+        renderSerialStatus();
+      } finally {
+        state.refreshInFlight = false;
+        scheduleNextRefresh();
+      }
+    }
+
+    async function refreshStatusLoop() {
+      if (state.statusRefreshInFlight) {
+        scheduleStatusRefresh();
+        return;
+      }
+      state.statusRefreshInFlight = true;
+      try {
+        await refreshStatus();
+      } catch (error) {
+        state.status = Object.assign({}, state.status, { lastError: error.message });
+        renderSerialStatus();
+      } finally {
+        state.statusRefreshInFlight = false;
+        scheduleStatusRefresh();
+      }
+    }
+
+    async function refreshPortsLoop() {
+      if (state.portsRefreshInFlight) {
+        schedulePortsRefresh();
+        return;
+      }
+      state.portsRefreshInFlight = true;
+      try {
+        await refreshPorts();
+      } catch (error) {
+        state.status = Object.assign({}, state.status, { lastError: error.message });
+        renderSerialStatus();
+        renderSerialPorts();
+      } finally {
+        state.portsRefreshInFlight = false;
+        schedulePortsRefresh();
+      }
+    }
+
+    async function refreshDataOnly() {
+      try {
+        await refreshLatest();
+        await refreshTelemetry();
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    }
+
+    el.serialPorts.addEventListener('click', function (event) {
+      var button = event.target.closest('[data-port]');
+      if (!button) {
+        return;
+      }
+      el.serialPort.value = button.dataset.port;
+    });
+
+    el.refreshPorts.addEventListener('click', function () {
+      refreshPorts().then(function () {
+        showToast('端口列表已刷新', 'ok');
+      }).catch(function (error) {
+        showToast(error.message, 'error');
+      });
+    });
+
+    el.serialForm.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      var body = {
+        port: el.serialPort.value.trim(),
+        baudRate: Number.parseInt(el.serialBaud.value, 10) || 115200
+      };
+      try {
+        await fetchJson('/api/serial/connect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        showToast('串口已连接', 'ok');
+      } catch (error) {
+        state.status = Object.assign({}, state.status, { lastError: error.message });
+        showToast(error.message, 'error');
+      }
+      refreshStatus();
+    });
+
+    el.stopSerial.addEventListener('click', async function () {
+      try {
+        await fetchJson('/api/serial/disconnect', { method: 'POST' });
+        showToast('串口已断开', 'ok');
+      } catch (error) {
+        state.status = Object.assign({}, state.status, { lastError: error.message });
+        showToast(error.message, 'error');
+      }
+      refreshStatus();
+    });
+
+    el.importJson.addEventListener('click', async function () {
+      try {
+        var payload = JSON.parse(el.jsonImport.value.trim());
+        await fetchJson('/api/csi/sample', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        showToast('JSON 已导入', 'ok');
+        refreshDataOnly();
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    });
+
+    el.parseLine.addEventListener('click', async function () {
+      try {
+        await fetchJson('/api/csi/log-line', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ line: el.manualLine.value.trim() })
+        });
+        showToast('日志已解析', 'ok');
+        refreshDataOnly();
+      } catch (error) {
+        showToast(error.message, 'error');
+        refreshStatus();
+      }
+    });
+
+    el.mockSample.addEventListener('click', async function () {
+      try {
+        await fetchJson('/api/csi/mock', { method: 'POST' });
+        showToast('模拟帧已写入', 'ok');
+        refreshDataOnly();
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    });
+
+    el.historyLimit.addEventListener('change', function () {
+      state.historyLimit = Number.parseInt(el.historyLimit.value, 10) || HISTORY_LIMIT_DEFAULT;
+      refreshTelemetry();
+    });
+
+    el.clearHistory.addEventListener('click', async function () {
+      try {
+        await fetchJson('/api/csi/history', { method: 'DELETE' });
+        state.telemetry = null;
+        state.latestSample = null;
+        state.totalCount = 0;
+        renderAllVisuals();
+        renderSerialStatus();
+        showToast('历史已清空', 'ok');
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    });
+
+    window.addEventListener('resize', function () {
+      renderAllVisuals();
+    });
+
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function escapeAttr(value) {
+      return escapeHtml(value);
+    }
+
+    refreshAll();
+  </script>
+</body>
+</html>

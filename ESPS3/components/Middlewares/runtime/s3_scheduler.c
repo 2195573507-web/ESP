@@ -11,6 +11,7 @@
 #include "s3_scheduler.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "app_stack_monitor.h"
@@ -20,8 +21,11 @@
 #include "device_stream_gateway.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "gateway_config.h"
@@ -100,6 +104,10 @@ static const char *safe_diagnostic_text(const char *value)
 #define S3_SCHEDULER_HEARTBEAT_LOG_MS 30000U
 #endif
 
+#ifndef S3_SCHEDULER_WEATHER_REFRESH_INTERVAL_MS
+#define S3_SCHEDULER_WEATHER_REFRESH_INTERVAL_MS (20U * 60U * 1000U)
+#endif
+
 typedef struct {
     bool valid;
     unified_msg_t latest;
@@ -141,6 +149,14 @@ static QueueHandle_t s_stream_queue;
 static TaskHandle_t s_scheduler_task;
 static TaskHandle_t s_protocol_worker_task;
 static TaskHandle_t s_stream_worker_task;
+static StaticEventGroup_t s_worker_events_storage;
+static EventGroupHandle_t s_worker_events;
+static portMUX_TYPE s_scheduler_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_scheduler_accepting;
+
+#define S3_WORKER_STOP_BIT BIT0
+#define S3_PROTOCOL_WORKER_EXIT_BIT BIT1
+#define S3_STREAM_WORKER_EXIT_BIT BIT2
 
 static s3_runtime_device_state_t s_device_registry[GATEWAY_CONFIG_MAX_CHILDREN];
 static s3_runtime_sensor_state_t s_sensor_state[GATEWAY_CONFIG_MAX_CHILDREN];
@@ -152,6 +168,7 @@ static bool s_voice_busy;
 static int64_t s_last_snapshot_upload_ms;
 static int64_t s_last_smart_home_poll_ms;
 static int64_t s_last_command_pull_ms;
+static int64_t s_last_weather_refresh_ms;
 static int64_t s_last_diagnostic_log_ms;
 static int64_t s_last_heartbeat_log_ms;
 static int64_t s_last_stack_monitor_ms;
@@ -171,11 +188,102 @@ static esp_err_t queue_push_reliable_owned(s3_scheduler_event_t *event);
 static esp_err_t queue_push_timed_owned(s3_scheduler_event_t *event,
                                         uint32_t event_bus_lock_timeout_ms,
                                         s3_scheduler_enqueue_diagnostics_t *diagnostics);
+static void release_stream_work_item(s3_stream_work_item_t *item);
+
+static void s3_scheduler_set_accepting(bool accepting)
+{
+    portENTER_CRITICAL(&s_scheduler_state_lock);
+    s_scheduler_accepting = accepting;
+    portEXIT_CRITICAL(&s_scheduler_state_lock);
+}
+
+static bool s3_scheduler_is_accepting(void)
+{
+    bool accepting;
+    portENTER_CRITICAL(&s_scheduler_state_lock);
+    accepting = s_scheduler_accepting;
+    portEXIT_CRITICAL(&s_scheduler_state_lock);
+    return accepting;
+}
 
 /* scheduler 使用本机 uptime 驱动 cadence；Server 时间只作为业务 payload 字段。 */
 static int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+/* Queues and worker stacks are long-lived PSRAM allocations.  Admit them on
+ * both total capacity and the contiguous-block constraint before publishing a
+ * handle that another module could observe. */
+static bool s3_scheduler_psram_admitted(size_t requested_bytes, const char *stage)
+{
+    const uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    const size_t free_bytes = heap_caps_get_free_size(caps);
+    const size_t largest_bytes = heap_caps_get_largest_free_block(caps);
+    const bool admitted = requested_bytes > 0U && free_bytes >= requested_bytes &&
+                          largest_bytes >= requested_bytes;
+    if (!admitted) {
+        ESP_LOGW(TAG,
+                 "S3_MEMORY_ADMISSION_FAIL stage=%s requested=%u psram_free=%u psram_largest=%u",
+                 stage != NULL ? stage : "unknown",
+                 (unsigned int)requested_bytes,
+                 (unsigned int)free_bytes,
+                 (unsigned int)largest_bytes);
+    }
+    return admitted;
+}
+
+static void *s3_scheduler_psram_calloc(size_t count, size_t size, const char *stage)
+{
+    if (count == 0U || size == 0U || count > SIZE_MAX / size ||
+        !s3_scheduler_psram_admitted(count * size, stage)) {
+        return NULL;
+    }
+    return heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+static void *s3_scheduler_psram_malloc(size_t size, const char *stage)
+{
+    if (size == 0U || !s3_scheduler_psram_admitted(size, stage)) {
+        return NULL;
+    }
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+static bool s3_scheduler_stop_new_workers(void)
+{
+    if (s_worker_events == NULL) {
+        return false;
+    }
+    const EventBits_t expected = (s_protocol_worker_task != NULL ? S3_PROTOCOL_WORKER_EXIT_BIT : 0U) |
+                                 (s_stream_worker_task != NULL ? S3_STREAM_WORKER_EXIT_BIT : 0U);
+    xEventGroupSetBits(s_worker_events, S3_WORKER_STOP_BIT);
+    const EventBits_t exited = xEventGroupWaitBits(s_worker_events,
+                                                   expected,
+                                                   pdFALSE,
+                                                   pdTRUE,
+                                                   pdMS_TO_TICKS(20U * S3_SCHEDULER_BASE_TICK_MS));
+    if ((exited & expected) != expected) {
+        return false;
+    }
+    s_protocol_worker_task = NULL;
+    s_stream_worker_task = NULL;
+    return true;
+}
+
+static void s3_scheduler_release_unconsumed_work(void)
+{
+    s3_event_bus_reset();
+    s3_runtime_ingress_t *ingress = NULL;
+    while (s_protocol_queue != NULL && xQueueReceive(s_protocol_queue, &ingress, 0U) == pdTRUE) {
+        heap_caps_free(ingress);
+        ingress = NULL;
+    }
+    s3_stream_work_item_t item = {0};
+    while (s_stream_queue != NULL && xQueueReceive(s_stream_queue, &item, 0U) == pdTRUE) {
+        release_stream_work_item(&item);
+        memset(&item, 0, sizeof(item));
+    }
 }
 
 const char *s3_scheduler_network_state_name(s3_scheduler_network_state_t state)
@@ -886,10 +994,10 @@ static void protocol_worker_task(void *arg)
     ESP_LOGI(TAG,
              "protocol worker started queue_depth=%u",
              (unsigned int)S3_PROTOCOL_WORKER_QUEUE_DEPTH);
-    app_stack_monitor_log(TAG, "protocol_worker", "entry");
+    app_stack_monitor_report(TAG, "protocol_worker", S3_PROTOCOL_WORKER_TASK_STACK, "entry");
     app_heap_monitor_log(TAG);
 
-    while (1) {
+    while ((xEventGroupGetBits(s_worker_events) & S3_WORKER_STOP_BIT) == 0U) {
         s3_runtime_ingress_t *ingress = NULL;
         if (xQueueReceive(s_protocol_queue, &ingress, pdMS_TO_TICKS(S3_SCHEDULER_BASE_TICK_MS)) ==
             pdTRUE) {
@@ -907,6 +1015,11 @@ static void protocol_worker_task(void *arg)
                                       APP_HEAP_MONITOR_INTERVAL_MS);
         app_task_wdt_reset_current(wdt_registered);
     }
+    if (wdt_registered && esp_task_wdt_delete(NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "protocol worker WDT unregister failed");
+    }
+    xEventGroupSetBits(s_worker_events, S3_PROTOCOL_WORKER_EXIT_BIT);
+    vTaskDelete(NULL);
 }
 
 static void release_stream_work_item(s3_stream_work_item_t *item)
@@ -961,10 +1074,10 @@ static void stream_worker_task(void *arg)
     ESP_LOGI(TAG,
              "stream worker started queue_depth=%u",
              (unsigned int)S3_STREAM_WORKER_QUEUE_DEPTH);
-    app_stack_monitor_log(TAG, "stream_worker", "entry");
+    app_stack_monitor_report(TAG, "stream_worker", S3_STREAM_WORKER_TASK_STACK, "entry");
     app_heap_monitor_log(TAG);
 
-    while (1) {
+    while ((xEventGroupGetBits(s_worker_events) & S3_WORKER_STOP_BIT) == 0U) {
         s3_stream_work_item_t item = {0};
         if (xQueueReceive(s_stream_queue, &item, pdMS_TO_TICKS(S3_SCHEDULER_BASE_TICK_MS)) ==
             pdTRUE) {
@@ -1002,6 +1115,11 @@ static void stream_worker_task(void *arg)
                                       APP_HEAP_MONITOR_INTERVAL_MS);
         app_task_wdt_reset_current(wdt_registered);
     }
+    if (wdt_registered && esp_task_wdt_delete(NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "stream worker WDT unregister failed");
+    }
+    xEventGroupSetBits(s_worker_events, S3_STREAM_WORKER_EXIT_BIT);
+    vTaskDelete(NULL);
 }
 
 static s3_scheduler_event_t *event_alloc(s3_scheduler_event_type_t type,
@@ -1012,7 +1130,8 @@ static s3_scheduler_event_t *event_alloc(s3_scheduler_event_type_t type,
         return NULL;
     }
 
-    s3_scheduler_event_t *event = heap_caps_calloc(1, sizeof(*event), MALLOC_CAP_8BIT);
+    s3_scheduler_event_t *event =
+        s3_scheduler_psram_calloc(1U, sizeof(*event), "event_envelope");
     if (event == NULL) {
         return NULL;
     }
@@ -1043,6 +1162,9 @@ static esp_err_t queue_push_owned(s3_scheduler_event_t *event)
         event->priority > S3_SCHEDULER_PRIORITY_LOW) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!s3_scheduler_is_accepting()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     stamp_event_bus_policy(event);
     return s3_event_bus_push_owned(event);
 }
@@ -1053,9 +1175,15 @@ static esp_err_t queue_push_reliable_owned(s3_scheduler_event_t *event)
         event->priority > S3_SCHEDULER_PRIORITY_LOW) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!s3_scheduler_is_accepting()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     stamp_event_bus_policy(event);
 
     while (1) {
+        if (!s3_scheduler_is_accepting()) {
+            return ESP_ERR_INVALID_STATE;
+        }
         const s3_event_bus_level_t level = event->bus_level;
         esp_err_t ret = s3_event_bus_push_owned(event);
         if (ret == ESP_OK) {
@@ -1077,6 +1205,9 @@ static esp_err_t queue_push_timed_owned(s3_scheduler_event_t *event,
     if (event == NULL || event->type == S3_SCHEDULER_EVENT_NONE ||
         event->priority > S3_SCHEDULER_PRIORITY_LOW) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (!s3_scheduler_is_accepting()) {
+        return ESP_ERR_INVALID_STATE;
     }
     stamp_event_bus_policy(event);
     esp_err_t ret = s3_event_bus_push_owned_timed(
@@ -1299,6 +1430,7 @@ void s3_scheduler_tick(void)
         interval_at_least(upload_interval_ms, S3_SCHEDULER_COMMAND_PULL_MIN_MS);
     const uint32_t smart_home_interval_ms =
         adjusted_interval(S3_SCHEDULER_SMART_HOME_POLL_MS, multiplier);
+    const uint32_t weather_refresh_interval_ms = S3_SCHEDULER_WEATHER_REFRESH_INTERVAL_MS;
     const bool server_allowed = s3_scheduler_is_server_upload_allowed();
     const bool has_live_session = resource_manager_has_live_sessions();
 
@@ -1339,6 +1471,19 @@ void s3_scheduler_tick(void)
         }
     }
 
+    if (server_allowed && !s_voice_busy &&
+        due(timestamp_ms, s_last_weather_refresh_ms, weather_refresh_interval_ms)) {
+        const bool first_weather_refresh = s_last_weather_refresh_ms == 0;
+        s_last_weather_refresh_ms = timestamp_ms;
+        esp_err_t ret = network_worker_enqueue_weather_refresh_request(
+            first_weather_refresh ? "link_stable" : "ttl_due");
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG,
+                     "weather refresh worker enqueue failed ret=%s",
+                     safe_diagnostic_text(esp_err_to_name(ret)));
+        }
+    }
+
     if (due(timestamp_ms, s_last_diagnostic_log_ms,
             adjusted_interval(S3_SCHEDULER_DIAGNOSTIC_LOG_MS, multiplier))) {
         s_last_diagnostic_log_ms = timestamp_ms;
@@ -1359,7 +1504,7 @@ static void s3_scheduler_task(void *arg)
              "S3 scheduler started as priority event bus base_tick_ms=%u priority_order=CRITICAL>REALTIME>STATE>BACKGROUND",
              (unsigned int)S3_SCHEDULER_BASE_TICK_MS);
     s3_event_bus_log_stats("start");
-    app_stack_monitor_log(TAG, "s3_scheduler_task", "entry");
+    app_stack_monitor_report(TAG, "s3_scheduler", S3_SCHEDULER_TASK_STACK, "entry");
     app_heap_monitor_log(TAG);
 
     int64_t last_tick_ms = 0;
@@ -1386,23 +1531,48 @@ static void s3_scheduler_task(void *arg)
 
 esp_err_t s3_scheduler_init(void)
 {
+    if (s_worker_events == NULL) {
+        s_worker_events = xEventGroupCreateStatic(&s_worker_events_storage);
+        if (s_worker_events == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    xEventGroupClearBits(s_worker_events,
+                         S3_WORKER_STOP_BIT | S3_PROTOCOL_WORKER_EXIT_BIT | S3_STREAM_WORKER_EXIT_BIT);
+    s3_scheduler_set_accepting(false);
     esp_err_t bus_ret = s3_event_bus_init(event_release);
     if (bus_ret != ESP_OK) {
         return bus_ret;
     }
+    bool created_protocol_queue = false;
+    bool created_stream_queue = false;
     if (s_protocol_queue == NULL) {
-        s_protocol_queue = xQueueCreate(S3_PROTOCOL_WORKER_QUEUE_DEPTH,
-                                        sizeof(s3_runtime_ingress_t *));
+        if (!s3_scheduler_psram_admitted(S3_PROTOCOL_WORKER_QUEUE_DEPTH *
+                                             sizeof(s3_runtime_ingress_t *),
+                                         "protocol_queue")) {
+            return ESP_ERR_NO_MEM;
+        }
+        s_protocol_queue = xQueueCreateWithCaps(S3_PROTOCOL_WORKER_QUEUE_DEPTH,
+                                                sizeof(s3_runtime_ingress_t *),
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (s_protocol_queue == NULL) {
             return ESP_ERR_NO_MEM;
         }
+        created_protocol_queue = true;
     }
     if (s_stream_queue == NULL) {
-        s_stream_queue = xQueueCreate(S3_STREAM_WORKER_QUEUE_DEPTH,
-                                      sizeof(s3_stream_work_item_t));
-        if (s_stream_queue == NULL) {
-            return ESP_ERR_NO_MEM;
+        if (!s3_scheduler_psram_admitted(S3_STREAM_WORKER_QUEUE_DEPTH *
+                                             sizeof(s3_stream_work_item_t),
+                                         "stream_queue")) {
+            goto fail;
         }
+        s_stream_queue = xQueueCreateWithCaps(S3_STREAM_WORKER_QUEUE_DEPTH,
+                                              sizeof(s3_stream_work_item_t),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_stream_queue == NULL) {
+            goto fail;
+        }
+        created_stream_queue = true;
     }
     /* init 可用于错误恢复：清掉旧队列对象，避免上一轮未处理事件重复执行。 */
     s3_event_bus_reset();
@@ -1420,6 +1590,17 @@ esp_err_t s3_scheduler_init(void)
     s_voice_busy = false;
     s_pending_command_pull = false;
     return ESP_OK;
+
+fail:
+    if (created_stream_queue) {
+        vQueueDelete(s_stream_queue);
+        s_stream_queue = NULL;
+    }
+    if (created_protocol_queue) {
+        vQueueDelete(s_protocol_queue);
+        s_protocol_queue = NULL;
+    }
+    return ESP_ERR_NO_MEM;
 }
 
 esp_err_t s3_scheduler_start(void)
@@ -1427,45 +1608,76 @@ esp_err_t s3_scheduler_start(void)
     if (s_protocol_queue == NULL || s_stream_queue == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    bool created_protocol_worker = false;
+    bool created_stream_worker = false;
+    xEventGroupClearBits(s_worker_events,
+                         S3_WORKER_STOP_BIT | S3_PROTOCOL_WORKER_EXIT_BIT | S3_STREAM_WORKER_EXIT_BIT);
     if (s_protocol_worker_task == NULL) {
-        BaseType_t created = xTaskCreate(protocol_worker_task,
-                                         "protocol_worker",
-                                         S3_PROTOCOL_WORKER_TASK_STACK,
-                                         NULL,
-                                         S3_PROTOCOL_WORKER_TASK_PRIORITY,
-                                         &s_protocol_worker_task);
+        BaseType_t created = xTaskCreateWithCaps(protocol_worker_task,
+                                                 "protocol_worker",
+                                                 S3_PROTOCOL_WORKER_TASK_STACK,
+                                                 NULL,
+                                                 S3_PROTOCOL_WORKER_TASK_PRIORITY,
+                                                 &s_protocol_worker_task,
+                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (created != pdPASS) {
             s_protocol_worker_task = NULL;
             return ESP_ERR_NO_MEM;
         }
+        app_stack_monitor_log_task_created(TAG,
+                                           "protocol_worker",
+                                           s_protocol_worker_task,
+                                           S3_PROTOCOL_WORKER_TASK_STACK);
+        created_protocol_worker = true;
     }
     if (s_stream_worker_task == NULL) {
-        BaseType_t created = xTaskCreate(stream_worker_task,
-                                         "stream_worker",
-                                         S3_STREAM_WORKER_TASK_STACK,
-                                         NULL,
-                                         S3_STREAM_WORKER_TASK_PRIORITY,
-                                         &s_stream_worker_task);
+        BaseType_t created = xTaskCreateWithCaps(stream_worker_task,
+                                                 "stream_worker",
+                                                 S3_STREAM_WORKER_TASK_STACK,
+                                                 NULL,
+                                                 S3_STREAM_WORKER_TASK_PRIORITY,
+                                                 &s_stream_worker_task,
+                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (created != pdPASS) {
             s_stream_worker_task = NULL;
-            return ESP_ERR_NO_MEM;
+            goto fail;
         }
+        app_stack_monitor_log_task_created(TAG,
+                                           "stream_worker",
+                                           s_stream_worker_task,
+                                           S3_STREAM_WORKER_TASK_STACK);
+        created_stream_worker = true;
     }
     if (s_scheduler_task != NULL) {
         return ESP_OK;
     }
 
-    BaseType_t created = xTaskCreate(s3_scheduler_task,
-                                     "s3_scheduler",
-                                     S3_SCHEDULER_TASK_STACK,
-                                     NULL,
-                                     S3_SCHEDULER_TASK_PRIORITY,
-                                     &s_scheduler_task);
+    BaseType_t created = xTaskCreateWithCaps(s3_scheduler_task,
+                                             "s3_scheduler",
+                                             S3_SCHEDULER_TASK_STACK,
+                                             NULL,
+                                             S3_SCHEDULER_TASK_PRIORITY,
+                                             &s_scheduler_task,
+                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         s_scheduler_task = NULL;
-        return ESP_ERR_NO_MEM;
+        goto fail;
     }
+    app_stack_monitor_log_task_created(TAG,
+                                       "s3_scheduler",
+                                       s_scheduler_task,
+                                       S3_SCHEDULER_TASK_STACK);
+    s3_scheduler_set_accepting(true);
     return ESP_OK;
+
+fail:
+    s3_scheduler_set_accepting(false);
+    if ((created_stream_worker || created_protocol_worker) && !s3_scheduler_stop_new_workers()) {
+        ESP_LOGE(TAG, "scheduler rollback worker exit timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+    s3_scheduler_release_unconsumed_work();
+    return ESP_ERR_NO_MEM;
 }
 
 esp_err_t s3_scheduler_enqueue_event(const s3_scheduler_event_t *event)
@@ -1494,7 +1706,9 @@ esp_err_t s3_scheduler_enqueue_event(const s3_scheduler_event_t *event)
             event_release(owned);
             return ESP_ERR_INVALID_ARG;
         }
-        owned->ingress = heap_caps_calloc(1, sizeof(*owned->ingress), MALLOC_CAP_8BIT);
+        owned->ingress = s3_scheduler_psram_calloc(1U,
+                                                   sizeof(*owned->ingress),
+                                                   "event_ingress");
         if (owned->ingress == NULL) {
             event_release(owned);
             return ESP_ERR_NO_MEM;
@@ -1511,7 +1725,8 @@ esp_err_t s3_scheduler_enqueue_event(const s3_scheduler_event_t *event)
     }
     if (event->type == S3_SCHEDULER_EVENT_STREAM_FRAME ||
         event->type == S3_SCHEDULER_EVENT_STREAM_SEND) {
-        owned->payload = heap_caps_malloc(event->payload_len + 1U, MALLOC_CAP_8BIT);
+        owned->payload = s3_scheduler_psram_malloc(event->payload_len + 1U,
+                                                    "event_payload");
         if (owned->payload == NULL) {
             event_release(owned);
             return ESP_ERR_NO_MEM;
@@ -1546,8 +1761,9 @@ esp_err_t s3_scheduler_enqueue_ingress(const s3_runtime_ingress_t *ingress,
         ingress->body_len > S3_RUNTIME_BUS_BODY_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
-    s3_runtime_ingress_t *owned_ingress =
-        heap_caps_calloc(1, sizeof(*owned_ingress), MALLOC_CAP_8BIT);
+    s3_runtime_ingress_t *owned_ingress = s3_scheduler_psram_calloc(1U,
+                                                                      sizeof(*owned_ingress),
+                                                                      "ingress_copy");
     if (owned_ingress == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -1668,7 +1884,7 @@ esp_err_t s3_scheduler_enqueue_stream_frame(const char *json,
     if (event == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    event->payload = heap_caps_malloc(json_len + 1U, MALLOC_CAP_8BIT);
+    event->payload = s3_scheduler_psram_malloc(json_len + 1U, "stream_json");
     if (event->payload == NULL) {
         event_release(event);
         return ESP_ERR_NO_MEM;
@@ -1703,7 +1919,7 @@ esp_err_t s3_scheduler_enqueue_stream_send(const char *peer_ip,
     if (event == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    event->payload = heap_caps_malloc(payload_len, MALLOC_CAP_8BIT);
+    event->payload = s3_scheduler_psram_malloc(payload_len, "stream_payload");
     if (event->payload == NULL) {
         event_release(event);
         return ESP_ERR_NO_MEM;

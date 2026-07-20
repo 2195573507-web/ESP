@@ -33,7 +33,8 @@ set(runtime_srcs
             runtime/c5_backpressure_controller.c
             runtime/c5_event_bus.c
             runtime/c5_resource_manager.c
-            runtime/c5_runtime_workers.c)
+            runtime/c5_runtime_workers.c
+            runtime/c5_task_lifecycle.c)
 
 set(memory_srcs
             memory/c5_memory.c)
@@ -81,7 +82,8 @@ set(srcs
             ${system_srcs})
 
 set(include_dirs
-            app_orchestrator)
+            app_orchestrator
+            memory)
 
 set(priv_include_dirs
             wifi
@@ -124,6 +126,7 @@ set(requires
             server_comm
             esp111_protocol_common
             radar_ld2450
+            lcd_ui
             radar_domain
             bt
             espressif__esp-sr)

@@ -5,6 +5,9 @@ const {
     buildLlmPrompt
 } = require("../services/llmPromptContextService");
 const {
+    runVoiceAgentConversation
+} = require("./agentConversation");
+const {
     maskLogValue,
     maskUrlForLog,
     normalizeLogPreview
@@ -28,9 +31,6 @@ const {
 const {
     normalizeTtsPcmBuffer
 } = require("./ttsAudio");
-const {
-    createVoiceTtsPcmStream
-} = require("./ttsStream");
 const {
     openRealtimeWebSocket
 } = require("./realtimeSocket");
@@ -165,132 +165,49 @@ async function requestVoiceTurnLlm(asrText, config, signal, options = {}) {
     }
 }
 
-function isRealtimeTtsUrl(url) {
-    const protocol = new URL(url).protocol;
-    return protocol === "ws:" || protocol === "wss:";
-}
-
-function createRealtimeTtsEventSource(text, config, signal, options = {}) {
-    const controller = new AbortController();
-    const openWebSocket = options.openWebSocket || openRealtimeWebSocket;
+async function requestRealtimeVoiceTts(text, config, signal) {
     let ws = null;
-    let closeRequested = false;
-
-    const abort = () => {
-        if (closeRequested) {
-            return;
-        }
-        closeRequested = true;
-        controller.abort();
-        if (ws) {
-            if (typeof ws.abort === "function") {
-                ws.abort(createVoiceStageError("tts", "VOICE_TTS_ABORTED", "TTS stream aborted", 502));
-            } else {
-                ws.sendClose();
-            }
-        }
-    };
-
-    const onParentAbort = () => abort();
-    signal?.addEventListener("abort", onParentAbort, { once: true });
-
-    async function *events() {
-        try {
-            ws = await openWebSocket(
-                config.tts.url,
-                buildVolcGatewayHeaders(config, "tts"),
-                controller.signal,
-                "tts",
-                {
-                    receiveLimits: options.receiveLimits
-                }
-            );
-            ws.sendText(buildTtsSessionUpdate(config));
-
-            let sessionUpdated = false;
-            while (!controller.signal.aborted) {
-                const event = parseTtsRealtimeEvent(await ws.nextMessage(controller.signal));
-                if (event.isError) {
-                    throw createVoiceStageError("tts", "VOICE_TTS_FAILED", event.errorMessage || "TTS Realtime WebSocket returned an error", 502, {
-                        endpoint: config.tts.url,
-                        model: config.tts.model
-                    });
-                }
-                if (event.isSessionUpdated) {
-                    sessionUpdated = true;
-                    break;
-                }
-                if (event.isAudioDone) {
-                    throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS completed before its session acknowledgement", 502, {
-                        endpoint: config.tts.url,
-                        model: config.tts.model
-                    });
-                }
-            }
-            if (!sessionUpdated) {
-                throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS session acknowledgement was not received", 502, {
-                    endpoint: config.tts.url,
-                    model: config.tts.model
-                });
-            }
-
-            ws.sendText(JSON.stringify({
-                type: "input_text.append",
-                delta: text
-            }));
-            ws.sendText(JSON.stringify({
-                type: "input_text.done"
-            }));
-
-            while (!controller.signal.aborted) {
-                yield parseTtsRealtimeEvent(await ws.nextMessage(controller.signal));
-            }
-        } finally {
-            signal?.removeEventListener("abort", onParentAbort);
-            if (ws) {
-                ws.sendClose();
-            }
-        }
-    }
-
-    return {
-        events: events(),
-        abort
-    };
-}
-
-function createRealtimeVoiceTtsPcmStream(text, config, signal, options = {}) {
-    if (!isRealtimeTtsUrl(config.tts.url)) {
-        throw createVoiceStageError("tts", "VOICE_TTS_STREAMING_UNSUPPORTED", "Streaming TTS requires a WebSocket gateway URL", 503, {
-            endpoint: config.tts.url,
-            model: config.tts.model
-        });
-    }
-
-    const eventSource = createRealtimeTtsEventSource(text, config, signal, options);
-    return createVoiceTtsPcmStream({
-        events: eventSource.events,
-        signal,
-        provider: "volcengine",
-        limits: options.limits,
-        abortUpstream: eventSource.abort
-    });
-}
-
-async function requestRealtimeVoiceTts(text, config, signal, options = {}) {
-    let completed = false;
-    let eventSource = null;
     const audioChunks = [];
 
     try {
-        eventSource = createRealtimeTtsEventSource(text, config, signal, options);
-        for await (const event of eventSource.events) {
+        ws = await openRealtimeWebSocket(
+            config.tts.url,
+            buildVolcGatewayHeaders(config, "tts"),
+            signal,
+            "tts"
+        );
+        ws.sendText(buildTtsSessionUpdate(config));
+        while (!signal?.aborted) {
+            const event = parseTtsRealtimeEvent(await ws.nextMessage(signal));
             if (event.isError) {
                 throw createVoiceStageError("tts", "VOICE_TTS_FAILED", event.errorMessage || "TTS Realtime WebSocket returned an error", 502, {
                     endpoint: config.tts.url,
                     model: config.tts.model
                 });
             }
+
+            if (event.isSessionUpdated) {
+                break;
+            }
+        }
+
+        ws.sendText(JSON.stringify({
+            type: "input_text.append",
+            delta: text
+        }));
+        ws.sendText(JSON.stringify({
+            type: "input_text.done"
+        }));
+
+        while (!signal?.aborted) {
+            const event = parseTtsRealtimeEvent(await ws.nextMessage(signal));
+            if (event.isError) {
+                throw createVoiceStageError("tts", "VOICE_TTS_FAILED", event.errorMessage || "TTS Realtime WebSocket returned an error", 502, {
+                    endpoint: config.tts.url,
+                    model: config.tts.model
+                });
+            }
+
             if (event.isAudioDelta) {
                 const decoded = decodeBase64Buffer(event.delta);
                 if (!decoded) {
@@ -303,18 +220,13 @@ async function requestRealtimeVoiceTts(text, config, signal, options = {}) {
             }
 
             if (event.isAudioDone) {
-                completed = true;
                 break;
             }
         }
-        if (!completed) {
-            throw createVoiceStageError("tts", "VOICE_TTS_INCOMPLETE", "TTS provider closed before audio completion", 502, {
-                endpoint: config.tts.url,
-                model: config.tts.model
-            });
-        }
+
+        const audioBuffer = Buffer.concat(audioChunks);
         return {
-            pcm: normalizeTtsPcmBuffer(Buffer.concat(audioChunks))
+            pcm: normalizeTtsPcmBuffer(audioBuffer)
         };
     } catch (error) {
         if (error?.code) {
@@ -335,8 +247,8 @@ async function requestRealtimeVoiceTts(text, config, signal, options = {}) {
             cause: error
         });
     } finally {
-        if (!completed) {
-            eventSource?.abort("TTS buffered consumer stopped");
+        if (ws) {
+            ws.sendClose();
         }
     }
 }
@@ -412,15 +324,16 @@ async function requestHttpVoiceTts(text, config, deviceId, signal) {
     }
 }
 
-async function requestVoiceTts(text, config, deviceId, signal, options = {}) {
-    if (isRealtimeTtsUrl(config.tts.url)) {
-        return requestRealtimeVoiceTts(text, config, signal, options);
+async function requestVoiceTts(text, config, deviceId, signal) {
+    const protocol = new URL(config.tts.url).protocol;
+    if (protocol === "ws:" || protocol === "wss:") {
+        return requestRealtimeVoiceTts(text, config, signal);
     }
 
     return requestHttpVoiceTts(text, config, deviceId, signal);
 }
 
-async function runVoiceTurnTextStages(audioBuffer, deviceId, voiceConfig, gatewayConfig, signal, metrics, logger = console, options = {}) {
+async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConfig, signal, metrics, logger = console, options = {}) {
     let stageStartedAt = Date.now();
     const asrResult = await requestVoiceAsr(audioBuffer, gatewayConfig, voiceConfig, signal, logger);
     metrics.asrMs = Date.now() - stageStartedAt;
@@ -431,9 +344,10 @@ async function runVoiceTurnTextStages(audioBuffer, deviceId, voiceConfig, gatewa
     );
 
     stageStartedAt = Date.now();
-    const llmResult = await requestVoiceTurnLlm(asrResult.text, gatewayConfig, signal, {
+    const llmResult = await runVoiceAgentConversation(asrResult.text, gatewayConfig, signal, {
         dbAll: options.dbAll,
-        deviceId
+        deviceId,
+        logger
     });
     metrics.llmMs = Date.now() - stageStartedAt;
     metrics.llmReplyLength = llmResult.text.length;
@@ -441,22 +355,8 @@ async function runVoiceTurnTextStages(audioBuffer, deviceId, voiceConfig, gatewa
         `[voice-turn] llm_success device_id=${maskLogValue(deviceId)} asr_text_length=${metrics.asrTextLength} llm_reply_length=${metrics.llmReplyLength} elapsed_ms=${metrics.llmMs}`
     );
 
-    return {
-        llmText: llmResult.text
-    };
-}
-
-async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConfig, signal, metrics, logger = console, options = {}) {
-    const stages = await runVoiceTurnTextStages(audioBuffer,
-                                                deviceId,
-                                                voiceConfig,
-                                                gatewayConfig,
-                                                signal,
-                                                metrics,
-                                                logger,
-                                                options);
-    const stageStartedAt = Date.now();
-    const ttsResult = await requestVoiceTts(stages.llmText, gatewayConfig, deviceId, signal);
+    stageStartedAt = Date.now();
+    const ttsResult = await requestVoiceTts(llmResult.text, gatewayConfig, deviceId, signal);
     metrics.ttsMs = Date.now() - stageStartedAt;
     metrics.ttsPcmBytes = ttsResult.pcm.length;
     logger.log(
@@ -477,44 +377,9 @@ async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConf
     };
 }
 
-async function runVoiceTurnStreamingChain(audioBuffer, deviceId, voiceConfig, gatewayConfig, signal, metrics, logger = console, options = {}) {
-    const stages = await runVoiceTurnTextStages(audioBuffer,
-                                                deviceId,
-                                                voiceConfig,
-                                                gatewayConfig,
-                                                signal,
-                                                metrics,
-                                                logger,
-                                                options);
-    const ttsStartedAt = Date.now();
-    const ttsStream = createRealtimeVoiceTtsPcmStream(stages.llmText, gatewayConfig, signal, {
-        limits: {
-            maxQueuedBytes: voiceConfig.ttsStreamingQueueBytes,
-            maxChunkBytes: voiceConfig.ttsStreamingChunkBytes,
-            maxTotalBytes: voiceConfig.ttsStreamingTotalBytes
-        },
-        receiveLimits: {
-            maxMessageBytes: voiceConfig.ttsWebSocketMessageBytes,
-            maxBufferedBytes: voiceConfig.ttsWebSocketBacklogBytes,
-            maxBufferedMessages: voiceConfig.ttsWebSocketBacklogMessages
-        }
-    });
-
-    return {
-        mode: "chain_streaming",
-        asrMs: metrics.asrMs,
-        llmMs: metrics.llmMs,
-        asrTextLength: metrics.asrTextLength,
-        asrTextPreview: metrics.asrTextPreview,
-        llmReplyLength: metrics.llmReplyLength,
-        ttsStartedAt,
-        ttsStream
-    };
-}
-
 module.exports = {
     requestVoiceAsr,
+    requestVoiceTurnLlm,
     requestVoiceTts,
-    runVoiceTurnChain,
-    runVoiceTurnStreamingChain
+    runVoiceTurnChain
 };

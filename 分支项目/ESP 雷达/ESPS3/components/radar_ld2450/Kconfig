@@ -1,0 +1,36 @@
+menu "S3 local LD2450 radar"
+
+config S3_LOCAL_LD2450_UART_ENABLED
+    bool "Enable the wired S3 local LD2450 UART"
+    default n
+    help
+        Enable only after the actual LD2450 wiring has been confirmed. The
+        runtime still rejects invalid port or GPIO values instead of guessing.
+
+config S3_LOCAL_LD2450_UART_PORT
+    int "UART controller"
+    default 1
+    help
+        UART controller reserved for the S3-local LD2450. UART0 is the console
+        and must not be selected for this radar.
+
+config S3_LOCAL_LD2450_UART_TX_GPIO
+    int "MCU TX GPIO to LD2450 RX"
+    default -1
+    help
+        Enter the confirmed MCU TX GPIO. Leave at -1 until wired.
+
+config S3_LOCAL_LD2450_UART_RX_GPIO
+    int "MCU RX GPIO from LD2450 TX"
+    default -1
+    help
+        Enter the confirmed MCU RX GPIO. Leave at -1 until wired.
+
+config RADAR_RAW_DEBUG
+    bool "Enable bounded LD2450 raw-frame debug"
+    default n
+    help
+        Emit at most one bounded raw UART hex dump per second. Keep disabled
+        during normal operation because it is a diagnostic-only serial cost.
+
+endmenu

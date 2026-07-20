@@ -29,3 +29,6 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 
 # Active WiFi channel-state capture was removed; IDF maps its legacy alias to this symbol.
 # CONFIG_ESP_WIFI_CSI_ENABLED is not set
+# Keep both the software canary and the hardware stack-end watchpoint enabled.
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y

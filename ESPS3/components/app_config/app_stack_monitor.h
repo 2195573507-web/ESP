@@ -10,6 +10,7 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 #ifndef APP_STACK_LOW_WATER_WARNING_BYTES
@@ -83,6 +84,37 @@ static inline UBaseType_t app_stack_monitor_log(const char *tag,
     UBaseType_t high_water = app_stack_monitor_high_water();
     app_stack_monitor_log_free_bytes(tag, task_name, stage, high_water);
     return high_water;
+}
+
+static inline void app_stack_monitor_report(const char *tag,
+                                            const char *task_name,
+                                            size_t configured_stack_bytes,
+                                            const char *stage)
+{
+    const UBaseType_t high_water = app_stack_monitor_high_water();
+    ESP_LOGI(app_stack_monitor_safe_text(tag),
+             "TASK_STACK_REPORT task=%s stack_bytes=%u high_water_bytes=%u stage=%s",
+             app_stack_monitor_safe_text(task_name),
+             (unsigned int)configured_stack_bytes,
+             (unsigned int)high_water,
+             app_stack_monitor_safe_text(stage));
+}
+
+static inline void app_stack_monitor_log_task_created(const char *tag,
+                                                      const char *task_name,
+                                                      TaskHandle_t task,
+                                                      size_t stack_bytes)
+{
+    if (task == NULL) {
+        return;
+    }
+
+    ESP_LOGI(app_stack_monitor_safe_text(tag),
+             "TASK_CREATE task=%s tcb=%p stack=%p stack_bytes=%u memory=internal",
+             app_stack_monitor_safe_text(task_name),
+             (void *)task,
+             (void *)pxTaskGetStackStart(task),
+             (unsigned int)stack_bytes);
 }
 
 static inline UBaseType_t app_stack_monitor_log_periodic(const char *tag,

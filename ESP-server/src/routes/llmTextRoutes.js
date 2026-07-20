@@ -3,21 +3,24 @@ const {
     describeLlmError,
     getLlmResponseStatus,
     readLlmConfig,
-    readLlmTextRequest,
-    requestLlmText
+    readLlmTextRequest
 } = require("../llm/textClient");
 const {
     maskLogValue
 } = require("../utils/logging");
 const {
-    buildLlmPrompt
-} = require("../services/llmPromptContextService");
+    createDefaultToolRegistry
+} = require("../agent/defaultToolRegistry");
+const {
+    runAgentConversation
+} = require("../agent/agentRunner");
 
 function createLlmTextRouter(options) {
     const router = express.Router();
     const dbRun = options.dbRun;
     const dbAll = options.dbAll;
     const logger = options.logger || console;
+    const toolRegistry = options.toolRegistry || createDefaultToolRegistry();
 
     router.post("/api/llm/text", async (req, res) => {
         const llmRequest = readLlmTextRequest(req.body);
@@ -34,11 +37,14 @@ function createLlmTextRouter(options) {
         );
 
         try {
-            const promptResult = await buildLlmPrompt(dbAll, llmRequest.text, {
+            const llmResult = await runAgentConversation({
+                dbAll,
+                toolRegistry,
+                userText: llmRequest.text,
                 deviceId: llmRequest.deviceId,
-                mode: "text"
+                config,
+                logger
             });
-            const llmResult = await requestLlmText(promptResult.prompt, config);
             const serverTimeMs = Date.now();
             const insertResult = await dbRun(
                 "INSERT INTO llm_records(timestamp,prompt,response) VALUES(?,?,?)",

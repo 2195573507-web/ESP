@@ -50,6 +50,13 @@ typedef enum {
  */
 esp_err_t voice_chain_start(void);
 
+/**
+ * Queue a user-initiated local wake request for the voice task.  This is the
+ * only LCD-facing entry point: UI/touch code never changes voice state or
+ * allocates audio resources directly.
+ */
+esp_err_t voice_chain_request_local_wake(void);
+
 /** @brief 获取当前 voice_chain 状态；状态页、日志或调试命令调用，返回枚举值。 */
 voice_chain_state_t voice_chain_get_state(void);
 

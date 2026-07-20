@@ -31,7 +31,10 @@ extern "C" {
 #define C5_WORKER_QUEUE_LENGTH 6U
 #endif
 
-/** @brief Create queues, register event handlers, and start BME/system workers. */
+/** @brief Create bounded queues and register dispatcher handlers during scheduler phase 1. */
+esp_err_t c5_runtime_workers_prepare(void);
+
+/** @brief Create the BME/system worker tasks during scheduler phase 2. */
 esp_err_t c5_runtime_workers_start(void);
 
 /** @brief Stop new worker dispatch, clear queued work, and wait for current work to finish. */

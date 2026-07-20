@@ -3,6 +3,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+
 static bool append_text(char *out,
                         size_t out_size,
                         size_t *used,
@@ -43,12 +44,13 @@ int radar_result_encode_json(const radar_target_sample_t *sample,
                      out_size,
                      &used,
                      "{\"p\":3,\"id\":%u,\"t\":\"radar\",\"u\":%lu,\"q\":%lu,\"v\":{"
-                     "\"device_id\":\"%s\",\"link_state\":%u,\"sample_valid\":%u,"
+                     "\"device_id\":\"%s\",\"room_id\":\"%s\",\"link_state\":%u,\"sample_valid\":%u,"
                      "\"frame_seq\":%lu,\"frame_uptime_ms\":%lu,\"target_count\":%u,\"targets\":[",
                      (unsigned int)sample->local_id,
                      (unsigned long)request_uptime_ms,
                      (unsigned long)request_sequence,
                      sample->local_id == 1U ? "sensair_shuttle_01" : "sensair_shuttle_02",
+                     sample->local_id == 1U ? "living_room" : "bedroom",
                      (unsigned int)sample->link_state,
                      sample->sample_valid ? 1U : 0U,
                      (unsigned long)sample->frame_seq,

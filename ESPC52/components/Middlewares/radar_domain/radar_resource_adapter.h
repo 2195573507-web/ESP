@@ -47,6 +47,7 @@ typedef struct {
 } radar_resource_adapter_stats_t;
 
 void radar_resource_adapter_init(uint64_t now_ms);
+void radar_resource_adapter_deinit(void);
 void radar_resource_adapter_update_sample(const radar_target_sample_t *sample,
                                           uint64_t now_ms);
 void radar_resource_adapter_set_link_state(uint8_t link_state,

@@ -7,6 +7,7 @@
 
 #include "app_stack_monitor.h"
 #include "c5_memory.h"
+#include "c5_task_lifecycle.h"
 #include "gateway_link.h"
 #include "local_wake_word.h"
 #include "mic_adc_pcm.h"
@@ -20,6 +21,8 @@
 #include "esp_adc/adc_continuous.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/idf_additions.h"
+#include "freertos/portmacro.h"
 #include "freertos/task.h"
 
 #if MIC_ADC_SAMPLE_FREQ_HZ != MIC_ADC_PCM_SAMPLE_RATE_HZ
@@ -34,10 +37,8 @@ static adc_continuous_handle_t s_adc_handle;
 
 /* 任务句柄：用于防止重复创建 Mic ADC 测试任务。 */
 static TaskHandle_t s_mic_adc_task_handle;
-#define MIC_ADC_TEST_TASK_STACK_WORDS \
-    ((MIC_ADC_TEST_TASK_STACK_SIZE + sizeof(StackType_t) - 1U) / sizeof(StackType_t))
-static StackType_t *s_mic_adc_task_stack;
-static StaticTask_t s_mic_adc_task_storage;
+static portMUX_TYPE s_mic_adc_task_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_mic_adc_shutdown_in_progress;
 /* Only the Mic task may transition the ADC continuous driver. */
 static TaskHandle_t s_mic_adc_owner_task;
 static EventGroupHandle_t s_mic_adc_control_events;
@@ -45,6 +46,39 @@ static volatile bool s_mic_adc_started;
 static volatile uint32_t s_mic_session_generation;
 static mic_adc_voice_stream_ops_t s_mic_adc_voice_stream_ops;
 static bool s_mic_adc_voice_stream_ops_registered;
+
+static bool mic_adc_begin_shutdown(TaskHandle_t *task)
+{
+    bool begun = false;
+
+    portENTER_CRITICAL(&s_mic_adc_task_lock);
+    if (!s_mic_adc_shutdown_in_progress) {
+        s_mic_adc_shutdown_in_progress = true;
+        if (task != NULL) {
+            *task = s_mic_adc_task_handle;
+        }
+        begun = true;
+    }
+    portEXIT_CRITICAL(&s_mic_adc_task_lock);
+    return begun;
+}
+
+static void mic_adc_end_shutdown(void)
+{
+    portENTER_CRITICAL(&s_mic_adc_task_lock);
+    s_mic_adc_shutdown_in_progress = false;
+    portEXIT_CRITICAL(&s_mic_adc_task_lock);
+}
+
+static bool mic_adc_shutdown_is_in_progress(void)
+{
+    bool in_progress;
+
+    portENTER_CRITICAL(&s_mic_adc_task_lock);
+    in_progress = s_mic_adc_shutdown_in_progress;
+    portEXIT_CRITICAL(&s_mic_adc_task_lock);
+    return in_progress;
+}
 
 enum {
     MIC_ADC_CONTROL_PAUSE_REQUEST_BIT = BIT0,
@@ -779,15 +813,6 @@ static void mic_adc_release_psram_audio_storage(void)
     }
 }
 
-static void mic_adc_release_task_stack(void)
-{
-    if (s_mic_adc_task_stack != NULL) {
-        heap_caps_free(s_mic_adc_task_stack);
-        s_mic_adc_task_stack = NULL;
-        memset(&s_mic_adc_task_storage, 0, sizeof(s_mic_adc_task_storage));
-    }
-}
-
 static void mic_adc_handle_pause_if_needed(adc_continuous_handle_t handle,
                                            bool *adc_started,
                                            mic_adc_window_t *window,
@@ -925,6 +950,17 @@ static esp_err_t mic_adc_start_if_needed(adc_continuous_handle_t handle,
     return ESP_OK;
 }
 
+/* The shutdown requester owns final deletion and task-stack release. */
+static void mic_adc_wait_for_external_delete(const char *reason)
+{
+    ESP_LOGI(TAG,
+             "TASK_EXIT task=mic_adc_test reason=%s cleanup=external_delete",
+             reason != NULL ? reason : "stop_requested");
+    while (true) {
+        vTaskSuspend(NULL);
+    }
+}
+
 static bool mic_adc_handle_stop_if_requested(adc_continuous_handle_t handle,
                                              bool *adc_started,
                                              mic_adc_window_t *window,
@@ -971,14 +1007,14 @@ static bool mic_adc_handle_stop_if_requested(adc_continuous_handle_t handle,
     }
 
     EventGroupHandle_t events = s_mic_adc_control_events;
-    s_mic_adc_task_handle = NULL;
+    mic_adc_local_wake_deinit(local_wake);
+    s_mic_adc_owner_task = NULL;
     if (events != NULL) {
         xEventGroupClearBits(events, MIC_ADC_CONTROL_PAUSED_BIT);
         xEventGroupClearBits(events, MIC_ADC_CONTROL_RUNNING_BIT);
         xEventGroupSetBits(events, MIC_ADC_CONTROL_STOPPED_BIT);
     }
-    mic_adc_local_wake_deinit(local_wake);
-    vTaskDelete(NULL);
+    mic_adc_wait_for_external_delete("stop_requested");
     return true;
 }
 
@@ -1614,12 +1650,11 @@ static void mic_adc_test_task(void *arg)
                                                 pdFALSE,
                                                 portMAX_DELAY);
     if ((init_bits & (MIC_CTRL_INIT_ABORT | MIC_ADC_CONTROL_STOP_REQUEST_BIT)) != 0) {
+        s_mic_adc_owner_task = NULL;
         if (events == s_mic_adc_control_events) {
             xEventGroupSetBits(events, MIC_ADC_CONTROL_STOPPED_BIT);
         }
-        s_mic_adc_task_handle = NULL;
-        s_mic_adc_owner_task = NULL;
-        vTaskDelete(NULL);
+        mic_adc_wait_for_external_delete("init_abort");
         return;
     }
 
@@ -1760,7 +1795,8 @@ static void mic_adc_test_task(void *arg)
 static void mic_adc_abort_precreated_task(void)
 {
     EventGroupHandle_t events = s_mic_adc_control_events;
-    if (events == NULL || s_mic_adc_task_handle == NULL) {
+    TaskHandle_t task = s_mic_adc_task_handle;
+    if (events == NULL || task == NULL) {
         return;
     }
 
@@ -1773,7 +1809,11 @@ static void mic_adc_abort_precreated_task(void)
                               pdFALSE,
                               portMAX_DELAY);
     mic_adc_log_start_stage("mic_adc_task_init_abort", "after", ESP_OK);
-    s_mic_adc_task_handle = NULL;
+    (void)c5_task_delete_with_caps_safe(&s_mic_adc_task_handle,
+                                        &s_mic_adc_task_lock,
+                                        TAG,
+                                        "mic_adc_test",
+                                        "start_abort");
 }
 
 static void mic_adc_cleanup_failed_start(void)
@@ -1801,7 +1841,6 @@ static void mic_adc_cleanup_failed_start(void)
     }
     mic_adc_clear_static_audio_storage();
     mic_adc_release_psram_audio_storage();
-    mic_adc_release_task_stack();
 }
 
 /**
@@ -1815,6 +1854,13 @@ static void mic_adc_cleanup_failed_start(void)
 esp_err_t mic_adc_test_start(void)
 {
     mic_adc_log_heap("Mic ADC start API: enter");
+    if (!app_runtime_guard_check_heap_integrity(TAG, "mic_before_start")) {
+        return ESP_FAIL;
+    }
+    if (mic_adc_shutdown_is_in_progress()) {
+        ESP_LOGW(TAG, "Mic ADC start rejected: shutdown is in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (s_mic_adc_task_handle != NULL) {
         mic_adc_log_heap("Mic ADC start API: reuse existing task");
         return ESP_OK;
@@ -1859,34 +1905,26 @@ esp_err_t mic_adc_test_start(void)
 
     mic_adc_log_start_stage("mic_adc_task_create", "before", ESP_ERR_NOT_FINISHED);
     ESP_LOGI(TAG,
-             "VOICE_START_STAGE stage=mic_adc_task_create requested_stack_bytes=%u source=psram",
+             "VOICE_START_STAGE stage=mic_adc_task_create requested_stack_bytes=%u source=internal",
              (unsigned int)MIC_ADC_TEST_TASK_STACK_SIZE);
-    s_mic_adc_task_stack = heap_caps_malloc(MIC_ADC_TEST_TASK_STACK_WORDS *
-                                                 sizeof(*s_mic_adc_task_stack),
-                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_mic_adc_task_stack == NULL) {
+    TaskHandle_t task = NULL;
+    if (xTaskCreateWithCaps(mic_adc_test_task,
+                            "mic_adc_test",
+                            MIC_ADC_TEST_TASK_STACK_SIZE,
+                            NULL,
+                            MIC_ADC_TASK_PRIORITY,
+                            &task,
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
         mic_adc_log_start_stage("mic_adc_task_create", "after", ESP_ERR_NO_MEM);
-        mic_adc_log_start_failure("heap_caps_malloc(mic_adc_task_stack)", ESP_ERR_NO_MEM);
+        mic_adc_log_start_failure("xTaskCreateWithCaps(mic_adc_test)", ESP_ERR_NO_MEM);
         mic_adc_cleanup_failed_start();
         return ESP_ERR_NO_MEM;
     }
-    s_mic_adc_task_handle = xTaskCreateStatic(mic_adc_test_task,
-                                               "mic_adc_test",
-                                               MIC_ADC_TEST_TASK_STACK_WORDS,
-                                               NULL,
-                                               MIC_ADC_TASK_PRIORITY,
-                                               s_mic_adc_task_stack,
-                                               &s_mic_adc_task_storage);
-    if (s_mic_adc_task_handle == NULL) {
-        mic_adc_log_start_stage("mic_adc_task_create", "after", ESP_ERR_NO_MEM);
-        mic_adc_log_start_failure("xTaskCreateStatic(mic_adc_test)", ESP_ERR_NO_MEM);
-        s_mic_adc_task_handle = NULL;
-        mic_adc_cleanup_failed_start();
-        return ESP_ERR_NO_MEM;
-    }
+    c5_task_handle_publish(&s_mic_adc_task_handle, &s_mic_adc_task_lock, task);
     mic_adc_log_start_stage("mic_adc_task_create", "after", ESP_OK);
+    ESP_LOGI(TAG, "TASK_CREATE task=mic_adc_test");
     ESP_LOGI(TAG,
-             "VOICE_TASK_STACK task=mic_adc_test bytes=%u source=psram_static",
+             "VOICE_TASK_STACK task=mic_adc_test bytes=%u source=internal_caps_dynamic",
              (unsigned int)MIC_ADC_TEST_TASK_STACK_SIZE);
 
     mic_adc_log_start_stage("mic_adc_init", "before", ESP_ERR_NOT_FINISHED);
@@ -1992,7 +2030,15 @@ esp_err_t mic_adc_test_wait_paused(uint32_t timeout_ms)
 esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
 {
     mic_adc_log_heap("Mic ADC stop/deinit API: enter");
-    if (s_mic_adc_control_events == NULL || s_mic_adc_task_handle == NULL) {
+    /* Preserve cleanup even after an integrity failure so DMA ownership is not leaked. */
+    (void)app_runtime_guard_check_heap_integrity(TAG, "mic_before_stop_deinit");
+    TaskHandle_t task = NULL;
+    if (!mic_adc_begin_shutdown(&task)) {
+        ESP_LOGI(TAG, "Mic ADC stop/deinit already in progress");
+        return ESP_OK;
+    }
+
+    if (s_mic_adc_control_events == NULL || task == NULL) {
         mic_adc_log_heap("Mic ADC stop/deinit API: no running task");
         mic_adc_local_wake_deinit(&s_mic_adc_local_wake);
         memset(&s_mic_adc_vad, 0, sizeof(s_mic_adc_vad));
@@ -2005,6 +2051,7 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
                 ESP_LOGE(TAG,
                          "ADC continuous deinit failed without task: %s",
                          esp_err_to_name(deinit_ret));
+                mic_adc_end_shutdown();
                 return deinit_ret;
             }
             s_adc_handle = NULL;
@@ -2016,11 +2063,16 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
             mic_adc_log_heap("Mic ADC stop/deinit API: after event group delete no task");
         }
         s_mic_adc_started = false;
-        s_mic_adc_task_handle = NULL;
+        (void)c5_task_delete_with_caps_safe(&s_mic_adc_task_handle,
+                                            &s_mic_adc_task_lock,
+                                            TAG,
+                                            "mic_adc_test",
+                                            "no_task_cleanup");
+        s_mic_adc_owner_task = NULL;
         mic_adc_clear_static_audio_storage();
         mic_adc_release_psram_audio_storage();
-        mic_adc_release_task_stack();
         mic_adc_log_heap("Mic ADC stop/deinit API: done no task");
+        mic_adc_end_shutdown();
         return ESP_OK;
     }
 
@@ -2039,8 +2091,16 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
         ESP_LOGE(TAG,
                  "Mic ADC stop/deinit timeout during voice recovery: timeout_ms=%u",
                  (unsigned int)timeout_ms);
+        mic_adc_end_shutdown();
         return ESP_ERR_TIMEOUT;
     }
+
+    (void)c5_task_delete_with_caps_safe(&s_mic_adc_task_handle,
+                                        &s_mic_adc_task_lock,
+                                        TAG,
+                                        "mic_adc_test",
+                                        "stop_and_deinit");
+    s_mic_adc_owner_task = NULL;
 
     /* 任务可能仍在 READY gate 等待，停止确认后统一回收预初始化的状态。 */
     mic_adc_local_wake_deinit(&s_mic_adc_local_wake);
@@ -2055,6 +2115,7 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
             ESP_LOGE(TAG,
                      "ADC continuous deinit failed during voice recovery: %s",
                      esp_err_to_name(deinit_ret));
+            mic_adc_end_shutdown();
             return deinit_ret;
         }
         s_adc_handle = NULL;
@@ -2065,12 +2126,11 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
     s_mic_adc_control_events = NULL;
     mic_adc_log_heap("Mic ADC stop/deinit API: after event group delete");
 
-    s_mic_adc_task_handle = NULL;
     s_mic_adc_started = false;
     mic_adc_clear_static_audio_storage();
     mic_adc_release_psram_audio_storage();
-    mic_adc_release_task_stack();
     mic_adc_log_heap("Mic ADC stop/deinit API: done");
+    mic_adc_end_shutdown();
     return ESP_OK;
 }
 

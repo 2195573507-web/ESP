@@ -34,7 +34,7 @@ static const char *TAG = "speaker_player";
 static void speaker_player_log_writer_task_alloc_check(void)
 {
     ESP_LOGI(TAG,
-             "SPEAKER_IIS_WRITER_TASK_ALLOC_CHECK internal_free=%u internal_largest=%u psram_free=%u stack_size=%u source=psram",
+             "SPEAKER_IIS_WRITER_TASK_ALLOC_CHECK internal_free=%u internal_largest=%u psram_free=%u stack_size=%u source=internal",
              (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
@@ -220,7 +220,7 @@ static UBaseType_t speaker_player_writer_stack_high_water(void)
 {
 #if (INCLUDE_uxTaskGetStackHighWaterMark == 1)
     return s_pcm_stream_ctx.writer_task == NULL ? 0 :
-           uxTaskGetStackHighWaterMark(s_pcm_stream_ctx.writer_task);
+           uxTaskGetStackHighWaterMark(s_pcm_stream_ctx.writer_task) * sizeof(StackType_t);
 #else
     return 0;
 #endif
@@ -592,8 +592,13 @@ static void speaker_player_iis_writer_task(void *arg)
     if (ctx == NULL || ctx->ring_slots == NULL || ctx->ring_items == NULL ||
         ctx->ring_space == NULL || ctx->done == NULL || ctx->started == NULL ||
         ctx->dma_staging == NULL) {
-        vTaskDelete(NULL);
-        return;
+        /* This task owns static TCB/stack storage and must never self-delete/recreate it. */
+        ESP_LOGE(TAG,
+                 "TASK_EXIT task=speaker_iis_writer reason=invalid_writer_context "
+                 "action=suspend_keep_static_tcb");
+        while (true) {
+            vTaskSuspend(NULL);
+        }
     }
     app_stack_monitor_log(TAG, "speaker_iis_writer", "entry");
 
@@ -752,6 +757,9 @@ esp_err_t audio_player_init(void)
     if (speaker_player_called_from_isr()) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (!app_runtime_guard_check_heap_integrity(TAG, "speaker_session_before_init")) {
+        return ESP_FAIL;
+    }
     esp_err_t err = speaker_player_ensure_mutex();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "create play mutex failed: %s", esp_err_to_name(err));
@@ -827,12 +835,14 @@ esp_err_t audio_player_init(void)
 
     if (s_pcm_stream_ctx.writer_task == NULL) {
         speaker_player_log_writer_task_alloc_check();
+        c5_mem_log("task_create_before_speaker_iis_writer");
         s_writer_task_stack = (StackType_t *)c5_mem_alloc(
             AUDIO_PLAYER_I2S_WRITER_STACK_WORDS * sizeof(*s_writer_task_stack),
-            C5_MEM_PSRAM,
+            C5_MEM_INTERNAL_CONTROL,
             "speaker_iis_writer_stack");
         if (s_writer_task_stack == NULL) {
             err = ESP_ERR_NO_MEM;
+            c5_mem_log("task_create_after_speaker_iis_writer_failed");
             goto init_fail;
         }
         s_pcm_stream_ctx.writer_task = xTaskCreateStatic(speaker_player_iis_writer_task,
@@ -846,11 +856,14 @@ esp_err_t audio_player_init(void)
             c5_mem_free(s_writer_task_stack, "speaker_iis_writer_stack");
             s_writer_task_stack = NULL;
             err = ESP_ERR_NO_MEM;
+            c5_mem_log("task_create_after_speaker_iis_writer_failed");
             goto init_fail;
         }
         ESP_LOGI(TAG,
-                 "VOICE_TASK_STACK task=speaker_iis_writer bytes=%u source=psram_static",
+                 "VOICE_TASK_STACK task=speaker_iis_writer bytes=%u source=internal_static",
                  (unsigned int)AUDIO_PLAYER_I2S_WRITER_TASK_STACK_SIZE);
+        ESP_LOGI(TAG, "TASK_CREATE task=speaker_iis_writer");
+        c5_mem_log("task_create_after_speaker_iis_writer");
     }
 
     i2s_chan_info_t channel_info = {};
@@ -911,6 +924,35 @@ static void speaker_player_reset_turn_locked(audio_player_stream_ctx_t *ctx)
     s_pcm_stream_owner_task = NULL;
     s_pcm_stream_sequence = 0;
     s_pcm_player_state = AUDIO_PLAYER_STATE_READY_DISABLED;
+}
+
+/* The persistent writer is the sole I2S/DMA owner.  Resource release must wait
+ * for its completion signal before freeing any buffer it can still reference. */
+static esp_err_t speaker_player_stop_writer_for_release_locked(uint32_t timeout_ms)
+{
+    if (s_pcm_player_state == AUDIO_PLAYER_STATE_READY_DISABLED) {
+        return ESP_OK;
+    }
+    if (s_pcm_player_state == AUDIO_PLAYER_STATE_UNINITIALIZED ||
+        s_pcm_stream_ctx.writer_task == NULL || s_pcm_stream_ctx.done == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_pcm_stream_ctx.abort_requested = true;
+    s_pcm_player_state = AUDIO_PLAYER_STATE_ABORTING;
+    if (!s_pcm_stream_ctx.writer_done &&
+        xSemaphoreTake(s_pcm_stream_ctx.done,
+                       speaker_player_ms_to_ticks(timeout_ms)) != pdTRUE) {
+        ESP_LOGE(TAG,
+                 "speaker release blocked: writer did not acknowledge stop; keep I2S/DMA buffers");
+        return ESP_ERR_TIMEOUT;
+    }
+    if (!s_pcm_stream_ctx.writer_done) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    speaker_player_reset_turn_locked(&s_pcm_stream_ctx);
+    return ESP_OK;
 }
 
 esp_err_t audio_player_stream_open(void)
@@ -1159,11 +1201,13 @@ esp_err_t audio_player_release_session(uint32_t timeout_ms)
     if (xSemaphoreTake(s_play_mutex, speaker_player_ms_to_ticks(timeout_ms)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    if (s_pcm_stream_open) {
+    err = speaker_player_stop_writer_for_release_locked(timeout_ms);
+    if (err != ESP_OK) {
         xSemaphoreGive(s_play_mutex);
-        return ESP_ERR_INVALID_STATE;
+        return err;
     }
 
+    (void)app_runtime_guard_check_heap_integrity(TAG, "speaker_session_before_release");
     speaker_player_heap_monitor_stop();
     speaker_player_reset_session_semaphores(&s_pcm_stream_ctx);
     err = iis_deinit_timed(timeout_ms);

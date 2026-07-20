@@ -8,5 +8,5 @@ idf_component_register(
         "radar_state_codec.c"
         "radar_service.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_driver_uart esp_timer freertos log
+    REQUIRES app_config esp_driver_uart esp_timer freertos log
 )

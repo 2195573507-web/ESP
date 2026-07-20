@@ -7,7 +7,8 @@
     "start": "node server.js",
     "test": "node scripts/smoke-regression.js",
     "test:smoke": "node scripts/smoke-regression.js",
-    "test:device-status": "node scripts/test-device-status-chain.js"
+    "test:device-status": "node scripts/test-device-status-chain.js",
+    "test:esp-home-agent-prompt": "node scripts/test-esp-home-agent-prompt.js"
   },
   "keywords": [],
   "author": "",

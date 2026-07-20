@@ -88,8 +88,11 @@ bool c5_should_run(c5_task_type_t task_type);
 /** @brief 获取指定任务的下一轮调度间隔；高负载/低空闲时自动放大。 */
 uint32_t c5_get_interval(c5_task_type_t task_type);
 
-/** @brief 启动 C5 event dispatcher 和 runtime workers；可重复调用。 */
+/** @brief 启动 event bus、handlers 和 dispatcher（启动阶段 1）；可重复调用。 */
 esp_err_t c5_scheduler_start(void);
+
+/** @brief 创建 BME/system workers（启动阶段 2）；必须在 startup task 释放后调用。 */
+esp_err_t c5_scheduler_start_deferred_workers(void);
 
 /** @brief 执行一次 timer 扫描并产生事件；测试或手动 tick 可直接调用。 */
 void c5_scheduler_tick(void);

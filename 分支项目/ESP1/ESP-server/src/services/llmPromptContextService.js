@@ -1,6 +1,19 @@
 const {
     getDeviceContext
 } = require("./deviceContextService");
+const fs = require("fs");
+const path = require("path");
+
+const SYSTEM_PROMPT_PATH = path.resolve(__dirname, "../../prompts/esp_home_agent_system.md");
+let cachedSystemPrompt = null;
+
+function getEspHomeAgentSystemPrompt() {
+    if (cachedSystemPrompt === null) {
+        cachedSystemPrompt = fs.readFileSync(SYSTEM_PROMPT_PATH, "utf8").trim();
+    }
+
+    return cachedSystemPrompt;
+}
 
 function formatAge(ageMs) {
     if (!Number.isFinite(ageMs)) {
@@ -23,6 +36,9 @@ function buildContextText(context) {
     const modules = context.modules || {};
     const lines = [
         "设备上下文：",
+        ...(context.context_unavailable
+            ? ["- 当前设备上下文不可用。涉及环境、空气状态、在线状态或模块状态时必须说明无法确认实时数据。"]
+            : []),
         `- 设备 ${device.device_id || "unknown"} 当前${device.online ? "在线" : "离线或未知"}，最近通信约 ${formatAge(device.last_seen_age_ms)} 前。`,
         `- 平均上传延迟 ${formatNullable(device.avg_upload_delay_ms, " ms")}，最近一次有效延迟 ${formatNullable(device.latest_upload_delay_ms, " ms")}，有效样本 ${device.delay_sample_count || 0}。`,
         `- 时间同步状态：${device.time_synced === true ? "已同步" : device.time_synced === false ? "未同步" : "未知"}。`
@@ -56,22 +72,18 @@ function buildContextText(context) {
 
 function buildPromptWithContext(userText, context, mode = "text") {
     const contextText = buildContextText(context);
-    if (mode === "structured") {
-        return [
-            contextText,
-            "",
-            "命令解析时必须尊重上述设备上下文；如果设备离线或模块不可用，不要假装已看到实时环境。",
-            "",
-            userText
-        ].join("\n");
-    }
-
     return [
+        "[System Prompt]",
+        getEspHomeAgentSystemPrompt(),
+        "",
+        "[Runtime Context]",
         contextText,
         "",
-        "请基于用户问题回答。涉及环境或空气状态时必须说明数据新鲜度和非 AQI 属性。",
-        "",
-        `用户：${userText}`
+        "[User Message]",
+        String(userText || "").trim(),
+        ...(mode === "structured"
+            ? ["", "结构化命令解析仍必须尊重上述设备状态；设备离线或模块不可用时，不得声称已获得实时环境。"]
+            : [])
     ].join("\n");
 }
 
@@ -87,11 +99,15 @@ async function buildLlmPrompt(dbAll, userText, options = {}) {
         return {
             ok: false,
             context: null,
-            prompt: [
-                "设备上下文：当前设备上下文不可用。涉及环境、空气状态、在线状态或模块状态时必须说明无法确认实时数据。",
-                "",
-                `用户：${userText}`
-            ].join("\n"),
+            prompt: buildPromptWithContext(userText, {
+                context_unavailable: true,
+                environment: {
+                    available: false
+                },
+                air_quality: {
+                    available: false
+                }
+            }, options.mode || "text"),
             error
         };
     }
@@ -100,5 +116,6 @@ async function buildLlmPrompt(dbAll, userText, options = {}) {
 module.exports = {
     buildContextText,
     buildLlmPrompt,
-    buildPromptWithContext
+    buildPromptWithContext,
+    getEspHomeAgentSystemPrompt
 };

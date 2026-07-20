@@ -45,18 +45,7 @@ function createDbHelpers(db) {
     };
 }
 
-async function configureDatabase(dbRun) {
-    if (typeof dbRun !== "function") {
-        return;
-    }
-
-    await dbRun("PRAGMA journal_mode=WAL");
-    await dbRun("PRAGMA synchronous=NORMAL");
-    await dbRun("PRAGMA busy_timeout=5000");
-}
-
 module.exports = {
-    configureDatabase,
     createDatabase,
     createDbHelpers
 };

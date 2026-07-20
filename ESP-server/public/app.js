@@ -19,6 +19,13 @@ const metricDefinitions = {
         icon: "drop",
         historyField: "humidity"
     },
+    pressure: {
+        name: "气压",
+        unit: "hPa",
+        accent: "#f97316",
+        icon: "chip",
+        historyField: "pressure"
+    },
     air: {
         name: "空气质量",
         unit: "",
@@ -105,14 +112,8 @@ const DASHBOARD_REFRESH_INTERVAL_MS = 3000;
 const S3_DASHBOARD_REFRESH_INTERVAL_MS = 3000;
 const ESP_DELAY_REFRESH_INTERVAL_MS = 1000;
 const ACTIVITY_TREND_WINDOW_MS = 30 * 60 * 1000;
-const CHART_RANGE_OPTIONS = ["5m", "1h", "24h", "7d"];
-const DEFAULT_CHART_RANGE = "24h";
-const CHART_RANGE_LABELS = {
-    "5m": "最近 5 分钟",
-    "1h": "最近 1 小时",
-    "24h": "最近 24 小时",
-    "7d": "最近 7 天"
-};
+const CHART_RANGE_OPTIONS = [12, 24, 36, 48];
+const DEFAULT_CHART_RANGE_HOURS = 24;
 const ALERT_LOG_PREVIEW_LIMIT = 4;
 const SYSTEM_LOG_PREVIEW_LIMIT = 4;
 const OPERATION_LOG_PREVIEW_LIMIT = 5;
@@ -124,12 +125,7 @@ let dashboardRefreshTimer = null;
 let espDelayRefreshTimer = null;
 let s3DashboardRefreshTimer = null;
 let realtimeClockTimer = null;
-let selectedChartRange = DEFAULT_CHART_RANGE;
-let historyRequestSequence = 0;
-const chartHistoryRequestState = {
-    status: "idle",
-    error: null
-};
+let selectedChartRangeHours = DEFAULT_CHART_RANGE_HOURS;
 let activeLogModalType = null;
 let pendingConfirmAction = null;
 let activeDashboardPage = "c51";
@@ -215,6 +211,7 @@ function createEmptyMetrics(status = UNKNOWN_TEXT, note = EMPTY_TEXT) {
     return {
         temperature: createEmptyMetric("温度", "°C"),
         humidity: createEmptyMetric("湿度", "%"),
+        pressure: createEmptyMetric("气压", "hPa"),
         air: createEmptyMetric("空气质量", ""),
         esp,
         overall: "unknown"
@@ -382,12 +379,12 @@ window.DashboardRealtime = {
     escapeHtml
 };
 
-// 曲线时间范围：格式化横轴标签，7 天范围显示日期，避免跨天数据看不清。
+// 曲线时间范围：格式化横轴标签，36/48 小时时显示日期，避免跨天数据看不清。
 function formatChartTime(timestamp) {
     const date = parseTimestamp(timestamp);
     if (!date) return EMPTY_TEXT;
 
-    const options = selectedChartRange === "7d"
+    const options = selectedChartRangeHours > 24
         ? { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }
         : { hour: "2-digit", minute: "2-digit", hour12: false };
     return date.toLocaleString("zh-CN", options);
@@ -515,12 +512,9 @@ function humanizeAlertType(type, content = "") {
     if (/air|aqi|quality|空气/.test(text)) return "空气质量报警";
     if (/temp|temperature|温度|hot|heat/.test(text)) return "温度过高";
     if (/humid|humidity|湿度/.test(text)) return "湿度异常";
+    if (/pressure|气压/.test(text)) return "气压异常";
     if (/offline|disconnect|离线|设备/.test(text)) return "设备离线";
     return "报警";
-}
-
-function isPressureAlertText(type = "", content = "") {
-    return /pressure|气压/.test(`${type || ""} ${content || ""}`.toLowerCase());
 }
 
 function humanizeSystemLogText(log, payload) {
@@ -613,10 +607,11 @@ function normalizeHistoryPoint(point) {
 
     const temperature = toNumber(pickFirst(point, ["temperature", "temp"]));
     const humidity = toNumber(pickFirst(point, ["humidity"]));
+    const pressure = toNumber(pickFirst(point, ["pressure"]));
     const airQualityObject = isPlainObject(point.air_quality) ? point.air_quality : {};
     const airScore = toNumber(point.air_quality_score) ?? toNumber(airQualityObject.air_quality_score);
 
-    if (temperature === null && humidity === null && airScore === null) {
+    if (temperature === null && humidity === null && pressure === null && airScore === null) {
         return null;
     }
 
@@ -625,6 +620,7 @@ function normalizeHistoryPoint(point) {
         time: formatChartTime(timestamp),
         temperature,
         humidity,
+        pressure,
         air: airScore,
         air_quality_score: airScore
     };
@@ -639,17 +635,36 @@ function getLatestSensorChartPoint() {
         time: formatChartTime(sensor.timestamp),
         temperature: toNumber(sensor.temperature),
         humidity: toNumber(sensor.humidity),
+        pressure: toNumber(sensor.pressure),
         air: toNumber(sensor.airQualityScore),
         air_quality_score: toNumber(sensor.airQualityScore)
     };
 }
 
-// 曲线时间范围：直接绘制后端按 range 返回的数据，时间戳无效的数据会被跳过。
+// 曲线时间范围：按当前下拉选中的小时数筛选真实时间戳数据，时间戳无效的数据会被跳过。
 function getFilteredChartData() {
+    const rangeMs = selectedChartRangeHours * 60 * 60 * 1000;
+    const now = Date.now();
     const history = Array.isArray(dashboardState.history) ? dashboardState.history : [];
-    return history
+    const points = history
         .map(normalizeHistoryPoint)
-        .filter(Boolean)
+        .filter(Boolean);
+    const latestPoint = getLatestSensorChartPoint();
+
+    if (latestPoint) {
+        const duplicateIndex = points.findIndex(point => point.timestamp.getTime() === latestPoint.timestamp.getTime());
+        if (duplicateIndex >= 0) {
+            points[duplicateIndex] = latestPoint;
+        } else {
+            points.push(latestPoint);
+        }
+    }
+
+    return points
+        .filter(point => {
+            const timestamp = point.timestamp.getTime();
+            return Number.isFinite(timestamp) && timestamp <= now && now - timestamp <= rangeMs;
+        })
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
 }
 
@@ -659,54 +674,20 @@ function updateChartRangeSelector() {
     const button = document.getElementById("chartRangeButton");
 
     if (label) {
-        label.textContent = CHART_RANGE_LABELS[selectedChartRange] || CHART_RANGE_LABELS[DEFAULT_CHART_RANGE];
+        label.textContent = `最近 ${selectedChartRangeHours} 小时`;
     }
 
-    document.querySelectorAll("[data-range]").forEach(option => {
-        const selected = option.dataset.range === selectedChartRange;
+    document.querySelectorAll("[data-range-hours]").forEach(option => {
+        const selected = Number(option.dataset.rangeHours) === selectedChartRangeHours;
         option.setAttribute("aria-selected", selected ? "true" : "false");
     });
 
     if (button) {
-        const currentLabel = CHART_RANGE_LABELS[selectedChartRange] || CHART_RANGE_LABELS[DEFAULT_CHART_RANGE];
-        button.setAttribute("aria-label", `当前显示${currentLabel}数据`);
+        button.setAttribute("aria-label", `当前显示最近 ${selectedChartRangeHours} 小时数据`);
     }
 }
 
-function isCurrentHistoryResult(historyResult) {
-    return Boolean(historyResult) &&
-        historyResult.requestId === historyRequestSequence &&
-        historyResult.range === selectedChartRange &&
-        isCurrentCDeviceRequest(historyResult.deviceId);
-}
-
-function applyHistoryResult(historyResult) {
-    if (!isCurrentHistoryResult(historyResult)) return false;
-
-    const historyData = Array.isArray(historyResult.data) ? historyResult.data : [];
-    dashboardState.history = historyData;
-    dashboardState.sources.history = historyResult.source;
-    chartHistoryRequestState.status = historyResult.ok
-        ? (historyData.length > 0 ? "ready" : "empty")
-        : "error";
-    chartHistoryRequestState.error = historyResult.error || null;
-    return true;
-}
-
-async function reloadChartHistory() {
-    const deviceId = getActiveDeviceId();
-    chartHistoryRequestState.status = "loading";
-    chartHistoryRequestState.error = null;
-    dashboardState.sources.history = "loading";
-    renderMainChart();
-
-    const historyResult = await fetchHistoryData(deviceId, selectedChartRange);
-    if (applyHistoryResult(historyResult)) {
-        renderMainChart();
-    }
-}
-
-// 曲线时间范围：初始化自定义下拉菜单，点击选项后重新请求后端 range 数据并重绘图表。
+// 曲线时间范围：初始化自定义下拉菜单，点击选项后只改变前端筛选范围并重绘图表。
 function initChartRangeSelector() {
     const selector = document.querySelector("[data-range-selector]");
     const button = document.getElementById("chartRangeButton");
@@ -736,13 +717,13 @@ function initChartRangeSelector() {
         }
     });
 
-    menu.querySelectorAll("[data-range]").forEach(option => {
+    menu.querySelectorAll("[data-range-hours]").forEach(option => {
         option.addEventListener("click", () => {
-            const nextRange = option.dataset.range;
-            if (CHART_RANGE_OPTIONS.includes(nextRange)) {
-                selectedChartRange = nextRange;
+            const nextHours = Number(option.dataset.rangeHours);
+            if (CHART_RANGE_OPTIONS.includes(nextHours)) {
+                selectedChartRangeHours = nextHours;
                 updateChartRangeSelector();
-                reloadChartHistory();
+                renderMainChart();
             }
             closeMenu();
         });
@@ -878,20 +859,16 @@ async function fetchLatestLLM(deviceId = getActiveDeviceId()) {
     return readEndpoint("/api/dashboard/v1/llm/latest", "LLM");
 }
 
-async function fetchHistoryData(deviceId = getActiveDeviceId(), range = selectedChartRange) {
-    const requestId = ++historyRequestSequence;
+async function fetchHistoryData(deviceId = getActiveDeviceId()) {
     const result = await readEndpoint(
         buildUrl("/api/dashboard/v1/sensors/history", {
             device_id: deviceId,
-            range
+            limit: 500
         }),
-        `History ${deviceId} ${range}`
+        `History ${deviceId}`
     );
     return {
         ...result,
-        requestId,
-        deviceId,
-        range,
         data: Array.isArray(result.data) ? result.data : []
     };
 }
@@ -914,11 +891,6 @@ async function fetchAlertLogs(deviceId = getActiveDeviceId()) {
     return {
         ...result,
         data: readListPayload(result.data, ["alarms", "logs", "events"])
-            .filter(event => {
-                const payload = isPlainObject(event?.payload) ? event.payload : {};
-                const content = payload.summary || payload.message || payload.description || event?.local_action || event?.event_id || "";
-                return !isPressureAlertText(event?.event_type || payload.type, content);
-            })
     };
 }
 
@@ -1192,10 +1164,7 @@ function normalizeSmartHomeDevice(key, rawDevice) {
         icon: "chip"
     };
     const status = normalizeSmartHomeStatusValue(rawDevice);
-    const deviceOnline = typeof rawDevice.online === "boolean"
-        ? rawDevice.online
-        : (typeof rawDevice.device_online === "boolean" ? rawDevice.device_online : null);
-    const disabled = deviceOnline === false || status === null;
+    const disabled = rawDevice.online === false || status === null;
     return {
         id: key,
         name: rawDevice.name || definition.name,
@@ -1271,7 +1240,7 @@ function getEspStatus(deviceStatus) {
         };
     }
 
-    if (typeof deviceStatus.online !== "boolean" && typeof deviceStatus.device_online !== "boolean") {
+    if (typeof deviceStatus.online !== "boolean") {
         return {
             value: UNKNOWN_TEXT,
             latency: deviceStatus.latestUploadDelayMs ?? null,
@@ -1281,16 +1250,16 @@ function getEspStatus(deviceStatus) {
     }
 
     return {
-        value: (deviceStatus.online ?? deviceStatus.device_online) ? "在线" : OFFLINE_TEXT,
+        value: deviceStatus.online ? "在线" : OFFLINE_TEXT,
         latency: null,
-        level: (deviceStatus.online ?? deviceStatus.device_online) ? "normal" : "danger",
-        note: (deviceStatus.online ?? deviceStatus.device_online) ? "设备在线" : "设备离线",
+        level: deviceStatus.online ? "normal" : "danger",
+        note: deviceStatus.online ? "设备在线" : "设备离线",
         source: deviceStatus.source
     };
 }
 
 function getOverallLevel(metrics) {
-    const levels = [metrics.temperature.level, metrics.humidity.level, metrics.air.level, metrics.esp.level];
+    const levels = [metrics.temperature.level, metrics.humidity.level, metrics.pressure.level, metrics.air.level, metrics.esp.level];
     if (levels.includes("danger")) return "danger";
     if (levels.includes("warning")) return "warning";
     if (levels.includes("unknown")) return "unknown";
@@ -1307,6 +1276,7 @@ function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
     const esp = getEspStatus(deviceStatus);
     const temperatureLevel = sensor.temperature === null ? "unknown" : getTemperatureLevel(sensor.temperature);
     const humidityLevel = sensor.humidity === null ? "unknown" : getHumidityLevel(sensor.humidity);
+    const pressureLevel = sensor.pressure === null ? "unknown" : "normal";
     const airLevel = sensor.airQualityScore === null ? "unknown" : "normal";
     const airDisplay = sensor.airQualityScore === null
         ? DISCONNECTED_TEXT
@@ -1329,6 +1299,14 @@ function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
             label: "湿度",
             unit: "%"
         },
+        pressure: {
+            value: sensor.pressure,
+            display: formatNumber(sensor.pressure),
+            level: pressureLevel,
+            source: sensor.pressure === null ? "empty" : sensor.source,
+            label: "气压",
+            unit: "hPa"
+        },
         air: {
             value: sensor.airQualityScore,
             display: airDisplay,
@@ -1341,6 +1319,7 @@ function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
         overall: getOverallLevel({
             temperature: { level: temperatureLevel },
             humidity: { level: humidityLevel },
+            pressure: { level: pressureLevel },
             air: { level: airLevel },
             esp
         })
@@ -1391,8 +1370,6 @@ function setDashboardLoadingState(deviceId) {
     dashboardState.operationLogs = [];
     dashboardState.activity = createEmptyActivityState();
     dashboardState.activityHistory = [];
-    chartHistoryRequestState.status = "loading";
-    chartHistoryRequestState.error = null;
     dashboardState.sources = {
         sensor: "loading",
         deviceStatus: "loading",
@@ -1622,24 +1599,13 @@ function renderMainChart() {
         axisLabel: readThemeColor("--chart-axis-label", "#1f3b68"),
         temperature: readThemeColor("--chart-temperature", "#2266f3"),
         humidity: readThemeColor("--chart-humidity", "#10b981"),
+        pressure: readThemeColor("--orange", "#f97316"),
         air: readThemeColor("--chart-air", "#7c3aed")
     };
-    const drawChartMessage = message => {
-        context.fillStyle = chartColors.axisLabel;
-        context.font = "15px Avenir Next, PingFang SC, sans-serif";
-        context.textAlign = "center";
-        context.fillText(message, rect.width / 2, padding.top + height / 2);
-        context.textAlign = "left";
-    };
-
-    if (chartHistoryRequestState.status === "loading" || dashboardState.sources.history === "loading") {
-        drawChartMessage("正在加载历史数据...");
-        return;
-    }
-
     const chartFields = [
         { field: "temperature", color: chartColors.temperature },
-        { field: "humidity", color: chartColors.humidity }
+        { field: "humidity", color: chartColors.humidity },
+        { field: "pressure", color: chartColors.pressure }
     ];
     if (hasHistoryValues("air")) {
         chartFields.push({ field: "air", color: chartColors.air });
@@ -1648,10 +1614,11 @@ function renderMainChart() {
         .map(item => toNumber(point[item.field]))
         .filter(value => value !== null));
     if (data.length === 0 || allValues.length === 0) {
-        const emptyMessage = chartHistoryRequestState.status === "error" || dashboardState.sources.history === "error"
-            ? "历史数据加载失败"
-            : "该时间范围暂无数据";
-        drawChartMessage(emptyMessage);
+        context.fillStyle = chartColors.axisLabel;
+        context.font = "15px Avenir Next, PingFang SC, sans-serif";
+        context.textAlign = "center";
+        context.fillText("暂无数据", rect.width / 2, padding.top + height / 2);
+        context.textAlign = "left";
         return;
     }
 
@@ -1683,7 +1650,6 @@ function renderMainChart() {
         : padding.left + (index / (data.length - 1)) * width;
     const yFor = value => padding.top + height - ((Math.max(yMin, Math.min(yMax, value)) - yMin) / (yMax - yMin)) * height;
 
-    const shouldDrawMarkers = data.length < 60;
     const drawLine = (field, color) => {
         const drawablePoints = data
             .map((point, index) => ({ point, index, value: toNumber(point[field]) }))
@@ -1699,19 +1665,18 @@ function renderMainChart() {
             else context.lineTo(x, y);
         });
         context.strokeStyle = color;
-        context.lineWidth = 2;
+        context.lineWidth = 3;
         context.lineJoin = "round";
         context.lineCap = "round";
         if (drawablePoints.length > 1) {
             context.stroke();
         }
 
-        if (!shouldDrawMarkers) return;
         drawablePoints.forEach(item => {
             const x = xFor(item.index);
             const y = yFor(item.value);
             context.beginPath();
-            context.arc(x, y, 2, 0, Math.PI * 2);
+            context.arc(x, y, 4, 0, Math.PI * 2);
             context.fillStyle = color;
             context.fill();
         });
@@ -1720,10 +1685,8 @@ function renderMainChart() {
     chartFields.forEach(item => drawLine(item.field, item.color));
 
     context.fillStyle = chartColors.axisLabel;
-    const maxXAxisLabels = 7;
-    const labelStep = Math.max(1, Math.ceil(data.length / maxXAxisLabels));
     data.forEach((point, index) => {
-        if (index % labelStep === 0 || index === data.length - 1) {
+        if (index % 2 === 0 || rect.width > 760) {
             context.fillText(point.time, xFor(index) - 17, padding.top + height + 30);
         }
     });
@@ -1736,6 +1699,7 @@ function renderAlertSummary() {
     const rows = [
         { label: "温度", value: metricDisplay(dashboardState.metrics.temperature), key: "temperature", icon: "thermometer" },
         { label: "湿度", value: metricDisplay(dashboardState.metrics.humidity), key: "humidity", icon: "drop" },
+        { label: "气压", value: metricDisplay(dashboardState.metrics.pressure), key: "pressure", icon: "chip" },
         {
             label: dashboardState.metrics.air.label,
             value: metricDisplay(dashboardState.metrics.air),
@@ -2304,6 +2268,7 @@ function buildSensorSnapshotText(rawSensor, sensor, deviceStatus = dashboardStat
     const parts = [];
     const temperature = toNumber(pickFirst(rawSensor, ["temperature", "temp"]));
     const humidity = toNumber(pickFirst(rawSensor, ["humidity"]));
+    const pressure = toNumber(pickFirst(rawSensor, ["pressure"]));
     const airQualityObject = isPlainObject(rawSensor.air_quality) ? rawSensor.air_quality : {};
     const airQualityScore = toNumber(rawSensor.air_quality_score) ?? toNumber(airQualityObject.air_quality_score);
     const airQualityLevel = pickFirst(rawSensor, [
@@ -2316,6 +2281,9 @@ function buildSensorSnapshotText(rawSensor, sensor, deviceStatus = dashboardStat
     }
     if (humidity !== null) {
         parts.push(`湿度 ${formatNumber(humidity)}%`);
+    }
+    if (pressure !== null) {
+        parts.push(`气压 ${formatNumber(pressure)} hPa`);
     }
     if (airQualityScore !== null) {
         parts.push(`空气质量 ${formatNumber(airQualityScore, 0)} 分${airQualityLevel ? ` · ${airQualityLevel}` : ""}`);
@@ -2404,7 +2372,7 @@ async function fetchCDeviceDashboardData(deviceId) {
         fetchDeviceStatus(deviceId),
         fetchLatestASR(deviceId),
         fetchLatestLLM(deviceId),
-        fetchHistoryData(deviceId, selectedChartRange),
+        fetchHistoryData(deviceId),
         fetchAlertLogs(deviceId),
         fetchSystemLogs(deviceId),
         fetchCommandLogs(deviceId),
@@ -2464,22 +2432,19 @@ async function updateDashboard() {
     dashboardState.hasLoaded = true;
     dashboardState.asr = asrResult.ok && !asrResult.empty ? asrResult.data : null;
     dashboardState.llm = llmResult.ok && !llmResult.empty ? llmResult.data : null;
-    const historySource = isCurrentHistoryResult(historyResult)
-        ? historyResult.source
-        : dashboardState.sources.history;
     dashboardState.sources = {
         sensor: sensorResult.source,
         deviceStatus: deviceStatusResult.source,
         asr: asrResult.source,
         llm: llmResult.source,
-        history: historySource,
+        history: historyResult.source,
         alerts: alertResult.source,
         logs: systemResult.source,
         commands: commandResult.source,
         smartHome: smartHomeResult.source
     };
     dashboardState.metrics = buildMetrics(sensor, deviceStatus);
-    applyHistoryResult(historyResult);
+    dashboardState.history = Array.isArray(historyResult.data) ? historyResult.data : [];
     dashboardState.alertLogs = Array.isArray(alertResult.data) ? alertResult.data.map(normalizeAlertLog) : [];
     dashboardState.systemLogs = Array.isArray(systemResult.data) ? systemResult.data.map(normalizeSystemLog) : [];
     dashboardState.operationLogs = Array.isArray(commandResult.data) ? commandResult.data : [];
@@ -2724,7 +2689,7 @@ function bindMobileSidebar() {
 }
 
 function normalizeDashboardPage(value) {
-    return ["s3", "c51", "c52"].includes(value) ? value : "c51";
+    return ["s3", "c51", "c52", "settings", "habit-rules"].includes(value) ? value : "c51";
 }
 
 function getDashboardPageFromHash() {
@@ -2770,12 +2735,20 @@ function updateRouteChrome(page) {
 
     const s3Page = document.querySelector('[data-page="s3"]');
     const cDevicePage = document.querySelector("[data-c-device-page]");
+    const settingsPage = document.querySelector('[data-page="settings"]');
+    const habitRulesPage = document.querySelector('[data-page="habit-rules"]');
     if (s3Page) {
         s3Page.hidden = page !== "s3";
     }
     if (cDevicePage) {
-        cDevicePage.hidden = page === "s3";
+        cDevicePage.hidden = page === "s3" || page === "settings" || page === "habit-rules";
         cDevicePage.dataset.activeDevice = page === "c52" ? "c52" : "c51";
+    }
+    if (settingsPage) {
+        settingsPage.hidden = page !== "settings";
+    }
+    if (habitRulesPage) {
+        habitRulesPage.hidden = page !== "habit-rules";
     }
 
 }
@@ -2792,6 +2765,18 @@ function setDashboardPage(page, options = {}) {
         return;
     }
 
+    if (nextPage === "settings") {
+        cleanupDashboardTimers();
+        loadHomeLocation();
+        return;
+    }
+
+    if (nextPage === "habit-rules") {
+        cleanupDashboardTimers();
+        window.HabitRulesDashboard?.load();
+        return;
+    }
+
     stopS3DashboardTimer();
     if (options.refresh !== false) {
         updateDashboard();
@@ -2801,6 +2786,64 @@ function setDashboardPage(page, options = {}) {
 
 function handleDashboardRoute() {
     setDashboardPage(getDashboardPageFromHash());
+}
+
+function homeLocationFormData(form) {
+    const values = Object.fromEntries(new FormData(form));
+    for (const field of ["latitude", "longitude"]) {
+        values[field] = values[field] === "" ? null : Number(values[field]);
+    }
+    return values;
+}
+
+function setHomeLocationStatus(message, state = "") {
+    const status = document.querySelector("[data-home-location-status]");
+    if (!status) return;
+    status.textContent = message;
+    status.dataset.state = state;
+}
+
+function populateHomeLocation(location) {
+    const form = document.querySelector("[data-home-location-form]");
+    if (!form) return;
+    for (const field of ["country", "province", "city", "district", "latitude", "longitude", "timezone"]) {
+        form.elements[field].value = location?.[field] ?? "";
+    }
+}
+
+async function loadHomeLocation() {
+    try {
+        setHomeLocationStatus("正在读取位置配置...");
+        const payload = await fetchJson("/api/settings/home-location");
+        populateHomeLocation(payload?.data?.home_location);
+        setHomeLocationStatus(payload?.data?.home_location?.configured ? "当前位置已保存" : "尚未设置家庭位置", "ready");
+    } catch (_) {
+        setHomeLocationStatus("位置配置读取失败", "error");
+    }
+}
+
+function initHomeLocationForm() {
+    const form = document.querySelector("[data-home-location-form]");
+    if (!form) return;
+    form.addEventListener("submit", async event => {
+        event.preventDefault();
+        const submit = form.querySelector('button[type="submit"]');
+        submit.disabled = true;
+        setHomeLocationStatus("正在保存位置配置...");
+        try {
+            const payload = await fetchJson("/api/settings/home-location", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(homeLocationFormData(form))
+            });
+            populateHomeLocation(payload?.data?.home_location);
+            setHomeLocationStatus("家庭位置已保存", "ready");
+        } catch (_) {
+            setHomeLocationStatus("位置配置保存失败，请检查输入。", "error");
+        } finally {
+            submit.disabled = false;
+        }
+    });
 }
 
 window.addEventListener("resize", () => {
@@ -2856,6 +2899,8 @@ document.addEventListener("DOMContentLoaded", () => {
     bindCommandButtons();
     initCommandControls();
     initSmartHomeControls();
+    initHomeLocationForm();
+    window.HabitRulesDashboard?.init();
     bindMobileSidebar();
     window.addEventListener("hashchange", handleDashboardRoute);
     handleDashboardRoute();

@@ -24,7 +24,9 @@ esp_err_t radar_upload_queue_init(radar_upload_queue_t *queue)
 void radar_upload_queue_deinit(radar_upload_queue_t *queue)
 {
     if (queue == NULL) return;
-    radar_memory_free(queue->packets, "upload_queue");
+    radar_memory_free(queue->packets,
+                      sizeof(radar_upload_packet_t) * RADAR_UPLOAD_QUEUE_CAPACITY,
+                      "upload_queue");
     memset(queue, 0, sizeof(*queue));
 }
 

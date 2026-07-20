@@ -54,7 +54,13 @@ typedef enum {
     NETWORK_WORKER_SERVER_JSON_GATEWAY_STATE,
     NETWORK_WORKER_SERVER_JSON_SYSTEM_LOG,
     NETWORK_WORKER_SERVER_JSON_ALARM,
+    NETWORK_WORKER_SERVER_JSON_ENVIRONMENT_ALARM,
 } network_worker_server_json_type_t;
+
+typedef void (*network_worker_environment_alarm_completion_fn)(uint64_t event_seq,
+                                                                esp_err_t result,
+                                                                int http_status,
+                                                                void *context);
 
 typedef struct {
     uint32_t snapshot_skip_count;
@@ -109,6 +115,21 @@ esp_err_t network_worker_submit_peer_server_json(network_worker_server_json_type
                                                  const char *source);
 
 /**
+ * @brief Submit one environment alarm and receive its terminal HTTP outcome.
+ *
+ * Ownership: successful enqueue transfers @p json_body to network_worker.
+ * A link transition may retain the high-priority work until it can run; the
+ * completion callback is invoked only after an actual attempt or a terminal
+ * local drop. Existing telemetry/alarm queue behavior is unchanged.
+ */
+esp_err_t network_worker_submit_environment_alarm_json(
+    char *json_body,
+    uint64_t event_seq,
+    network_worker_environment_alarm_completion_fn completion,
+    void *completion_context,
+    const char *source);
+
+/**
  * @brief 提交一段已写入 BME cache 的 Server ingest JSON。
  *
  * 所有权：成功入队后 json_body 由 network_worker 释放；失败时调用方仍负责释放。
@@ -132,6 +153,9 @@ esp_err_t network_worker_restore_peer_resources(const char *device_id);
 
 /** @brief 请求上传一次 dashboard/gateway snapshot；scheduler 周期调用。 */
 esp_err_t network_worker_enqueue_snapshot_upload(void);
+
+/** @brief 低优先级请求 Server 刷新天气上下文；请求可合并，S3 不持有天气数据。 */
+esp_err_t network_worker_enqueue_weather_refresh_request(const char *reason);
 
 /** @brief 读取低优先级 dashboard snapshot 的累计调度统计。 */
 network_worker_snapshot_stats_t network_worker_get_snapshot_stats(void);

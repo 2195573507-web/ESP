@@ -1,0 +1,35 @@
+<h2>LD2450 /radar 调试页布局</h2>
+<p class="subtitle">点击选择一个方向。两种方案都保持本地只读，不含 zone、房间或上传。</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#101919;padding:18px;color:#d8e8df;font-family:monospace;min-height:340px">
+      <div style="display:flex;justify-content:space-between;color:#78edbd;font-size:12px;margin-bottom:14px"><span>RADAR / LIVE</span><span>LAST 32 ms</span></div>
+      <div style="display:grid;grid-template-columns:1fr 132px;gap:14px;height:276px">
+        <div style="position:relative;border:1px solid #456258;background:repeating-linear-gradient(0deg,transparent 0,transparent 35px,#1e382d 36px),repeating-linear-gradient(90deg,transparent 0,transparent 35px,#1e382d 36px)">
+          <div style="position:absolute;left:50%;bottom:14%;width:10px;height:10px;background:#78edbd;transform:translateX(-50%);clip-path:polygon(50% 0,100% 100%,0 100%)"></div>
+          <div style="position:absolute;left:62%;top:34%;width:12px;height:12px;border-radius:50%;background:#ff6b55;box-shadow:0 0 0 6px #ff6b5530"></div>
+          <div style="position:absolute;left:51%;top:43%;width:2px;height:2px;background:#7cc5ff;box-shadow:5px -4px #7cc5ff,9px -9px #7cc5ff,12px -14px #7cc5ff,15px -19px #7cc5ff"></div>
+          <span style="position:absolute;left:8px;top:8px;font-size:10px">Y +</span><span style="position:absolute;right:8px;bottom:8px;font-size:10px">X +</span>
+        </div>
+        <div style="border-left:1px solid #456258;padding-left:12px;font-size:11px;line-height:1.8"><b style="color:#78edbd">TARGET 1</b><br>X&nbsp;&nbsp;+128 cm<br>Y&nbsp;&nbsp;+241 cm<br>D&nbsp;&nbsp;273 cm<br>A&nbsp;&nbsp;62 deg<br>V&nbsp;&nbsp;-8 cm/s<br>C&nbsp;&nbsp;91<br>ID&nbsp;2<br>TS&nbsp;12:48:09.240</div>
+      </div>
+      <div style="margin-top:12px;border-top:1px solid #456258;padding-top:8px;font-size:10px;color:#91aa9d">SOURCE S3_LOCAL &nbsp;|&nbsp; RAW COORDINATES &nbsp;|&nbsp; HISTORY 24 SAMPLES</div>
+    </div>
+    <div class="card-body"><h3>A. 平面优先（推荐）</h3><p>适合调试坐标方向、移动轨迹与多 target 的空间关系；字段在右侧持续可见。</p></div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#17201b;padding:18px;color:#d7e4da;font-family:monospace;min-height:340px">
+      <div style="display:flex;justify-content:space-between;color:#f0b35e;font-size:12px;margin-bottom:14px"><span>LD2450 DEBUG</span><span>3 TARGETS</span></div>
+      <div style="height:150px;position:relative;border:1px solid #5b644c;background:repeating-linear-gradient(0deg,transparent 0,transparent 24px,#2d382b 25px),repeating-linear-gradient(90deg,transparent 0,transparent 24px,#2d382b 25px)">
+        <div style="position:absolute;left:50%;bottom:8%;width:9px;height:9px;background:#f0b35e;transform:translateX(-50%) rotate(45deg)"></div>
+        <div style="position:absolute;left:67%;top:28%;width:11px;height:11px;border-radius:50%;background:#f16759"></div>
+        <div style="position:absolute;left:34%;top:48%;width:8px;height:8px;border-radius:50%;background:#72b8ec"></div>
+      </div>
+      <div style="margin-top:14px;border:1px solid #5b644c;font-size:10px"><div style="padding:7px;border-bottom:1px solid #5b644c;color:#f0b35e">ID &nbsp; X &nbsp; Y &nbsp; DIST &nbsp; ANGLE &nbsp; SPEED &nbsp; CONF</div><div style="padding:7px">2 &nbsp; +128 +241 273 &nbsp; 62 &nbsp;&nbsp;&nbsp; -8 &nbsp;&nbsp;&nbsp; 91</div><div style="padding:7px;border-top:1px solid #5b644c">1 &nbsp; -63 &nbsp;+94 &nbsp;113 &nbsp; 124 &nbsp;&nbsp; 0 &nbsp;&nbsp;&nbsp;&nbsp; 78</div></div>
+      <div style="margin-top:11px;font-size:10px;color:#a9b59d">X/Y: cm &nbsp; SPEED: cm/s &nbsp; LAST UPDATE: 32 ms</div>
+    </div>
+    <div class="card-body"><h3>B. 表格优先</h3><p>多 target 参数对比更紧凑；二维空间与轨迹面积更小，坐标调试效率较低。</p></div>
+  </div>
+</div>

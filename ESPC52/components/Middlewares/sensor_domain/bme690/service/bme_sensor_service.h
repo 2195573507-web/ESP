@@ -40,6 +40,15 @@ extern "C" {
 #define BME_SENSOR_DEVICE_ID "bme690_01" // BME690 模块 sensor_id；整机 device_id 使用 server_comm_get_device_id()。
 #endif
 
+/** Fixed-value LCD/status snapshot; it never exposes driver-owned pointers. */
+typedef struct {
+    bool valid;
+    float temperature_c;
+    float humidity_percent;
+    uint16_t air_quality_score;
+    uint32_t generation;
+} bme_sensor_service_reading_t;
+
 /**
  * @brief 注册 BME690 event-worker 驱动读取/上传服务。
  *
@@ -107,6 +116,9 @@ bool bme_sensor_service_is_running(void);
 
 /** @brief 查询当前是否处于暂停态；voice/runtime 诊断调用，返回 true/false。 */
 bool bme_sensor_service_is_paused(void);
+
+/** Copy the last successful sensor/air-quality reading without I2C or network I/O. */
+void bme_sensor_service_get_latest_reading(bme_sensor_service_reading_t *out_reading);
 
 #ifdef __cplusplus
 }

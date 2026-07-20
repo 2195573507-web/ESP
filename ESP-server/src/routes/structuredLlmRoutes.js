@@ -7,7 +7,6 @@ const {
     getLlmResponseStatus,
     readLlmConfig,
     readLlmTextRequest,
-    requestLlmText
 } = require("../llm/textClient");
 const {
     buildStructuredPrompt,
@@ -17,14 +16,18 @@ const {
     maskLogValue
 } = require("../utils/logging");
 const {
-    buildLlmPrompt
-} = require("../services/llmPromptContextService");
+    createDefaultToolRegistry
+} = require("../agent/defaultToolRegistry");
+const {
+    runAgentConversation
+} = require("../agent/agentRunner");
 
 function createStructuredLlmRouter(options) {
     const router = express.Router();
     const dbRun = options.dbRun;
     const dbAll = options.dbAll;
     const logger = options.logger || console;
+    const toolRegistry = options.toolRegistry || createDefaultToolRegistry();
 
     router.post("/api/llm/structured", async (req, res) => {
         const llmRequest = readLlmTextRequest(req.body);
@@ -40,17 +43,20 @@ function createStructuredLlmRouter(options) {
             ? req.body.target_device_id.trim()
             : "";
         const targetDeviceId = requestedTargetDeviceId || llmRequest.deviceId;
-        const promptContext = await buildLlmPrompt(dbAll, llmRequest.text, {
-            deviceId: targetDeviceId || llmRequest.deviceId,
-            mode: "structured"
-        });
-        const prompt = buildStructuredPrompt(promptContext.prompt);
         logger.log(
             `[llm-structured] request text_len=${llmRequest.text.length} device_id=${maskLogValue(llmRequest.deviceId)} target_device_id=${maskLogValue(targetDeviceId)} session_id=${maskLogValue(llmRequest.sessionId)} key_${config.keySummary} endpoint=${config.endpoint} model=${config.model}`
         );
 
         try {
-            const llmResult = await requestLlmText(prompt, config);
+            const llmResult = await runAgentConversation({
+                dbAll,
+                toolRegistry,
+                userText: llmRequest.text,
+                deviceId: targetDeviceId || llmRequest.deviceId,
+                config,
+                logger,
+                additionalSystemPrompt: buildStructuredPrompt(llmRequest.text)
+            });
             const parsed = parseStructuredLlmOutput(llmResult.text);
             const serverTimeMs = Date.now();
             const chatText = parsed.parsed ? parsed.chat_text : (parsed.chat_text || llmResult.text);

@@ -188,6 +188,13 @@ void radar_resource_adapter_init(uint64_t now_ms)
     portEXIT_CRITICAL(&s_adapter_lock);
 }
 
+void radar_resource_adapter_deinit(void)
+{
+    portENTER_CRITICAL(&s_adapter_lock);
+    memset(&s_adapter, 0, sizeof(s_adapter));
+    portEXIT_CRITICAL(&s_adapter_lock);
+}
+
 void radar_resource_adapter_update_sample(const radar_target_sample_t *sample,
                                           uint64_t now_ms)
 {

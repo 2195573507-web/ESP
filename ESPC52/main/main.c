@@ -13,6 +13,7 @@
 #include "app_main_config.h"
 #include "app_orchestrator.h"
 #include "app_stack_monitor.h"
+#include "c5_memory.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -21,6 +22,8 @@
 
 static const char *TAG = "APP_ENTRY";
 static TaskHandle_t s_app_startup_task;
+static StackType_t *s_app_startup_stack;
+static StaticTask_t s_app_startup_storage;
 
 static void app_startup_task(void *arg)
 {
@@ -35,8 +38,11 @@ static void app_startup_task(void *arg)
     app_orchestrator_start();
     app_stack_monitor_log(TAG, "app_startup_task", "orchestrator_returned");
 
+    TaskHandle_t task = xTaskGetCurrentTaskHandle();
     s_app_startup_task = NULL;
-    vTaskDelete(NULL);
+    if (task != NULL) {
+        vTaskDelete(task);
+    }
 }
 
 /**
@@ -46,30 +52,46 @@ static void app_startup_task(void *arg)
  * 调用时机：芯片启动、系统组件初始化完成后进入。
  * 输入参数：无。
  * 返回值：无；本函数创建 app_startup 任务后返回给 ESP-IDF。
- * 失败处理：启动任务创建失败时通过 ESP_ERROR_CHECK(ESP_ERR_NO_MEM) 进入
- * ESP-IDF 错误处理；WiFi/BME/voice/command 等后续失败由 app_orchestrator_start()
- * 及各模块记录和处理。
+ * 失败处理：启动任务创建失败时记录明确的资源错误并返回，不触发重启循环；WiFi/BME/
+ * voice/command 等后续失败由 app_orchestrator_start() 及各模块记录和处理。
  */
 void app_main(void)
 {
     app_debug_apply_log_levels();
     app_stack_monitor_log(TAG, "app_main", "entry");
 
-    BaseType_t created = xTaskCreate(app_startup_task,
-                                     "app_startup",
-                                     APP_STARTUP_TASK_STACK,
-                                     NULL,
-                                     APP_STARTUP_TASK_PRIORITY,
-                                     &s_app_startup_task);
+    c5_mem_log("task_create_before_app_startup");
+    s_app_startup_stack = (StackType_t *)c5_mem_alloc(APP_STARTUP_TASK_STACK,
+                                                       C5_MEM_PSRAM,
+                                                       "app_startup_stack");
+    if (s_app_startup_stack == NULL) {
+        ESP_LOGE(TAG, "allocate app_startup PSRAM stack failed");
+        c5_mem_log("task_create_after_app_startup_failed");
+        return;
+    }
+    s_app_startup_task = xTaskCreateStatic(app_startup_task,
+                                           "app_startup",
+                                           APP_STARTUP_TASK_STACK,
+                                           NULL,
+                                           APP_STARTUP_TASK_PRIORITY,
+                                           s_app_startup_stack,
+                                           &s_app_startup_storage);
     app_stack_monitor_log(TAG, "app_main", "after_startup_task_create");
-    if (created != pdPASS) {
+    if (s_app_startup_task == NULL) {
+        c5_mem_free(s_app_startup_stack, "app_startup_stack");
+        s_app_startup_stack = NULL;
         s_app_startup_task = NULL;
         ESP_LOGE(TAG,
-                 "create app_startup task failed stack=%u priority=%u",
+                 "create static app_startup task failed stack=%u priority=%u",
                  (unsigned int)APP_STARTUP_TASK_STACK,
                  (unsigned int)APP_STARTUP_TASK_PRIORITY);
-        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+        ESP_LOGE(TAG, "app_startup disabled ret=%s", esp_err_to_name(ESP_ERR_NO_MEM));
+        c5_mem_log("task_create_after_app_startup_failed");
+        return;
     }
 
+    ESP_LOGI(TAG, "TASK_CREATE task=app_startup stack=%u source=psram_static",
+             (unsigned int)APP_STARTUP_TASK_STACK);
+    c5_mem_log("task_create_after_app_startup");
     app_stack_monitor_log(TAG, "app_main", "return");
 }

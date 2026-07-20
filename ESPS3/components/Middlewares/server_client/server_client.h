@@ -79,6 +79,17 @@ esp_err_t server_client_post_alarm_json(const char *json_body,
                                         char *response_body,
                                         size_t response_body_size,
                                         int *http_status);
+/** @brief POST habit-rule event to ESP-server.  Reporter owns retries. */
+esp_err_t server_client_post_habit_event_json(const char *json_body,
+                                              char *response_body,
+                                              size_t response_body_size,
+                                              int *http_status);
+
+/** @brief 请求 ESP-server 刷新其拥有的天气上下文；不传输或保存天气数据。 */
+esp_err_t server_client_post_weather_refresh_json(const char *json_body,
+                                                  char *response_body,
+                                                  size_t response_body_size,
+                                                  int *http_status);
 /** @brief 轻量探测 ESP-server 是否可达；network_worker 在打开 LINK_STABLE 前调用。 */
 esp_err_t server_client_probe_available(int *http_status);
 /**
