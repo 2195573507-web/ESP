@@ -190,6 +190,15 @@ struct RadarStatePatch: Equatable {
     var connectionType: String?
     var sequence: Int64?
     var targetCount: Int?
+    var rawTargetCount: Int?
+    var acceptedTargetCount: Int?
+    var visibleTrackCount: Int?
+    var confirmedActiveTrackCount: Int?
+    var historyTargetCount: Int?
+    var visiblePersonCount: Int?
+    var retainedPersonCount: Int?
+    var businessPersonCount: Int?
+    var countState: String?
     var presenceState: RadarPresenceState?
     var motionState: String?
     var spatialState: String?
@@ -215,6 +224,15 @@ struct RadarStatePatch: Equatable {
          connectionType: String? = nil,
          sequence: Int64? = nil,
          targetCount: Int? = nil,
+         rawTargetCount: Int? = nil,
+         acceptedTargetCount: Int? = nil,
+         visibleTrackCount: Int? = nil,
+         confirmedActiveTrackCount: Int? = nil,
+         historyTargetCount: Int? = nil,
+         visiblePersonCount: Int? = nil,
+         retainedPersonCount: Int? = nil,
+         businessPersonCount: Int? = nil,
+         countState: String? = nil,
          presenceState: RadarPresenceState? = nil,
          motionState: String? = nil,
          spatialState: String? = nil,
@@ -239,6 +257,15 @@ struct RadarStatePatch: Equatable {
         self.connectionType = connectionType
         self.sequence = sequence
         self.targetCount = targetCount
+        self.rawTargetCount = rawTargetCount
+        self.acceptedTargetCount = acceptedTargetCount
+        self.visibleTrackCount = visibleTrackCount
+        self.confirmedActiveTrackCount = confirmedActiveTrackCount
+        self.historyTargetCount = historyTargetCount
+        self.visiblePersonCount = visiblePersonCount
+        self.retainedPersonCount = retainedPersonCount
+        self.businessPersonCount = businessPersonCount
+        self.countState = countState
         self.presenceState = presenceState
         self.motionState = motionState
         self.spatialState = spatialState
@@ -263,6 +290,9 @@ struct RadarStatePatch: Equatable {
 
     var hasValues: Bool {
         online != nil || connectionType != nil || sequence != nil || targetCount != nil ||
+            rawTargetCount != nil || acceptedTargetCount != nil || visibleTrackCount != nil ||
+            confirmedActiveTrackCount != nil || historyTargetCount != nil || visiblePersonCount != nil ||
+            retainedPersonCount != nil || businessPersonCount != nil || countState != nil ||
             presenceState != nil || motionState != nil || spatialState != nil ||
             parserErrors != nil || sequenceRejects != nil || identityMismatches != nil ||
             droppedFrames != nil || recoveryState != nil || deviceID != nil || sensorState != nil ||
@@ -309,6 +339,16 @@ struct RadarRoomState: Equatable {
     var tracks: [Int: RadarTrack]
     var trackHistory: [Int: [RadarTrackPoint]]
     var targetCount: Int
+    var rawTargetCount: Int
+    var acceptedTargetCount: Int
+    var visibleTrackCount: Int
+    var confirmedActiveTrackCount: Int
+    var historyTargetCount: Int
+    var visiblePersonCount: Int
+    var retainedPersonCount: Int
+    var businessPersonCount: Int
+    var countState: String
+    var hasExplicitCountSummary: Bool
     var presenceState: RadarPresenceState
     var motionState: String
     var spatialState: String
@@ -347,6 +387,16 @@ struct RadarRoomState: Equatable {
         tracks = [:]
         trackHistory = [:]
         targetCount = 0
+        rawTargetCount = 0
+        acceptedTargetCount = 0
+        visibleTrackCount = 0
+        confirmedActiveTrackCount = 0
+        historyTargetCount = 0
+        visiblePersonCount = 0
+        retainedPersonCount = 0
+        businessPersonCount = 0
+        countState = "UNKNOWN"
+        hasExplicitCountSummary = false
         presenceState = .unknown
         motionState = "unknown"
         spatialState = "unknown"
@@ -380,6 +430,8 @@ struct RadarRoomState: Equatable {
     var badHeader: Int { parserHealth.badHeader }
     var badTail: Int { parserHealth.badTail }
     var resyncCount: Int { parserHealth.resyncCount }
+    var visibleTracks: [RadarTarget] { filteredTargets.filter(\.isVisible) }
+    var retainedTrackCount: Int { max(0, filteredTargets.count - visibleTracks.count) }
 }
 
 enum RadarClock {

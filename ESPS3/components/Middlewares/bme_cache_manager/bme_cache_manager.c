@@ -11,6 +11,7 @@
 
 #include "cJSON.h"
 #include "esp111_protocol_common.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -32,8 +33,15 @@ typedef struct {
     int64_t last_size_log_ms;
 } bme_cache_state_t;
 
-static bme_cache_state_t s_cache;
+static bme_cache_state_t *s_cache_storage;
+#define s_cache (*s_cache_storage)
 static SemaphoreHandle_t s_lock;
+static bool s_initialized;
+
+static bool cache_ready(void)
+{
+    return s_initialized && s_cache_storage != NULL && s_lock != NULL;
+}
 
 static int64_t now_ms(void)
 {
@@ -46,7 +54,7 @@ static void free_record_storage(bme_cache_record_t *record)
         return;
     }
     if (record->server_json != NULL) {
-        cJSON_free(record->server_json);
+        heap_caps_free(record->server_json);
         record->server_json = NULL;
     }
 }
@@ -114,7 +122,7 @@ static bool duplicate_json(const char *json, char **out)
         return false;
     }
     const size_t len = strlen(json);
-    char *copy = cJSON_malloc(len + 1U);
+    char *copy = heap_caps_malloc(len + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (copy == NULL) {
         return false;
     }
@@ -231,24 +239,46 @@ static esp_err_t copy_record_for_output(const bme_cache_record_t *src,
 
 esp_err_t bme_cache_manager_init(void)
 {
-    if (s_lock == NULL) {
-        s_lock = xSemaphoreCreateMutex();
-        if (s_lock == NULL) {
+    if (cache_ready()) {
+        return ESP_OK;
+    }
+    bme_cache_state_t *storage = s_cache_storage;
+    SemaphoreHandle_t lock = s_lock;
+    const bool storage_created = storage == NULL;
+    if (storage_created) {
+        storage = heap_caps_calloc(1U,
+                                   sizeof(*storage),
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (storage == NULL) {
+            ESP_LOGE(TAG,
+                     "BME cache PSRAM allocation failed bytes=%u",
+                     (unsigned int)sizeof(*storage));
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (lock == NULL) {
+        lock = xSemaphoreCreateMutex();
+        if (lock == NULL) {
+            if (storage_created) heap_caps_free(storage);
             return ESP_ERR_NO_MEM;
         }
     }
 
-    xSemaphoreTake(s_lock, portMAX_DELAY);
+    xSemaphoreTake(lock, portMAX_DELAY);
     for (size_t i = 0; i < BME_CACHE_MANAGER_CAPACITY; ++i) {
-        clear_record(&s_cache.records[i]);
+        clear_record(&storage->records[i]);
     }
-    memset(&s_cache, 0, sizeof(s_cache));
-    s_cache.next_sequence = 1U;
-    xSemaphoreGive(s_lock);
+    memset(storage, 0, sizeof(*storage));
+    storage->next_sequence = 1U;
+    s_cache_storage = storage;
+    s_lock = lock;
+    s_initialized = true;
+    xSemaphoreGive(lock);
 
     ESP_LOGI(TAG,
-             "BME cache initialized capacity=%u",
-             (unsigned int)BME_CACHE_MANAGER_CAPACITY);
+             "BME cache initialized capacity=%u storage=psram bytes=%u",
+             (unsigned int)BME_CACHE_MANAGER_CAPACITY,
+             (unsigned int)sizeof(*storage));
     return ESP_OK;
 }
 
@@ -259,7 +289,7 @@ esp_err_t bme_cache_manager_push_json(const char *server_json,
     if (server_json == NULL || server_json[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_lock == NULL) {
+    if (!cache_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -322,7 +352,7 @@ esp_err_t bme_cache_manager_peek_oldest(bme_cache_record_t *out_record)
     if (out_record == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_lock == NULL) {
+    if (!cache_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -349,7 +379,7 @@ esp_err_t bme_cache_manager_peek_oldest_for_device(const char *device_id,
         return ESP_ERR_INVALID_ARG;
     }
     memset(out_record, 0, sizeof(*out_record));
-    if (s_lock == NULL) {
+    if (!cache_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -374,7 +404,7 @@ esp_err_t bme_cache_manager_peek_oldest_for_device(const char *device_id,
 
 esp_err_t bme_cache_manager_delete_oldest(uint32_t sequence)
 {
-    if (s_lock == NULL) {
+    if (!cache_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -403,7 +433,7 @@ esp_err_t bme_cache_manager_delete_sequence(uint32_t sequence)
     if (sequence == 0U) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_lock == NULL) {
+    if (!cache_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -450,7 +480,7 @@ esp_err_t bme_cache_manager_mark_in_flight(uint32_t sequence, bool in_flight)
     if (sequence == 0U) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_lock == NULL) {
+    if (!cache_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -478,7 +508,7 @@ void bme_cache_manager_release_record(bme_cache_record_t *record)
 
 size_t bme_cache_manager_size(void)
 {
-    if (s_lock == NULL) {
+    if (!cache_ready()) {
         return 0U;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);

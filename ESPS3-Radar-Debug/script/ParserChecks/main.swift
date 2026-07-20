@@ -25,6 +25,8 @@ enum ParserChecks {
         testCurrentS3LocalTrackCompatibility()
         testVisibleZeroKeepsLastAcceptedPosition()
         testAcceptedAndRawSlotCompatibility()
+        testPersonContinuityCountsAndHistoryIsolation()
+        testLegacyTracksDoNotImplyPersons()
         testLocalHealthPreservesLastTarget()
         testRelativeLogTimestampUsesReceiveTime()
         testReplayRestart()
@@ -208,6 +210,33 @@ enum ParserChecks {
         parser.consumeLine("local raw slot=0 x=20 y=30 speed=8").forEach { store.apply($0, nowMilliseconds: 2_000) }
         let target = store.states[.s3Local]?.filteredTargets.first
         expect(target?.xMillimeters == -1_074 && target?.yMillimeters == 5_017 && target?.isVisible == false, "accepted position survives a raw-slot diagnostic")
+    }
+
+    static func testPersonContinuityCountsAndHistoryIsolation() {
+        var parser = RadarLogParser()
+        var store = RadarStateStore()
+        parser.consumeLine("source=S3_LOCAL RADAR_COUNTS: raw_target_count=3 accepted_target_count=2 visible_track_count=1 confirmed_active_track_count=2 history_target_count=4 visible_person_count=1 retained_person_count=1 business_person_count=2 count_state=ESTIMATED").forEach {
+            store.apply($0, nowMilliseconds: 1_000)
+        }
+        parser.consumeLine("source=S3_LOCAL local track=8 visible=0 raw_x=100 raw_y=100 filtered_x=100 filtered_y=100 distance=141 angle=45 speed=0 confidence=70").forEach {
+            store.apply($0, nowMilliseconds: 1_001)
+        }
+        let state = store.states[.s3Local]
+        expect(state?.rawTargetCount == 3 && state?.acceptedTargetCount == 2, "raw and accepted target counts remain distinct")
+        expect(state?.visibleTrackCount == 1 && state?.confirmedActiveTrackCount == 2, "visible and confirmed-active track counts remain distinct")
+        expect(state?.visiblePersonCount == 1 && state?.retainedPersonCount == 1 && state?.businessPersonCount == 2 && state?.countState == "ESTIMATED", "retained and business person counts parse independently")
+        expect(state?.visibleTracks.isEmpty == true && state?.historyTargetCount == 4, "history track count and hidden track are excluded from current visible tracks")
+    }
+
+    static func testLegacyTracksDoNotImplyPersons() {
+        var store = RadarStateStore()
+        store.apply(event(source: .s3Local, trackID: 1, sequence: 1), nowMilliseconds: 1_000)
+        store.apply(event(source: .s3Local, trackID: 2, sequence: 2), nowMilliseconds: 1_100)
+        let state = store.states[.s3Local]
+        expect(state?.visibleTrackCount == 2, "legacy track-only logs still expose visible tracks")
+        expect(state?.visiblePersonCount == 0 && state?.retainedPersonCount == 0 &&
+            state?.businessPersonCount == 0 && state?.countState == "UNKNOWN",
+            "legacy tracks do not imply observed or retained persons")
     }
 
     static func testLocalHealthPreservesLastTarget() {

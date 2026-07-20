@@ -37,6 +37,7 @@ static const char *TAG = "wake_prompt_stream";
 #define WAKE_PROMPT_STREAM_SAMPLE_RATE_HZ 16000U
 #define WAKE_PROMPT_STREAM_MAX_BYTES (96U * 1024U)
 #define WAKE_PROMPT_STREAM_MIN_BYTES 64U
+#define WAKE_PROMPT_STREAM_ENDPOINT_BYTES 384U
 #define WAKE_PROMPT_SPOOL_PARTITION_LABEL "storage"
 #define WAKE_PROMPT_SPOOL_BASE_PATH "/wake_prompt"
 #define WAKE_PROMPT_SPOOL_PATH WAKE_PROMPT_SPOOL_BASE_PATH "/wake_prompt.pcm"
@@ -109,6 +110,61 @@ static bool wake_prompt_content_type_ok(const char *content_type)
            strstr(content_type, "audio/L16") != NULL &&
            strstr(content_type, "rate=16000") != NULL &&
            strstr(content_type, "channels=1") != NULL;
+}
+
+static bool wake_prompt_text_valid(const char *prompt_text)
+{
+    if (prompt_text == NULL || prompt_text[0] == '\0' ||
+        strlen(prompt_text) > ESP111_PROTOCOL_WAKE_PROMPT_MAX_TEXT_BYTES) {
+        return false;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)prompt_text;
+         *cursor != '\0'; cursor++) {
+        if (*cursor < 0x20U || *cursor == 0x7FU) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static esp_err_t wake_prompt_build_text_endpoint(const char *prompt_text,
+                                                 char *out,
+                                                 size_t out_size)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    if (!wake_prompt_text_valid(prompt_text) || out == NULL || out_size == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *prefix = WAKE_PROMPT_STREAM_ENDPOINT "?" ESP111_PROTOCOL_WAKE_PROMPT_QUERY_KEY "=";
+    size_t written = strlen(prefix);
+    if (written >= out_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(out, prefix, written);
+    for (const unsigned char *cursor = (const unsigned char *)prompt_text;
+         *cursor != '\0'; cursor++) {
+        const bool safe = ((*cursor >= 'a' && *cursor <= 'z') ||
+                           (*cursor >= 'A' && *cursor <= 'Z') ||
+                           (*cursor >= '0' && *cursor <= '9') ||
+                           *cursor == '-' || *cursor == '_' ||
+                           *cursor == '.' || *cursor == '~');
+        if (safe) {
+            if (written + 1U >= out_size) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            out[written++] = (char)*cursor;
+        } else {
+            if (written + 3U >= out_size) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            out[written++] = '%';
+            out[written++] = hex[*cursor >> 4U];
+            out[written++] = hex[*cursor & 0x0FU];
+        }
+    }
+    out[written] = '\0';
+    return ESP_OK;
 }
 
 static const char *wake_prompt_failure_reason(esp_err_t ret, const char *fallback)
@@ -245,19 +301,34 @@ esp_err_t wake_prompt_cache_start_async(void)
     return wake_prompt_spool_mount();
 }
 
-esp_err_t wake_prompt_cache_play(void)
+static esp_err_t wake_prompt_cache_play_internal(const char *prompt_text)
 {
     /*
      * 调用时机：WakeNet 命中后、录音窗口打开前调用。
      * 成功路径：GET S3 /local/v1/audio/wake-prompt，写临时文件并关闭 HTTP 后播放。
      * 失败路径：返回错误给 local_wake_word，由本地 short beep 兜底，录音窗口继续打开。
      */
+    if (prompt_text != NULL && !wake_prompt_text_valid(prompt_text)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (!server_comm_wifi_is_ready()) {
         return SERVER_COMM_ERR_WIFI_NOT_READY;
     }
-    if (!local_wake_word_is_ack_active()) {
+    if (prompt_text == NULL && !local_wake_word_is_ack_active()) {
         ESP_LOGW(TAG, "wake prompt stream rejected outside local_wake ack");
         return ESP_ERR_INVALID_STATE;
+    }
+
+    char endpoint[WAKE_PROMPT_STREAM_ENDPOINT_BYTES];
+    const char *stream_endpoint = WAKE_PROMPT_STREAM_ENDPOINT;
+    if (prompt_text != NULL) {
+        esp_err_t endpoint_ret = wake_prompt_build_text_endpoint(prompt_text,
+                                                                  endpoint,
+                                                                  sizeof(endpoint));
+        if (endpoint_ret != ESP_OK) {
+            return endpoint_ret;
+        }
+        stream_endpoint = endpoint;
     }
     esp_err_t ret = wake_prompt_spool_mount();
     if (ret != ESP_OK) {
@@ -273,7 +344,7 @@ esp_err_t wake_prompt_cache_play(void)
     }
 
     server_comm_raw_stream_config_t config = {
-        .endpoint = WAKE_PROMPT_STREAM_ENDPOINT,
+        .endpoint = stream_endpoint,
         .content_type = NULL,
         .headers = headers,
         .header_count = header_count,
@@ -298,7 +369,7 @@ esp_err_t wake_prompt_cache_play(void)
         ESP_LOGW(TAG,
                  "wake prompt S3 request failed reason=%s endpoint=%s ret=%s rx_buffer=%u tx_buffer=%u",
                  wake_prompt_failure_reason(ret, "http_open_failed"),
-                 WAKE_PROMPT_STREAM_ENDPOINT,
+                 stream_endpoint,
                  server_comm_err_to_name(ret),
                  (unsigned int)WAKE_PROMPT_CACHE_HTTP_HEADER_BUFFER_BYTES,
                  (unsigned int)WAKE_PROMPT_CACHE_HTTP_TX_BUFFER_BYTES);
@@ -310,7 +381,7 @@ esp_err_t wake_prompt_cache_play(void)
     int64_t headers_begin_ms = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG,
              "wake prompt fetch headers begin endpoint=%s timeout_ms=%u rx_buffer=%u",
-             WAKE_PROMPT_STREAM_ENDPOINT,
+             stream_endpoint,
              (unsigned int)WAKE_PROMPT_CACHE_FETCH_HEADERS_TIMEOUT_MS,
              (unsigned int)WAKE_PROMPT_CACHE_HTTP_HEADER_BUFFER_BYTES);
     ret = server_comm_http_fetch_headers(stream, &response);
@@ -319,7 +390,7 @@ esp_err_t wake_prompt_cache_play(void)
         ESP_LOGW(TAG,
                  "wake prompt S3 request failed reason=%s endpoint=%s ret=%s timeout_ms=%u elapsed_ms=%lld",
                  wake_prompt_failure_reason(ret, "http_fetch_headers_failed"),
-                 WAKE_PROMPT_STREAM_ENDPOINT,
+                 stream_endpoint,
                  server_comm_err_to_name(ret),
                  (unsigned int)WAKE_PROMPT_CACHE_FETCH_HEADERS_TIMEOUT_MS,
                  (long long)headers_elapsed_ms);
@@ -327,7 +398,7 @@ esp_err_t wake_prompt_cache_play(void)
     if (ret == ESP_OK) {
         ESP_LOGI(TAG,
                  "wake prompt fetch headers end endpoint=%s elapsed_ms=%lld status=%d content_length=%lld",
-                 WAKE_PROMPT_STREAM_ENDPOINT,
+                 stream_endpoint,
                  (long long)headers_elapsed_ms,
                  response.status_code,
                  (long long)response.content_length);
@@ -335,7 +406,7 @@ esp_err_t wake_prompt_cache_play(void)
             ret = SERVER_COMM_ERR_BAD_STATUS;
             ESP_LOGW(TAG,
                      "wake prompt S3 request failed reason=http_status_non_2xx endpoint=%s ret=%s status=%d content_length=%lld content_type=%s",
-                     WAKE_PROMPT_STREAM_ENDPOINT,
+                     stream_endpoint,
                      server_comm_err_to_name(ret),
                      response.status_code,
                      (long long)response.content_length,
@@ -345,7 +416,7 @@ esp_err_t wake_prompt_cache_play(void)
             if (ret != ESP_OK) {
                 ESP_LOGW(TAG,
                          "wake prompt S3 request failed reason=invalid_response endpoint=%s ret=%s status=%d content_length=%lld content_type=%s",
-                         WAKE_PROMPT_STREAM_ENDPOINT,
+                         stream_endpoint,
                          server_comm_err_to_name(ret),
                          response.status_code,
                          (long long)response.content_length,
@@ -374,7 +445,7 @@ esp_err_t wake_prompt_cache_play(void)
             ESP_LOGW(TAG,
                      "wake prompt S3 request failed reason=%s endpoint=%s ret=%s status=%d bytes=%u",
                      wake_prompt_failure_reason(ret, "stream_read_failed"),
-                     WAKE_PROMPT_STREAM_ENDPOINT,
+                     stream_endpoint,
                      server_comm_err_to_name(ret),
                      response.status_code,
                      (unsigned int)spool.response_bytes);
@@ -399,7 +470,7 @@ esp_err_t wake_prompt_cache_play(void)
         ret = ESP_ERR_INVALID_RESPONSE;
         ESP_LOGW(TAG,
                  "wake prompt S3 request failed reason=empty_payload endpoint=%s bytes=%u",
-                 WAKE_PROMPT_STREAM_ENDPOINT,
+                 stream_endpoint,
                  (unsigned int)spool.response_bytes);
     }
     if (ret == ESP_OK) {
@@ -422,7 +493,7 @@ esp_err_t wake_prompt_cache_play(void)
         ret = ESP_ERR_INVALID_RESPONSE;
         ESP_LOGW(TAG,
                  "wake prompt S3 request failed reason=empty_payload endpoint=%s bytes=%u peak=%u",
-                 WAKE_PROMPT_STREAM_ENDPOINT,
+                 stream_endpoint,
                  (unsigned int)spool.response_bytes,
                  (unsigned int)peak);
     }
@@ -434,4 +505,14 @@ esp_err_t wake_prompt_cache_play(void)
              (unsigned int)spool.chunks,
              (unsigned int)peak);
     return ret;
+}
+
+esp_err_t wake_prompt_cache_play(void)
+{
+    return wake_prompt_cache_play_internal(NULL);
+}
+
+esp_err_t wake_prompt_cache_play_text(const char *prompt_text)
+{
+    return wake_prompt_cache_play_internal(prompt_text);
 }

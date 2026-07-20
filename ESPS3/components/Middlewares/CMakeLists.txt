@@ -9,10 +9,15 @@ set(gateway_srcs
             protocol_adapter/protocol_adapter.c
             server_client/server_client.c
             gateway_event_reporter/gateway_event_reporter.c
+            environment_alarm_adapter/environment_alarm_adapter.c
+            environment_alarm_adapter/environment_alarm_sequence.c
+            environment_alarm_reporter/environment_alarm_delivery.c
+            environment_alarm_reporter/environment_alarm_reporter.c
             sensor_aggregator/sensor_aggregator.c
             smart_home_gateway/smart_home_gateway.c
             voice_proxy/voice_proxy.c
             wake_prompt_cache_gateway/wake_prompt_cache_gateway.c
+            command_router/command_ack_policy.c
             command_router/command_router.c
             offline_policy/offline_policy.c
             runtime/s3_event_bus.c
@@ -28,10 +33,25 @@ set(gateway_srcs
             radar_domain/radar_coordinate_transform.c
             radar_domain/radar_zone_map.c
             radar_domain/radar_target_tracker.c
+            radar_domain/radar_person_continuity.c
             radar_domain/radar_spatial_state.c
             radar_ingest/radar_ingest.c
             device_stream_gateway/device_stream_gateway.c
+            home_ai/home_ai_voice_session.c
+            home_ai/home_ai_voice_router.c
+            home_ai/home_ai_emergency_coordinator.c
+            home_ai/home_ai_local_voice_command.c
+            home_ai/home_ai_room_state.c
+            home_ai/home_ai_user_override.c
+            home_ai/home_ai_rule_engine.c
+            home_ai/home_ai_virtual_device.c
+            home_ai/home_ai_history_store.c
+            home_ai/home_ai_event_reporter.c
+            home_ai/home_ai_weather_context.c
+            home_ai/home_ai_config_store.c
+            home_ai/home_ai_runtime.c
             local_http_server/radar_local_handler.c
+            local_http_server/home_ai_local_handler.c
             local_http_server/local_http_server.c
             gateway_orchestrator/gateway_orchestrator.c)
 
@@ -49,6 +69,8 @@ set(priv_include_dirs
             protocol_adapter
             server_client
             gateway_event_reporter
+            environment_alarm_adapter
+            environment_alarm_reporter
             sensor_aggregator
             smart_home_gateway
             voice_proxy
@@ -59,10 +81,12 @@ set(priv_include_dirs
             radar_ingest
             radar_domain/include
             device_stream_gateway
+            home_ai
             local_http_server)
 
 set(requires
             app_config
+            environment_alarm_engine
             esp_event
             esp_hw_support
             esp_http_client
@@ -77,6 +101,7 @@ set(requires
             json
             log
             lwip
+            mbedtls
             nvs_flash
             radar_ld2450
             spiffs

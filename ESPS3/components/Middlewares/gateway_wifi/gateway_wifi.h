@@ -28,7 +28,7 @@ extern volatile bool g_net_ready;
  * 调用时机：registry/router/proxy 初始化后；local HTTP 由 network_worker 在 SoftAP ready 后启动。
  * 输入参数：无。
  * @return ESP_OK 表示 WiFi 已启动或已在运行；NVS/netif/WiFi 配置失败返回对应错误码。
- * 失败处理：gateway_orchestrator 使用 ESP_ERROR_CHECK 处理关键启动失败。
+ * 失败处理：回滚本次创建的 WiFi/netif/handler/STA 辅助资源并返回错误；orchestrator 记录降级后继续独立模块。
  */
 esp_err_t gateway_wifi_start(void);
 /** @brief worker 线程内启动一次非阻塞 STA 扫描；完成事件会由 WiFi callback 转交 worker。 */

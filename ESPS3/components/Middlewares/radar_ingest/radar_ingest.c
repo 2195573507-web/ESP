@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #endif
@@ -46,6 +47,7 @@ static const char *TAG = "radar_ingest";
 static StaticSemaphore_t s_lock_storage;
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_worker;
+static bool s_worker_with_caps;
 #else
 static radar_ingest_history_entry_t s_history_host[RADAR_INGEST_HISTORY_DEPTH];
 #endif
@@ -314,12 +316,30 @@ static void radar_worker_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(RADAR_INGEST_WORKER_PERIOD_MS));
     }
 }
+
+static void radar_ingest_rollback_start(void)
+{
+    if (s_worker != NULL) {
+        if (s_worker_with_caps) {
+            vTaskDeleteWithCaps(s_worker);
+        } else {
+            vTaskDelete(s_worker);
+        }
+        s_worker = NULL;
+        s_worker_with_caps = false;
+    }
+    if (s_lock != NULL) {
+        vSemaphoreDelete(s_lock);
+        s_lock = NULL;
+    }
+    heap_caps_free(s_history);
+    s_history = NULL;
+}
 #endif
 
 esp_err_t radar_ingest_start(void)
 {
     if (s_started) return ESP_OK;
-    if (radar_gateway_ingest_start() != ESP_OK) return ESP_ERR_NO_MEM;
     memset(s_pending, 0, sizeof(s_pending));
     s_history_head = 0U;
     s_history_count = 0U;
@@ -328,21 +348,69 @@ esp_err_t radar_ingest_start(void)
                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_history == NULL) return ESP_ERR_NO_MEM;
     s_lock = xSemaphoreCreateMutexStatic(&s_lock_storage);
-    if (s_lock == NULL) return ESP_ERR_NO_MEM;
+    if (s_lock == NULL) {
+        heap_caps_free(s_history);
+        s_history = NULL;
+        return ESP_ERR_NO_MEM;
+    }
 #if CONFIG_FREERTOS_UNICORE
-    const BaseType_t created = xTaskCreate(radar_worker_task, "radar_worker", RADAR_INGEST_WORKER_STACK,
-                                           NULL, RADAR_INGEST_WORKER_PRIORITY, &s_worker);
+    BaseType_t created = xTaskCreateWithCaps(radar_worker_task,
+                                             "radar_worker",
+                                             RADAR_INGEST_WORKER_STACK,
+                                             NULL,
+                                             RADAR_INGEST_WORKER_PRIORITY,
+                                             &s_worker,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #else
-    const BaseType_t created = xTaskCreatePinnedToCore(radar_worker_task, "radar_worker",
-                                                       RADAR_INGEST_WORKER_STACK, NULL,
-                                                       RADAR_INGEST_WORKER_PRIORITY, &s_worker, 1);
+    BaseType_t created = xTaskCreatePinnedToCoreWithCaps(radar_worker_task,
+                                                         "radar_worker",
+                                                         RADAR_INGEST_WORKER_STACK,
+                                                         NULL,
+                                                         RADAR_INGEST_WORKER_PRIORITY,
+                                                         &s_worker,
+                                                         1,
+                                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #endif
-    if (created != pdPASS) return ESP_ERR_NO_MEM;
+    if (created != pdPASS) {
+        ESP_LOGW(TAG, "PSRAM task stack allocation failed; falling back to internal RAM");
+#if CONFIG_FREERTOS_UNICORE
+        created = xTaskCreate(radar_worker_task,
+                              "radar_worker",
+                              RADAR_INGEST_WORKER_STACK,
+                              NULL,
+                              RADAR_INGEST_WORKER_PRIORITY,
+                              &s_worker);
+#else
+        created = xTaskCreatePinnedToCore(radar_worker_task,
+                                          "radar_worker",
+                                          RADAR_INGEST_WORKER_STACK,
+                                          NULL,
+                                          RADAR_INGEST_WORKER_PRIORITY,
+                                          &s_worker,
+                                          1);
+#endif
+        s_worker_with_caps = false;
+    } else {
+        s_worker_with_caps = true;
+    }
+    if (created != pdPASS) {
+        s_worker = NULL;
+        radar_ingest_rollback_start();
+        return ESP_ERR_NO_MEM;
+    }
 #endif
 #ifdef RADAR_INGEST_HOST_TEST
     s_history = s_history_host;
     memset(s_history, 0, sizeof(s_history_host));
 #endif
+    if (radar_gateway_ingest_start() != ESP_OK) {
+#ifndef RADAR_INGEST_HOST_TEST
+        radar_ingest_rollback_start();
+#else
+        s_history = NULL;
+#endif
+        return ESP_ERR_NO_MEM;
+    }
     s_started = true;
     return ESP_OK;
 }

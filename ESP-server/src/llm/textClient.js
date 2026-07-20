@@ -215,22 +215,32 @@ async function requestLlmText(text, config, externalSignal) {
     }
 
     try {
+        const messages = [];
+        if (typeof config.systemPrompt === "string" && config.systemPrompt.trim()) {
+            messages.push({
+                role: "system",
+                content: config.systemPrompt.trim()
+            });
+        }
+        messages.push({
+            role: "user",
+            content: text
+        });
+        const requestBody = {
+            model: config.model,
+            messages,
+            stream: false
+        };
+        if (config.jsonMode === true) {
+            requestBody.response_format = { type: "json_object" };
+        }
         const upstreamResponse = await fetch(endpoint, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
                 Authorization: `Bearer ${config.apiKey}`
             },
-            body: JSON.stringify({
-                model: config.model,
-                messages: [
-                    {
-                        role: "user",
-                        content: text
-                    }
-                ],
-                stream: false
-            }),
+            body: JSON.stringify(requestBody),
             signal: controller.signal
         });
         const responseBody = await upstreamResponse.text();

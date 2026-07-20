@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "radar_protocol.h"
+#include "radar_spatial_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,6 +50,9 @@ typedef struct {
     char room_id[RADAR_REGISTRY_ROOM_ID_LEN];
     bool source_online;
     radar_snapshot_t snapshot;
+    /* A target array remains a motion-track transport value.  Business person
+     * counts live here so retained continuity never needs a fake target. */
+    radar_count_summary_t count_summary;
     uint32_t sequence;
     uint64_t source_uptime_ms;
     uint32_t session_generation;
@@ -85,10 +89,12 @@ void radar_registry_get_home_presence(radar_home_presence_t *out);
 radar_registry_update_result_t radar_registry_update_remote(
     radar_source_id_t source,
     const radar_protocol_payload_t *payload,
+    const radar_count_summary_t *count_summary,
     uint32_t session_generation,
     uint64_t received_at_ms,
     bool *out_state_changed);
 bool radar_registry_update_local(const radar_snapshot_t *snapshot,
+                                 const radar_count_summary_t *count_summary,
                                  const radar_registry_local_diagnostics_t *service_diagnostics,
                                  uint64_t received_at_ms,
                                  bool *out_state_changed);

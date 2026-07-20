@@ -38,6 +38,7 @@ static const char *TAG = "wake_prompt_s3";
 #define WAKE_PROMPT_META_PATH "/spiffs/s3_wake_prompt.json"
 #define WAKE_PROMPT_CONFIG_ENDPOINT "/api/voice/prompt/config"
 #define WAKE_PROMPT_PCM_ENDPOINT "/api/voice/prompt?prompt_key=wake_ack_zh"
+#define WAKE_PROMPT_PCM_TEXT_ENDPOINT "/api/voice/prompt"
 #define WAKE_PROMPT_CONTENT_TYPE ESP111_PROTOCOL_AUDIO_CONTENT_TYPE_L16_16K_MONO
 #define WAKE_PROMPT_AUDIO_FORMAT ESP111_PROTOCOL_AUDIO_FORMAT_PCM_S16LE_MONO_16K
 #define WAKE_PROMPT_SAMPLE_RATE 16000
@@ -49,7 +50,10 @@ static const char *TAG = "wake_prompt_s3";
 #define WAKE_PROMPT_DOWNLOAD_TOTAL_TIMEOUT_MS 20000
 #define WAKE_PROMPT_READ_BYTES 1024U
 #define WAKE_PROMPT_HEADER_BYTES 128U
-#define WAKE_PROMPT_URL_BYTES 320U
+#define WAKE_PROMPT_URL_BYTES 768U
+#define WAKE_PROMPT_SERVER_ENDPOINT_BYTES 384U
+#define WAKE_PROMPT_QUERY_BYTES 384U
+#define WAKE_PROMPT_TEXT_BYTES (ESP111_PROTOCOL_WAKE_PROMPT_MAX_TEXT_BYTES + 1U)
 #define WAKE_PROMPT_CONFIG_BODY_BYTES 2048U
 
 typedef struct {
@@ -104,6 +108,137 @@ static bool wake_prompt_streq_ci(const char *lhs, const char *rhs)
         rhs++;
     }
     return *lhs == '\0' && *rhs == '\0';
+}
+
+static bool wake_prompt_text_valid(const char *prompt_text)
+{
+    if (prompt_text == NULL || prompt_text[0] == '\0' ||
+        strlen(prompt_text) > ESP111_PROTOCOL_WAKE_PROMPT_MAX_TEXT_BYTES) {
+        return false;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)prompt_text;
+         *cursor != '\0'; cursor++) {
+        if (*cursor < 0x20U || *cursor == 0x7FU) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int wake_prompt_hex_value(char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return ch - 'a' + 10;
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return ch - 'A' + 10;
+    }
+    return -1;
+}
+
+static esp_err_t wake_prompt_url_decode(const char *encoded, char *out, size_t out_size)
+{
+    if (encoded == NULL || out == NULL || out_size == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t written = 0U;
+    for (size_t index = 0U; encoded[index] != '\0'; index++) {
+        unsigned char value = (unsigned char)encoded[index];
+        if (value == '%') {
+            if (encoded[index + 1U] == '\0' || encoded[index + 2U] == '\0') {
+                return ESP_ERR_INVALID_ARG;
+            }
+            int high = wake_prompt_hex_value(encoded[index + 1U]);
+            int low = wake_prompt_hex_value(encoded[index + 2U]);
+            if (high < 0 || low < 0) {
+                return ESP_ERR_INVALID_ARG;
+            }
+            value = (unsigned char)((high << 4) | low);
+            index += 2U;
+        } else if (value == '+') {
+            value = ' ';
+        }
+        if (value == '\0' || written + 1U >= out_size) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        out[written++] = (char)value;
+    }
+    out[written] = '\0';
+    return wake_prompt_text_valid(out) ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
+
+static esp_err_t wake_prompt_url_encode(const char *prompt_text, char *out, size_t out_size)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    if (!wake_prompt_text_valid(prompt_text) || out == NULL || out_size == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t written = 0U;
+    for (const unsigned char *cursor = (const unsigned char *)prompt_text;
+         *cursor != '\0'; cursor++) {
+        const bool safe = ((*cursor >= 'a' && *cursor <= 'z') ||
+                           (*cursor >= 'A' && *cursor <= 'Z') ||
+                           (*cursor >= '0' && *cursor <= '9') ||
+                           *cursor == '-' || *cursor == '_' ||
+                           *cursor == '.' || *cursor == '~');
+        if (safe) {
+            if (written + 1U >= out_size) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            out[written++] = (char)*cursor;
+        } else {
+            if (written + 3U >= out_size) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            out[written++] = '%';
+            out[written++] = hex[*cursor >> 4U];
+            out[written++] = hex[*cursor & 0x0FU];
+        }
+    }
+    out[written] = '\0';
+    return ESP_OK;
+}
+
+static esp_err_t wake_prompt_read_requested_text(httpd_req_t *req,
+                                                 char *out,
+                                                 size_t out_size,
+                                                 bool *out_present)
+{
+    if (req == NULL || out == NULL || out_size == 0U || out_present == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out[0] = '\0';
+    *out_present = false;
+
+    const size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len == 0U) {
+        return ESP_OK;
+    }
+    if (query_len >= WAKE_PROMPT_QUERY_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char query[WAKE_PROMPT_QUERY_BYTES];
+    esp_err_t ret = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    char encoded[WAKE_PROMPT_QUERY_BYTES];
+    ret = httpd_query_key_value(query,
+                                ESP111_PROTOCOL_WAKE_PROMPT_QUERY_KEY,
+                                encoded,
+                                sizeof(encoded));
+    if (ret == ESP_ERR_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    *out_present = true;
+    return wake_prompt_url_decode(encoded, out, out_size);
 }
 
 static esp_err_t wake_prompt_build_url(const char *endpoint, char *out, size_t out_size)
@@ -457,15 +592,44 @@ static esp_err_t wake_prompt_http_event(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static esp_err_t wake_prompt_download_pcm(const wake_prompt_metadata_t *remote)
+static esp_err_t wake_prompt_download_pcm(wake_prompt_metadata_t *remote,
+                                          const char *requested_text)
 {
+    if (remote == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (requested_text != NULL && !wake_prompt_text_valid(requested_text)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (!gateway_wifi_is_net_ready() || !gateway_wifi_is_sta_connected() ||
         !s3_scheduler_is_server_upload_allowed()) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    char endpoint[WAKE_PROMPT_SERVER_ENDPOINT_BYTES];
+    const char *server_endpoint = WAKE_PROMPT_PCM_ENDPOINT;
+    if (requested_text != NULL) {
+        char encoded[WAKE_PROMPT_QUERY_BYTES];
+        esp_err_t encode_ret = wake_prompt_url_encode(requested_text,
+                                                      encoded,
+                                                      sizeof(encoded));
+        if (encode_ret != ESP_OK) {
+            return encode_ret;
+        }
+        int endpoint_len = snprintf(endpoint,
+                                    sizeof(endpoint),
+                                    "%s?%s=%s",
+                                    WAKE_PROMPT_PCM_TEXT_ENDPOINT,
+                                    ESP111_PROTOCOL_WAKE_PROMPT_QUERY_KEY,
+                                    encoded);
+        if (endpoint_len <= 0 || endpoint_len >= (int)sizeof(endpoint)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        server_endpoint = endpoint;
+    }
+
     char url[WAKE_PROMPT_URL_BYTES];
-    esp_err_t ret = wake_prompt_build_url(WAKE_PROMPT_PCM_ENDPOINT, url, sizeof(url));
+    esp_err_t ret = wake_prompt_build_url(server_endpoint, url, sizeof(url));
     if (ret != ESP_OK) {
         return ret;
     }
@@ -505,9 +669,19 @@ static esp_err_t wake_prompt_download_pcm(const wake_prompt_metadata_t *remote)
         if (strcmp(http_ctx.audio_format, WAKE_PROMPT_AUDIO_FORMAT) != 0 ||
             strcmp(http_ctx.sample_rate, "16000") != 0 ||
             strcmp(http_ctx.channels, "1") != 0 ||
-            strcmp(http_ctx.voice_config_hash, remote->voice_config_hash) != 0 ||
-            strcmp(http_ctx.prompt_version, remote->prompt_version) != 0) {
+            http_ctx.voice_config_hash[0] == '\0' ||
+            http_ctx.prompt_version[0] == '\0' ||
+            (requested_text == NULL &&
+             (strcmp(http_ctx.voice_config_hash, remote->voice_config_hash) != 0 ||
+              strcmp(http_ctx.prompt_version, remote->prompt_version) != 0))) {
             ret = ESP_ERR_INVALID_RESPONSE;
+        } else if (requested_text != NULL) {
+            strlcpy(remote->voice_config_hash,
+                    http_ctx.voice_config_hash,
+                    sizeof(remote->voice_config_hash));
+            strlcpy(remote->prompt_version,
+                    http_ctx.prompt_version,
+                    sizeof(remote->prompt_version));
         }
     }
     if (ret == ESP_OK) {
@@ -583,28 +757,50 @@ static esp_err_t wake_prompt_download_pcm(const wake_prompt_metadata_t *remote)
     return ret;
 }
 
-static esp_err_t wake_prompt_ensure_cached_locked(wake_prompt_metadata_t *out_meta)
+static esp_err_t wake_prompt_ensure_cached_locked(wake_prompt_metadata_t *out_meta,
+                                                  const char *requested_text)
 {
     wake_prompt_metadata_t remote = {0};
     esp_err_t ret = wake_prompt_read_config(&remote);
     if (ret != ESP_OK) {
         return ret;
     }
+    if (requested_text != NULL) {
+        if (!wake_prompt_text_valid(requested_text)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        strlcpy(remote.wake_prompt_text,
+                requested_text,
+                sizeof(remote.wake_prompt_text));
+    }
 
     struct stat pcm_stat = {0};
     wake_prompt_metadata_t local = {0};
-    if (stat(WAKE_PROMPT_PCM_PATH, &pcm_stat) == 0 &&
+    const bool local_file_valid = stat(WAKE_PROMPT_PCM_PATH, &pcm_stat) == 0 &&
         pcm_stat.st_size > 0 &&
         (size_t)pcm_stat.st_size <= WAKE_PROMPT_MAX_PCM_BYTES &&
-        wake_prompt_read_local_meta(&local) == ESP_OK &&
-        wake_prompt_meta_matches(&local, &remote, (size_t)pcm_stat.st_size)) {
+        wake_prompt_read_local_meta(&local) == ESP_OK;
+    bool local_matches = false;
+    if (local_file_valid) {
+        if (requested_text == NULL) {
+            local_matches = wake_prompt_meta_matches(&local,
+                                                     &remote,
+                                                     (size_t)pcm_stat.st_size);
+        } else {
+            local_matches = strcmp(local.wake_prompt_text, requested_text) == 0 &&
+                            local.updated_at_ms == remote.updated_at_ms &&
+                            local.voice_config_hash[0] != '\0' &&
+                            local.prompt_version[0] != '\0';
+        }
+    }
+    if (local_matches) {
         if (out_meta != NULL) {
             *out_meta = local;
         }
         return ESP_OK;
     }
 
-    ret = wake_prompt_download_pcm(&remote);
+    ret = wake_prompt_download_pcm(&remote, requested_text);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -631,7 +827,19 @@ esp_err_t wake_prompt_cache_gateway_handle_http(httpd_req_t *req)
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = wake_prompt_with_mount();
+    char requested_text[WAKE_PROMPT_TEXT_BYTES];
+    bool has_requested_text = false;
+    esp_err_t ret = wake_prompt_read_requested_text(req,
+                                                    requested_text,
+                                                    sizeof(requested_text),
+                                                    &has_requested_text);
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"wake_prompt_text_invalid\"}");
+    }
+
+    ret = wake_prompt_with_mount();
     if (ret != ESP_OK) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"wake_prompt_storage_unavailable\"}");
@@ -639,7 +847,8 @@ esp_err_t wake_prompt_cache_gateway_handle_http(httpd_req_t *req)
 
     wake_prompt_metadata_t meta = {0};
     xSemaphoreTake(s_cache_lock, portMAX_DELAY);
-    ret = wake_prompt_ensure_cached_locked(&meta);
+    ret = wake_prompt_ensure_cached_locked(&meta,
+                                           has_requested_text ? requested_text : NULL);
     xSemaphoreGive(s_cache_lock);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "wake prompt cache unavailable ret=%s", esp_err_to_name(ret));

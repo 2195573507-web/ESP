@@ -4,9 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -31,6 +33,7 @@ static radar_presence_t s_presence;
 static radar_uart_recovery_t s_recovery;
 static radar_frame_t s_latest_frame;
 static TaskHandle_t s_rx_task;
+static bool s_rx_task_with_caps;
 static bool s_initialized;
 static bool s_uart_healthy;
 static bool s_config_active;
@@ -425,14 +428,27 @@ esp_err_t radar_service_start(void)
         xSemaphoreGive(s_lock);
     }
 
-    BaseType_t created = xTaskCreate(radar_rx_task,
-                                     "radar_rx",
-                                     RADAR_CONFIG_UART_RX_TASK_STACK,
-                                     NULL,
-                                     RADAR_CONFIG_UART_RX_TASK_PRIORITY,
-                                     &s_rx_task);
+    s_rx_task_with_caps = true;
+    BaseType_t created = xTaskCreateWithCaps(radar_rx_task,
+                                             "radar_rx",
+                                             RADAR_CONFIG_UART_RX_TASK_STACK,
+                                             NULL,
+                                             RADAR_CONFIG_UART_RX_TASK_PRIORITY,
+                                             &s_rx_task,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (created != pdPASS) {
+        ESP_LOGW(TAG, "PSRAM task stack allocation failed; falling back to internal RAM");
+        s_rx_task_with_caps = false;
+        created = xTaskCreate(radar_rx_task,
+                              "radar_rx",
+                              RADAR_CONFIG_UART_RX_TASK_STACK,
+                              NULL,
+                              RADAR_CONFIG_UART_RX_TASK_PRIORITY,
+                              &s_rx_task);
+    }
     if (created != pdPASS) {
         s_rx_task = NULL;
+        s_rx_task_with_caps = false;
         (void)ld2450_uart_deinit();
         return ESP_ERR_NO_MEM;
     }
@@ -446,6 +462,50 @@ esp_err_t radar_service_start(void)
              (int)ret,
              RADAR_CONFIG_UART_RX_RING_BYTES);
     return ret == ESP_OK ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t radar_service_stop(void)
+{
+    const bool parser_locked =
+        s_parser_lock != NULL && xSemaphoreTake(s_parser_lock, portMAX_DELAY) == pdTRUE;
+    const bool state_locked =
+        s_lock != NULL && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE;
+    const bool rx_buffer_locked =
+        s_rx_buffer_lock != NULL &&
+        xSemaphoreTake(s_rx_buffer_lock, portMAX_DELAY) == pdTRUE;
+
+    TaskHandle_t task = s_rx_task;
+    const bool task_with_caps = s_rx_task_with_caps;
+    s_rx_task = NULL;
+    s_rx_task_with_caps = false;
+    if (task != NULL) {
+        if (task_with_caps) {
+            vTaskDeleteWithCaps(task);
+        } else {
+            vTaskDelete(task);
+        }
+    }
+
+    const esp_err_t ret = ld2450_uart_deinit();
+    if (state_locked) {
+        s_uart_healthy = false;
+        s_config_active = false;
+        s_uart_stop_applied = true;
+    }
+    if (rx_buffer_locked) {
+        s_pending_rx_length = 0U;
+    }
+
+    if (rx_buffer_locked) {
+        xSemaphoreGive(s_rx_buffer_lock);
+    }
+    if (state_locked) {
+        xSemaphoreGive(s_lock);
+    }
+    if (parser_locked) {
+        xSemaphoreGive(s_parser_lock);
+    }
+    return ret;
 }
 
 bool radar_service_get_latest_frame(radar_frame_t *out)

@@ -138,6 +138,10 @@ struct RadarStateStore {
         state.freshnessState = .fresh
         state.online = patch.online ?? true
         if let targetCount = patch.targetCount { state.targetCount = targetCount }
+        if let visibleTrackCount = patch.visibleTrackCount {
+            state.visibleTrackCount = visibleTrackCount
+            state.targetCount = visibleTrackCount
+        }
         if let presenceState = patch.presenceState { state.presenceState = presenceState }
         if let motionState = patch.motionState { state.motionState = motionState }
         if let spatialState = patch.spatialState { state.spatialState = spatialState }
@@ -150,6 +154,43 @@ struct RadarStateStore {
         if let deviceID = patch.deviceID, !deviceID.isEmpty { state.deviceId = deviceID }
         if let sensorState = patch.sensorState { state.sensorState = sensorState }
         if let occupancyState = patch.occupancyState { state.occupancyState = occupancyState }
+        if let rawTargetCount = patch.rawTargetCount {
+            state.rawTargetCount = rawTargetCount
+            state.hasExplicitCountSummary = true
+        }
+        if let acceptedTargetCount = patch.acceptedTargetCount {
+            state.acceptedTargetCount = acceptedTargetCount
+            state.hasExplicitCountSummary = true
+        }
+        if let visibleTrackCount = patch.visibleTrackCount {
+            state.visibleTrackCount = visibleTrackCount
+            state.targetCount = visibleTrackCount
+            state.hasExplicitCountSummary = true
+        }
+        if let confirmedActiveTrackCount = patch.confirmedActiveTrackCount {
+            state.confirmedActiveTrackCount = confirmedActiveTrackCount
+            state.hasExplicitCountSummary = true
+        }
+        if let historyTargetCount = patch.historyTargetCount {
+            state.historyTargetCount = historyTargetCount
+            state.hasExplicitCountSummary = true
+        }
+        if let visiblePersonCount = patch.visiblePersonCount {
+            state.visiblePersonCount = visiblePersonCount
+            state.hasExplicitCountSummary = true
+        }
+        if let retainedPersonCount = patch.retainedPersonCount {
+            state.retainedPersonCount = retainedPersonCount
+            state.hasExplicitCountSummary = true
+        }
+        if let businessPersonCount = patch.businessPersonCount {
+            state.businessPersonCount = businessPersonCount
+            state.hasExplicitCountSummary = true
+        }
+        if let countState = patch.countState {
+            state.countState = countState.uppercased()
+            state.hasExplicitCountSummary = true
+        }
         if let parserErrors = patch.parserErrors { state.parseErrorCount = max(state.parseErrorCount, parserErrors) }
         if let sequenceRejects = patch.sequenceRejects { state.sequenceRejectCount = max(state.sequenceRejectCount, sequenceRejects) }
         if let identityMismatches = patch.identityMismatches { state.identityMismatchCount = max(state.identityMismatchCount, identityMismatches) }
@@ -205,6 +246,7 @@ struct RadarStateStore {
                                                       lastSeenMs: Int64(stale.lastSeenTime.timeIntervalSince1970 * 1_000))
             state.targetCount = state.filteredTargets.filter(\.isVisible).count
             state.stableTargetCount = state.targetCount
+            applyTrackOnlyCountFallback(to: &state)
             return
         }
 
@@ -236,6 +278,7 @@ struct RadarStateStore {
         state.targetDisappearanceMilliseconds[accepted.trackID] = eventTime
         state.targetCount = state.filteredTargets.filter(\.isVisible).count
         state.stableTargetCount = state.targetCount
+        applyTrackOnlyCountFallback(to: &state)
         state.lastValidTargets = state.filteredTargets
         if state.targetCount > 0 && state.presenceState == .unknown {
             state.presenceState = accepted.speedCentimetersPerSecond == 0 ? .hold : .motion
@@ -252,5 +295,17 @@ struct RadarStateStore {
             targets.append(target)
             targets.sort { $0.trackID < $1.trackID }
         }
+    }
+
+    private func applyTrackOnlyCountFallback(to state: inout RadarRoomState) {
+        guard !state.hasExplicitCountSummary else { return }
+
+        // A legacy track line has no person-continuity evidence.  Keep the
+        // visual track metric useful without inventing person observations.
+        state.visibleTrackCount = state.targetCount
+        state.visiblePersonCount = 0
+        state.retainedPersonCount = 0
+        state.businessPersonCount = 0
+        state.countState = "UNKNOWN"
     }
 }

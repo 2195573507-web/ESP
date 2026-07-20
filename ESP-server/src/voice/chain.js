@@ -5,6 +5,13 @@ const {
     buildLlmPrompt
 } = require("../services/llmPromptContextService");
 const {
+    buildProfilePrompt,
+    getPromptProfile
+} = require("../homeAi/promptProfiles");
+const {
+    requestHomeAiVoiceDecision
+} = require("../homeAi/voiceAgentService");
+const {
     maskLogValue,
     maskUrlForLog,
     normalizeLogPreview
@@ -145,13 +152,20 @@ async function requestVoiceTurnLlm(asrText, config, signal, options = {}) {
                 mode: "voice"
             })
             : { prompt: asrText };
-        return await requestLlmText(promptResult.prompt, {
+        const profileName = options.profile || "conversation";
+        const profile = getPromptProfile(profileName);
+        const prompt = profile
+            ? buildProfilePrompt(profileName, asrText, promptResult.prompt)
+            : promptResult.prompt;
+        return await requestLlmText(prompt, {
             apiKey: config.apiKey,
             endpoint: config.chat.endpoint,
             baseUrl: config.chat.baseUrl,
             chatPath: config.chat.path,
             model: config.chat.model,
-            timeoutMs: readVoiceLlmTimeoutMs()
+            timeoutMs: readVoiceLlmTimeoutMs(),
+            systemPrompt: profile?.system_prompt || "",
+            jsonMode: false
         }, signal);
     } catch (error) {
         throw createVoiceStageError("llm", "VOICE_LLM_FAILED", error?.message || "LLM request failed", 502, {
@@ -431,18 +445,33 @@ async function runVoiceTurnTextStages(audioBuffer, deviceId, voiceConfig, gatewa
     );
 
     stageStartedAt = Date.now();
-    const llmResult = await requestVoiceTurnLlm(asrResult.text, gatewayConfig, signal, {
+    const agentResult = await requestHomeAiVoiceDecision(asrResult.text, gatewayConfig, signal, {
+        dbRun: options.dbRun,
         dbAll: options.dbAll,
-        deviceId
+        deviceId,
+        traceId: options.traceId
     });
+    const llmResult = agentResult.handled
+        ? { text: agentResult.text, model: agentResult.model || "" }
+        : await requestVoiceTurnLlm(asrResult.text, gatewayConfig, signal, {
+            dbAll: options.dbAll,
+            deviceId,
+            profile: "conversation"
+        });
     metrics.llmMs = Date.now() - stageStartedAt;
     metrics.llmReplyLength = llmResult.text.length;
+    metrics.agentProfile = agentResult.profile || "conversation";
+    metrics.agentDecisionId = agentResult.decision_id || "";
+    metrics.agentDecisionStatus = agentResult.decision_status || "";
     logger.log(
         `[voice-turn] llm_success device_id=${maskLogValue(deviceId)} asr_text_length=${metrics.asrTextLength} llm_reply_length=${metrics.llmReplyLength} elapsed_ms=${metrics.llmMs}`
     );
 
     return {
-        llmText: llmResult.text
+        llmText: llmResult.text,
+        agentProfile: metrics.agentProfile,
+        agentDecisionId: metrics.agentDecisionId,
+        agentDecisionStatus: metrics.agentDecisionStatus
     };
 }
 
@@ -472,6 +501,9 @@ async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConf
         asrTextLength: metrics.asrTextLength,
         asrTextPreview: metrics.asrTextPreview,
         llmReplyLength: metrics.llmReplyLength,
+        agentProfile: stages.agentProfile,
+        agentDecisionId: stages.agentDecisionId,
+        agentDecisionStatus: stages.agentDecisionStatus,
         ttsPcmBytes: metrics.ttsPcmBytes,
         pcm: ttsResult.pcm
     };
@@ -507,6 +539,9 @@ async function runVoiceTurnStreamingChain(audioBuffer, deviceId, voiceConfig, ga
         asrTextLength: metrics.asrTextLength,
         asrTextPreview: metrics.asrTextPreview,
         llmReplyLength: metrics.llmReplyLength,
+        agentProfile: stages.agentProfile,
+        agentDecisionId: stages.agentDecisionId,
+        agentDecisionStatus: stages.agentDecisionStatus,
         ttsStartedAt,
         ttsStream
     };
@@ -514,6 +549,7 @@ async function runVoiceTurnStreamingChain(audioBuffer, deviceId, voiceConfig, ga
 
 module.exports = {
     requestVoiceAsr,
+    requestVoiceTurnLlm,
     requestVoiceTts,
     runVoiceTurnChain,
     runVoiceTurnStreamingChain

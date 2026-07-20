@@ -58,6 +58,9 @@ typedef void (*s3_event_bus_release_fn_t)(struct s3_scheduler_event *event);
 /** @brief 初始化锁、信号量和事件释放回调；scheduler init 阶段调用。 */
 esp_err_t s3_event_bus_init(s3_event_bus_release_fn_t release_fn);
 
+/** @brief 释放 event bus 内部控制对象；仅在 worker 尚未运行时用于初始化回滚。 */
+void s3_event_bus_deinit(void);
+
 /** @brief 清空所有队列和 STATE 槽位；测试或 runtime reset 时调用。 */
 void s3_event_bus_reset(void);
 

@@ -6,14 +6,18 @@
 #include "network_replay_worker.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "bme_cache_manager.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "gateway_config.h"
 #include "gateway_event_reporter.h"
+#include "home_ai_history_store.h"
 #include "network_worker.h"
 #include "offline_policy.h"
 #include "resource_manager.h"
@@ -23,7 +27,7 @@
 static const char *TAG = "network_replay_worker";
 
 #ifndef NETWORK_REPLAY_WORKER_TASK_STACK
-#define NETWORK_REPLAY_WORKER_TASK_STACK 8192U
+#define NETWORK_REPLAY_WORKER_TASK_STACK 16384U
 #endif
 
 #ifndef NETWORK_REPLAY_WORKER_TASK_PRIORITY
@@ -46,7 +50,117 @@ static const char *TAG = "network_replay_worker";
 #define NETWORK_REPLAY_PROGRESS_LOG_EVERY 10U
 #endif
 
+#define NETWORK_REPLAY_HOME_AI_BODY_BYTES 1600U
+#define NETWORK_REPLAY_HOME_AI_FLUSH_BATCH 4U
+
 static TaskHandle_t s_replay_task;
+
+static bool json_escape(const char *input, char *out, size_t out_size)
+{
+    if (input == NULL || out == NULL || out_size == 0U) return false;
+    size_t used = 0U;
+    for (size_t index = 0U; input[index] != '\0'; ++index) {
+        const unsigned char value = (unsigned char)input[index];
+        const char *escape = NULL;
+        char escaped[7] = {0};
+        if (value == '"') escape = "\\\"";
+        else if (value == '\\') escape = "\\\\";
+        else if (value == '\n') escape = "\\n";
+        else if (value == '\r') escape = "\\r";
+        else if (value == '\t') escape = "\\t";
+        else if (value < 0x20U) {
+            (void)snprintf(escaped, sizeof(escaped), "\\u%04x", (unsigned int)value);
+            escape = escaped;
+        }
+        if (escape != NULL) {
+            const size_t length = strlen(escape);
+            if (used + length + 1U > out_size) return false;
+            memcpy(out + used, escape, length);
+            used += length;
+        } else {
+            if (used + 2U > out_size) return false;
+            out[used++] = (char)value;
+        }
+    }
+    out[used] = '\0';
+    return true;
+}
+
+static bool build_home_ai_replay_json(const home_ai_history_event_t *event,
+                                      char *out,
+                                      size_t out_size)
+{
+    if (event == NULL || out == NULL || out_size == 0U ||
+        event->payload_len == 0U || event->payload[0] != '{') return false;
+    char event_id[HOME_AI_HISTORY_EVENT_ID_LEN * 2U];
+    char room_id[HOME_AI_HISTORY_ROOM_ID_LEN * 2U];
+    char event_type[HOME_AI_HISTORY_EVENT_TYPE_LEN * 2U];
+    char gateway_id[128];
+    if (!json_escape(event->event_id, event_id, sizeof(event_id)) ||
+        !json_escape(event->room_id, room_id, sizeof(room_id)) ||
+        !json_escape(event->event_type, event_type, sizeof(event_type)) ||
+        !json_escape(gateway_config_get()->gateway_id, gateway_id, sizeof(gateway_id))) return false;
+    const int written = snprintf(
+        out,
+        out_size,
+        "{\"gateway_id\":\"%s\",\"events\":[{\"event_id\":\"%s\","
+        "\"event_type\":\"%s\",\"room_id\":\"%s\",\"priority\":%u,"
+        "\"occurred_at_ms\":%llu,\"source_device_id\":\"%s\","
+        "\"sequence_no\":%lu,\"schema_version\":1,\"payload\":%s}]}",
+        gateway_id,
+        event_id,
+        event_type,
+        room_id,
+        (unsigned int)event->priority,
+        (unsigned long long)event->occurred_at_ms,
+        gateway_id,
+        (unsigned long)event->sequence,
+        event->payload);
+    return written > 0 && written < (int)out_size;
+}
+
+static bool replay_one_home_ai_event(void)
+{
+    home_ai_history_event_t event = {0};
+    esp_err_t ret = home_ai_history_peek_unuploaded(&event);
+    if (ret == ESP_ERR_NOT_FOUND) return false;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "HOME_AI_REPLAY status=peek_failed ret=%s", esp_err_to_name(ret));
+        return true;
+    }
+    char request[NETWORK_REPLAY_HOME_AI_BODY_BYTES];
+    if (!build_home_ai_replay_json(&event, request, sizeof(request))) {
+        ESP_LOGW(TAG,
+                 "HOME_AI_REPLAY status=encode_failed seq=%lu event=%s",
+                 (unsigned long)event.sequence,
+                 event.event_id);
+        return true;
+    }
+    char response[SERVER_CLIENT_SMALL_BODY_BYTES];
+    int status = 0;
+    ret = server_client_post_home_ai_history_replay(request,
+                                                    response,
+                                                    sizeof(response),
+                                                    &status);
+    const bool ok = ret == ESP_OK && status >= 200 && status < 300;
+    offline_policy_record_server_result(ret, status);
+    gateway_event_reporter_record_server_state(ok);
+    if (ok) {
+        esp_err_t mark_ret = home_ai_history_mark_uploaded(event.sequence);
+        ESP_LOGI(TAG,
+                 "HOME_AI_REPLAY status=uploaded seq=%lu remaining=%u mark_ret=%s",
+                 (unsigned long)event.sequence,
+                 (unsigned int)home_ai_history_pending_count(),
+                 esp_err_to_name(mark_ret));
+    } else {
+        ESP_LOGW(TAG,
+                 "HOME_AI_REPLAY status=upload_failed seq=%lu http_status=%d ret=%s",
+                 (unsigned long)event.sequence,
+                 status,
+                 esp_err_to_name(ret));
+    }
+    return true;
+}
 
 typedef struct {
     const char *device_id;
@@ -120,13 +234,16 @@ static void replay_worker_task(void *arg)
 {
     (void)arg;
     bool replay_active = false;
+    bool prefer_home_ai = true;
     uint32_t replayed_in_run = 0U;
 
     ESP_LOGI(TAG,
-             "network replay worker started rate_limit=10/s cache_capacity=%u",
-             (unsigned int)BME_CACHE_MANAGER_CAPACITY);
+             "network replay worker started rate_limit=10/s cache_capacity=%u task_stack_internal=%u",
+             (unsigned int)BME_CACHE_MANAGER_CAPACITY,
+             (unsigned int)NETWORK_REPLAY_WORKER_TASK_STACK);
 
     while (1) {
+        (void)home_ai_history_flush(NETWORK_REPLAY_HOME_AI_FLUSH_BATCH);
         if (!link_stable()) {
             if (replay_active) {
                 ESP_LOGI(TAG,
@@ -139,6 +256,13 @@ static void replay_worker_task(void *arg)
             (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(NETWORK_REPLAY_WORKER_IDLE_MS));
             continue;
         }
+
+        if (prefer_home_ai && replay_one_home_ai_event()) {
+            prefer_home_ai = false;
+            vTaskDelay(pdMS_TO_TICKS(NETWORK_REPLAY_WORKER_RATE_DELAY_MS));
+            continue;
+        }
+        prefer_home_ai = true;
 
         bme_cache_record_t record = {0};
         esp_err_t ret = peek_oldest_live_record(&record);
@@ -255,12 +379,13 @@ esp_err_t network_replay_worker_init(void)
         return ESP_OK;
     }
 
-    BaseType_t created = xTaskCreate(replay_worker_task,
-                                     "bme_replay_worker",
-                                     NETWORK_REPLAY_WORKER_TASK_STACK,
-                                     NULL,
-                                     NETWORK_REPLAY_WORKER_TASK_PRIORITY,
-                                     &s_replay_task);
+    BaseType_t created = xTaskCreateWithCaps(replay_worker_task,
+                                             "bme_replay_worker",
+                                             NETWORK_REPLAY_WORKER_TASK_STACK,
+                                             NULL,
+                                             NETWORK_REPLAY_WORKER_TASK_PRIORITY,
+                                             &s_replay_task,
+                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         s_replay_task = NULL;
         return ESP_ERR_NO_MEM;
@@ -269,6 +394,13 @@ esp_err_t network_replay_worker_init(void)
 }
 
 void network_replay_worker_request_bme_replay(void)
+{
+    if (s_replay_task != NULL) {
+        xTaskNotifyGive(s_replay_task);
+    }
+}
+
+void network_replay_worker_request_home_ai_replay(void)
 {
     if (s_replay_task != NULL) {
         xTaskNotifyGive(s_replay_task);

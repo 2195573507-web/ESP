@@ -85,6 +85,33 @@ static inline UBaseType_t app_stack_monitor_log(const char *tag,
     return high_water;
 }
 
+static inline void app_stack_monitor_report(const char *tag,
+                                            const char *task_name,
+                                            size_t configured_stack_bytes,
+                                            const char *stage)
+{
+    const UBaseType_t high_water = app_stack_monitor_high_water();
+    ESP_LOGI(app_stack_monitor_safe_text(tag),
+             "TASK_STACK_REPORT task=%s stack_bytes=%u high_water_bytes=%u stage=%s",
+             app_stack_monitor_safe_text(task_name),
+             (unsigned int)configured_stack_bytes,
+             (unsigned int)high_water,
+             app_stack_monitor_safe_text(stage));
+}
+
+static inline void app_startup_memory_check(const char *tag,
+                                            const char *module,
+                                            const char *stage)
+{
+    ESP_LOGI(app_stack_monitor_safe_text(tag),
+             "STARTUP_MEMORY_CHECK module=%s internal_free=%u internal_largest=%u psram_free=%u stage=%s",
+             app_stack_monitor_safe_text(module),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             app_stack_monitor_safe_text(stage));
+}
+
 static inline UBaseType_t app_stack_monitor_log_periodic(const char *tag,
                                                          const char *task_name,
                                                          int64_t *last_log_ms,
@@ -112,19 +139,35 @@ static inline void app_heap_monitor_log(const char *tag)
     const size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     const size_t largest_bytes = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     const size_t minimum_bytes = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    const size_t internal_free_bytes =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_largest_bytes =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_minimum_bytes =
+        heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t psram_free_bytes =
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     ESP_LOGI(safe_tag,
-             "HEAP_MONITOR free=%u largest=%u min=%u",
+             "HEAP_MONITOR free=%u largest=%u min=%u internal_free=%u internal_largest=%u internal_min=%u psram_free=%u",
              (unsigned int)free_bytes,
              (unsigned int)largest_bytes,
-             (unsigned int)minimum_bytes);
-    if (free_bytes < APP_HEAP_LOW_FREE_WARNING_BYTES ||
-        largest_bytes < APP_HEAP_LOW_LARGEST_WARNING_BYTES) {
+             (unsigned int)minimum_bytes,
+             (unsigned int)internal_free_bytes,
+             (unsigned int)internal_largest_bytes,
+             (unsigned int)internal_minimum_bytes,
+             (unsigned int)psram_free_bytes);
+    if (internal_free_bytes < APP_HEAP_LOW_FREE_WARNING_BYTES ||
+        internal_largest_bytes < APP_HEAP_LOW_LARGEST_WARNING_BYTES) {
         ESP_LOGW(safe_tag,
-                 "HEAP_MONITOR free=%u largest=%u min=%u warning=low_or_fragmented_heap threshold_free=%u threshold_largest=%u",
+                 "HEAP_MONITOR free=%u largest=%u min=%u internal_free=%u internal_largest=%u internal_min=%u psram_free=%u warning=low_or_fragmented_internal_heap threshold_free=%u threshold_largest=%u",
                  (unsigned int)free_bytes,
                  (unsigned int)largest_bytes,
                  (unsigned int)minimum_bytes,
+                 (unsigned int)internal_free_bytes,
+                 (unsigned int)internal_largest_bytes,
+                 (unsigned int)internal_minimum_bytes,
+                 (unsigned int)psram_free_bytes,
                  (unsigned int)APP_HEAP_LOW_FREE_WARNING_BYTES,
                  (unsigned int)APP_HEAP_LOW_LARGEST_WARNING_BYTES);
     }

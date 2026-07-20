@@ -157,7 +157,18 @@ static void test_source_isolation_and_freshness(void)
         .uart_online = true,
         .frame_fresh = true,
     };
-    assert(radar_registry_update_local(&local, NULL, 8000U, &changed));
+    const radar_count_summary_t local_counts = {
+        .raw_target_count = 1U,
+        .accepted_target_count = 1U,
+        .visible_track_count = 0U,
+        .confirmed_active_track_count = 1U,
+        .history_target_count = 7U,
+        .visible_person_count = 0U,
+        .retained_person_count = 1U,
+        .business_person_count = 1U,
+        .count_state = RADAR_PERSON_COUNT_ESTIMATED,
+    };
+    assert(radar_registry_update_local(&local, &local_counts, NULL, 8000U, &changed));
 
     radar_registry_note_parse_error(RADAR_SOURCE_C51);
     radar_registry_refresh(8001U);
@@ -174,6 +185,10 @@ static void test_source_isolation_and_freshness(void)
     assert(c52_entry.source_online);
     assert(local_entry.snapshot.state == RADAR_STATE_HOLD);
     assert(local_entry.source_online);
+    assert(local_entry.count_summary.business_person_count == 1U);
+    assert(local_entry.count_summary.retained_person_count == 1U);
+    assert(local_entry.count_summary.history_target_count == 7U);
+    assert(local_entry.count_summary.count_state == RADAR_PERSON_COUNT_ESTIMATED);
     assert(c51_entry.diagnostics.parse_error_count == 1U);
 }
 

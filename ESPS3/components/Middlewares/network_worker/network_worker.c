@@ -21,17 +21,21 @@
 #include "command_router.h"
 #include "device_stream_gateway.h"
 #include "esp111_protocol_common.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "gateway_config.h"
 #include "gateway_event_reporter.h"
 #include "gateway_wifi.h"
+#include "home_ai_runtime.h"
+#include "home_ai_voice_session.h"
 #include "local_http_server.h"
 #include "network_replay_worker.h"
 #include "offline_policy.h"
@@ -165,22 +169,36 @@ typedef enum {
     NETWORK_WORKER_WORK_COMMAND_PULL,
     NETWORK_WORKER_WORK_COMMAND_ACK,
     NETWORK_WORKER_WORK_SMART_HOME_POLL,
+    NETWORK_WORKER_WORK_HOME_AI_RULE_NOTIFICATION,
+    NETWORK_WORKER_WORK_HOME_AI_RULE_SYNC,
 } network_worker_work_type_t;
 
 typedef struct {
     network_worker_work_type_t work_type;
     network_worker_server_json_type_t json_type;
     char *json_body;
+    uint64_t environment_event_seq;
+    network_worker_environment_alarm_completion_fn environment_completion;
+    void *environment_completion_context;
     char device_id[CHILD_REGISTRY_DEVICE_ID_LEN];
     char command_id[48];
     char source[24];
     uint32_t bme_cache_sequence;
 } network_worker_work_item_t;
 
+typedef struct {
+    StaticQueue_t *control;
+    uint8_t *storage;
+} network_worker_queue_allocation_t;
+
 static QueueHandle_t s_event_queue;
 static QueueHandle_t s_ap_disconnect_queue;
 static QueueHandle_t s_work_queue;
 static QueueHandle_t s_command_queue;
+static network_worker_queue_allocation_t s_event_queue_allocation;
+static network_worker_queue_allocation_t s_ap_disconnect_queue_allocation;
+static network_worker_queue_allocation_t s_work_queue_allocation;
+static network_worker_queue_allocation_t s_command_queue_allocation;
 static SemaphoreHandle_t s_work_queue_mutation_lock;
 static SemaphoreHandle_t s_command_queue_mutation_lock;
 static TaskHandle_t s_worker_task;
@@ -213,7 +231,9 @@ static int64_t s_sta_scan_deadline_ms;
 static int64_t s_sta_last_scan_start_ms;
 static int64_t s_sta_disconnected_since_ms;
 static char s_sta_scan_reason[32];
-static char s_command_ack_response[SERVER_CLIENT_SMALL_BODY_BYTES];
+/* The command response is written by the command worker; keep it out of DRAM. */
+static char *s_command_ack_response;
+static volatile bool s_workers_ready;
 static bool s_local_ingest_ready;
 static bool s_local_http_start_requested;
 static bool s_local_http_running;
@@ -224,6 +244,8 @@ static int64_t s_last_server_probe_ms;
 static bool s_snapshot_upload_pending;
 static bool s_command_pull_pending;
 static bool s_smart_home_poll_pending;
+static bool s_home_ai_rule_sync_pending;
+static bool s_home_ai_rule_notification_pending;
 static bool s_server_ready;
 static uint32_t s_server_failure_count;
 static uint32_t s_server_success_count;
@@ -250,6 +272,50 @@ static void release_work_item(network_worker_work_item_t *item);
 static void drop_low_priority_upload_backlog(const char *reason);
 static esp_err_t enqueue_upload_work_item(const network_worker_work_item_t *item);
 static void snapshot_worker_task(void *arg);
+
+static bool network_worker_initialized(void)
+{
+    return s_pending_station_lock != NULL &&
+           s_work_queue_mutation_lock != NULL &&
+           s_command_queue_mutation_lock != NULL &&
+           s_event_queue != NULL &&
+           s_ap_disconnect_queue != NULL &&
+           s_work_queue != NULL &&
+           s_command_queue != NULL &&
+           s_event_queue_allocation.control != NULL &&
+           s_event_queue_allocation.storage != NULL &&
+           s_ap_disconnect_queue_allocation.control != NULL &&
+           s_ap_disconnect_queue_allocation.storage != NULL &&
+           s_work_queue_allocation.control != NULL &&
+           s_work_queue_allocation.storage != NULL &&
+           s_command_queue_allocation.control != NULL &&
+           s_command_queue_allocation.storage != NULL &&
+           s_command_ack_response != NULL &&
+           s_worker_task != NULL &&
+           s_upload_task != NULL &&
+           s_command_task != NULL &&
+           s_snapshot_task != NULL &&
+           s_workers_ready;
+}
+
+static esp_err_t network_worker_init_failed(const char *stage)
+{
+    ESP_LOGE(TAG,
+             "NETWORK_WORKER_INIT_FAIL stage=%s internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u retry=allowed",
+             stage != NULL ? stage : "unknown",
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    return ESP_ERR_NO_MEM;
+}
+
+static void network_worker_wait_until_ready(void)
+{
+    while (!s_workers_ready) {
+        vTaskDelay(1U);
+    }
+}
 
 static const uint32_t s_local_http_retry_backoff_ms[] = {
     2000U,
@@ -560,6 +626,10 @@ static const char *work_name(network_worker_work_type_t work_type)
         return "command_ack";
     case NETWORK_WORKER_WORK_SMART_HOME_POLL:
         return "smart_home_poll";
+    case NETWORK_WORKER_WORK_HOME_AI_RULE_NOTIFICATION:
+        return "home_ai_rule_notification";
+    case NETWORK_WORKER_WORK_HOME_AI_RULE_SYNC:
+        return "home_ai_rule_sync";
     default:
         return "unknown";
     }
@@ -576,6 +646,16 @@ static const char *json_type_name(network_worker_server_json_type_t type)
         return "system_log";
     case NETWORK_WORKER_SERVER_JSON_ALARM:
         return "alarm";
+    case NETWORK_WORKER_SERVER_JSON_ENVIRONMENT_ALARM:
+        return "environment_alarm";
+    case NETWORK_WORKER_SERVER_JSON_HOME_AI_EVENTS:
+        return "home_ai_events";
+    case NETWORK_WORKER_SERVER_JSON_HOME_AI_VIRTUAL_STATE:
+        return "home_ai_virtual_state";
+    case NETWORK_WORKER_SERVER_JSON_HOME_AI_DEPLOYMENT:
+        return "home_ai_deployment";
+    case NETWORK_WORKER_SERVER_JSON_HOME_AI_HISTORY:
+        return "home_ai_history";
     default:
         return "unknown";
     }
@@ -647,7 +727,8 @@ static bool upload_work_is_low_priority(const network_worker_work_item_t *item)
     return item != NULL &&
            (item->work_type == NETWORK_WORKER_WORK_UPLOAD_SNAPSHOT ||
             (item->work_type == NETWORK_WORKER_WORK_UPLOAD_JSON &&
-             item->json_type != NETWORK_WORKER_SERVER_JSON_INGEST));
+             item->json_type != NETWORK_WORKER_SERVER_JSON_INGEST &&
+             item->json_type != NETWORK_WORKER_SERVER_JSON_ENVIRONMENT_ALARM));
 }
 
 static bool upload_work_is_telemetry(const network_worker_work_item_t *item)
@@ -659,7 +740,8 @@ static bool upload_work_is_high_priority(const network_worker_work_item_t *item)
 {
     return item != NULL &&
            item->work_type == NETWORK_WORKER_WORK_UPLOAD_JSON &&
-           item->json_type == NETWORK_WORKER_SERVER_JSON_INGEST;
+           (item->json_type == NETWORK_WORKER_SERVER_JSON_INGEST ||
+            item->json_type == NETWORK_WORKER_SERVER_JSON_ENVIRONMENT_ALARM);
 }
 
 static void clear_upload_pending_flag(const network_worker_work_item_t *item)
@@ -673,6 +755,10 @@ static void clear_upload_pending_flag(const network_worker_work_item_t *item)
         s_command_pull_pending = false;
     } else if (item->work_type == NETWORK_WORKER_WORK_SMART_HOME_POLL) {
         s_smart_home_poll_pending = false;
+    } else if (item->work_type == NETWORK_WORKER_WORK_HOME_AI_RULE_NOTIFICATION) {
+        s_home_ai_rule_notification_pending = false;
+    } else if (item->work_type == NETWORK_WORKER_WORK_HOME_AI_RULE_SYNC) {
+        s_home_ai_rule_sync_pending = false;
     }
 }
 
@@ -687,6 +773,10 @@ static void mark_upload_pending_flag(const network_worker_work_item_t *item)
         s_command_pull_pending = true;
     } else if (item->work_type == NETWORK_WORKER_WORK_SMART_HOME_POLL) {
         s_smart_home_poll_pending = true;
+    } else if (item->work_type == NETWORK_WORKER_WORK_HOME_AI_RULE_NOTIFICATION) {
+        s_home_ai_rule_notification_pending = true;
+    } else if (item->work_type == NETWORK_WORKER_WORK_HOME_AI_RULE_SYNC) {
+        s_home_ai_rule_sync_pending = true;
     }
 }
 
@@ -1339,6 +1429,12 @@ static void evaluate_state(const char *reason)
     set_gateway_link_state(NETWORK_WORKER_LINK_STABLE, reason);
     if (entering_link_stable) {
         log_network_epoch("LINK_STABLE", reason);
+        esp_err_t sync_ret = network_worker_enqueue_home_ai_rule_sync();
+        if (sync_ret != ESP_OK && sync_ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG,
+                     "home-ai recovery sync enqueue failed ret=%s",
+                     esp_err_to_name(sync_ret));
+        }
     }
     network_replay_worker_request_bme_replay();
 }
@@ -1391,9 +1487,13 @@ static bool release_disconnected_session(const char *device_id,
                                                      before.generation,
                                                      disconnected_at_us,
                                                      reason);
-    return resource_manager_get_session(device_id, &after) &&
-           after.generation != before.generation &&
-           !resource_manager_is_live(device_id);
+    const bool released = resource_manager_get_session(device_id, &after) &&
+                          after.generation != before.generation &&
+                          !resource_manager_is_live(device_id);
+    if (released) {
+        (void)home_ai_voice_session_release_owner(device_id);
+    }
+    return released;
 }
 
 static void handle_network_event(const network_worker_item_t *item)
@@ -1801,11 +1901,22 @@ static esp_err_t enqueue_command_work_item(const network_worker_work_item_t *ite
         xSemaphoreGive(s_command_queue_mutation_lock);
         return ESP_OK;
     }
+    if (item->work_type == NETWORK_WORKER_WORK_HOME_AI_RULE_SYNC && s_home_ai_rule_sync_pending) {
+        xSemaphoreGive(s_command_queue_mutation_lock);
+        return ESP_OK;
+    }
+    if (item->work_type == NETWORK_WORKER_WORK_HOME_AI_RULE_NOTIFICATION &&
+        s_home_ai_rule_notification_pending) {
+        xSemaphoreGive(s_command_queue_mutation_lock);
+        return ESP_OK;
+    }
 
     esp_err_t ret = enqueue_to_queue(s_command_queue, item);
     if (ret == ESP_OK &&
         (item->work_type == NETWORK_WORKER_WORK_COMMAND_PULL ||
-         item->work_type == NETWORK_WORKER_WORK_SMART_HOME_POLL)) {
+         item->work_type == NETWORK_WORKER_WORK_SMART_HOME_POLL ||
+         item->work_type == NETWORK_WORKER_WORK_HOME_AI_RULE_NOTIFICATION ||
+         item->work_type == NETWORK_WORKER_WORK_HOME_AI_RULE_SYNC)) {
         mark_upload_pending_flag(item);
     }
     xSemaphoreGive(s_command_queue_mutation_lock);
@@ -1842,6 +1953,18 @@ static void release_work_item(network_worker_work_item_t *item)
     }
 }
 
+static void notify_environment_completion(const network_worker_work_item_t *item,
+                                          esp_err_t result,
+                                          int http_status)
+{
+    if (item != NULL && item->environment_completion != NULL) {
+        item->environment_completion(item->environment_event_seq,
+                                     result,
+                                     http_status,
+                                     item->environment_completion_context);
+    }
+}
+
 static void requeue_or_drop_work(QueueHandle_t queue,
                                  network_worker_work_item_t *item,
                                  esp_err_t reason)
@@ -1870,15 +1993,19 @@ static void requeue_or_drop_work(QueueHandle_t queue,
              json_type_name(item->json_type),
              item->source,
              esp_err_to_name(reason));
+    notify_environment_completion(item, reason, 0);
     release_work_item(item);
 }
 
-static esp_err_t perform_server_json(network_worker_work_item_t *item)
+static esp_err_t perform_server_json(network_worker_work_item_t *item, int *http_status)
 {
     if (item == NULL || item->json_body == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (http_status != NULL) {
+        *http_status = 0;
+    }
     char response[SERVER_CLIENT_SMALL_BODY_BYTES];
     int status = 0;
     esp_err_t ret = ESP_ERR_INVALID_ARG;
@@ -1923,6 +2050,35 @@ static esp_err_t perform_server_json(network_worker_work_item_t *item)
         ret = server_client_post_alarm_json(item->json_body, response, sizeof(response), &status);
         telemetry_local_deferred = ret == ESP_ERR_NOT_FINISHED;
         break;
+    case NETWORK_WORKER_SERVER_JSON_ENVIRONMENT_ALARM:
+        ret = server_client_post_alarm_json(item->json_body, response, sizeof(response), &status);
+        telemetry_local_deferred = ret == ESP_ERR_NOT_FINISHED;
+        break;
+    case NETWORK_WORKER_SERVER_JSON_HOME_AI_EVENTS:
+        ret = server_client_post_home_ai_events(item->json_body, response, sizeof(response), &status);
+        telemetry_local_deferred = ret == ESP_ERR_NOT_FINISHED;
+        break;
+    case NETWORK_WORKER_SERVER_JSON_HOME_AI_VIRTUAL_STATE:
+        ret = server_client_post_home_ai_virtual_device_state(item->json_body,
+                                                              response,
+                                                              sizeof(response),
+                                                              &status);
+        telemetry_local_deferred = ret == ESP_ERR_NOT_FINISHED;
+        break;
+    case NETWORK_WORKER_SERVER_JSON_HOME_AI_DEPLOYMENT:
+        ret = server_client_post_home_ai_rule_deployment(item->json_body,
+                                                         response,
+                                                         sizeof(response),
+                                                         &status);
+        telemetry_local_deferred = ret == ESP_ERR_NOT_FINISHED;
+        break;
+    case NETWORK_WORKER_SERVER_JSON_HOME_AI_HISTORY:
+        ret = server_client_post_home_ai_history_replay(item->json_body,
+                                                        response,
+                                                        sizeof(response),
+                                                        &status);
+        telemetry_local_deferred = ret == ESP_ERR_NOT_FINISHED;
+        break;
     default:
         ret = ESP_ERR_INVALID_ARG;
         break;
@@ -1949,6 +2105,9 @@ static esp_err_t perform_server_json(network_worker_work_item_t *item)
     if (!peer_cancelled && !telemetry_local_deferred &&
         (ret != ESP_OK || status < 200 || status >= 300)) {
         log_server_upload_failed_limited(item, ret, status);
+    }
+    if (http_status != NULL) {
+        *http_status = status;
     }
     return ret;
 }
@@ -1979,9 +2138,10 @@ static void process_upload_work_item(network_worker_work_item_t *item)
 
     /* upload worker 只处理 Server-facing 工作；C5 本地 HTTP 响应早已在 S3 ingress 路径完成。 */
     esp_err_t ret = ESP_OK;
+    int http_status = 0;
     switch (item->work_type) {
     case NETWORK_WORKER_WORK_UPLOAD_JSON:
-        ret = perform_server_json(item);
+        ret = perform_server_json(item, &http_status);
         if (ret == ESP_ERR_INVALID_STATE && !server_link_stable()) {
             requeue_or_drop_work(s_work_queue, item, ret);
             return;
@@ -2002,6 +2162,7 @@ static void process_upload_work_item(network_worker_work_item_t *item)
                  item->source,
                  esp_err_to_name(ret));
     }
+    notify_environment_completion(item, ret, http_status);
     release_work_item(item);
 }
 
@@ -2015,7 +2176,7 @@ static esp_err_t perform_command_ack(network_worker_work_item_t *item)
     esp_err_t ret = server_client_ack_command(item->command_id,
                                              item->json_body,
                                              s_command_ack_response,
-                                             sizeof(s_command_ack_response),
+                                             SERVER_CLIENT_SMALL_BODY_BYTES,
                                              &status);
     if (ret == ESP_ERR_INVALID_STATE && !server_link_stable()) {
         return ret;
@@ -2060,6 +2221,20 @@ static void process_command_work_item(network_worker_work_item_t *item)
     case NETWORK_WORKER_WORK_SMART_HOME_POLL:
         smart_home_gateway_poll_once();
         break;
+    case NETWORK_WORKER_WORK_HOME_AI_RULE_NOTIFICATION:
+        ret = home_ai_runtime_check_rule_notification();
+        if (ret == ESP_ERR_INVALID_STATE && !server_link_stable()) {
+            requeue_or_drop_work(s_command_queue, item, ret);
+            return;
+        }
+        break;
+    case NETWORK_WORKER_WORK_HOME_AI_RULE_SYNC:
+        ret = home_ai_runtime_sync_rules_now();
+        if (ret == ESP_ERR_INVALID_STATE && !server_link_stable()) {
+            requeue_or_drop_work(s_command_queue, item, ret);
+            return;
+        }
+        break;
     default:
         ret = ESP_ERR_INVALID_ARG;
         break;
@@ -2078,6 +2253,7 @@ static void process_command_work_item(network_worker_work_item_t *item)
 static void network_worker_task(void *arg)
 {
     (void)arg;
+    network_worker_wait_until_ready();
     const bool wdt_registered = app_task_wdt_add_current(TAG, "network_worker");
     ESP_LOGI(TAG,
              "network worker started queue_depth=%u stable_gate_ms=%u",
@@ -2109,6 +2285,7 @@ static void network_worker_task(void *arg)
 static void upload_worker_task(void *arg)
 {
     (void)arg;
+    network_worker_wait_until_ready();
     const bool wdt_registered = app_task_wdt_add_current(TAG, "upload_worker");
     ESP_LOGI(TAG,
              "upload worker started queue_depth=%u server_gate=LINK_STABLE",
@@ -2149,6 +2326,7 @@ static void upload_worker_task(void *arg)
 static void snapshot_worker_task(void *arg)
 {
     (void)arg;
+    network_worker_wait_until_ready();
     const bool wdt_registered = app_task_wdt_add_current(TAG, "snapshot_worker");
     ESP_LOGI(TAG, "snapshot worker started cache=1 priority=low interval_ms=%u",
              (unsigned int)UPLOAD_SNAPSHOT_INTERVAL_MS);
@@ -2208,6 +2386,7 @@ static void snapshot_worker_task(void *arg)
 static void command_worker_task(void *arg)
 {
     (void)arg;
+    network_worker_wait_until_ready();
     const bool wdt_registered = app_task_wdt_add_current(TAG, "command_worker");
     ESP_LOGI(TAG,
              "command worker started queue_depth=%u server_gate=LINK_STABLE",
@@ -2244,103 +2423,263 @@ static void command_worker_task(void *arg)
     }
 }
 
-esp_err_t network_worker_init(void)
+static QueueHandle_t network_worker_create_split_queue(
+    UBaseType_t depth,
+    UBaseType_t item_size,
+    network_worker_queue_allocation_t *allocation)
 {
-    if (s_pending_station_lock == NULL) {
-        s_pending_station_lock = xSemaphoreCreateMutex();
-        if (s_pending_station_lock == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_work_queue_mutation_lock == NULL) {
-        s_work_queue_mutation_lock = xSemaphoreCreateMutex();
-        if (s_work_queue_mutation_lock == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_command_queue_mutation_lock == NULL) {
-        s_command_queue_mutation_lock = xSemaphoreCreateMutex();
-        if (s_command_queue_mutation_lock == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_event_queue == NULL) {
-        s_event_queue = xQueueCreate(NETWORK_WORKER_QUEUE_DEPTH, sizeof(network_worker_item_t));
-        if (s_event_queue == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_ap_disconnect_queue == NULL) {
-        s_ap_disconnect_queue =
-            xQueueCreate(GATEWAY_CONFIG_MAX_CHILDREN, sizeof(network_worker_item_t));
-        if (s_ap_disconnect_queue == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_work_queue == NULL) {
-        s_work_queue =
-            xQueueCreate(NETWORK_WORKER_WORK_QUEUE_DEPTH, sizeof(network_worker_work_item_t));
-        if (s_work_queue == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_command_queue == NULL) {
-        s_command_queue =
-            xQueueCreate(NETWORK_WORKER_WORK_QUEUE_DEPTH, sizeof(network_worker_work_item_t));
-        if (s_command_queue == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
+    if (depth == 0U || item_size == 0U || allocation == NULL ||
+        allocation->control != NULL || allocation->storage != NULL ||
+        (size_t)depth > SIZE_MAX / (size_t)item_size) {
+        return NULL;
     }
 
-    if (s_worker_task == NULL) {
-        BaseType_t created = xTaskCreate(network_worker_task,
-                                         "network_worker",
-                                         NETWORK_WORKER_TASK_STACK,
-                                         NULL,
-                                         NETWORK_WORKER_TASK_PRIORITY,
-                                         &s_worker_task);
-        if (created != pdPASS) {
-            s_worker_task = NULL;
-            return ESP_ERR_NO_MEM;
-        }
+    StaticQueue_t *control = heap_caps_calloc(1U,
+                                               sizeof(*control),
+                                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (control == NULL) {
+        return NULL;
     }
-    if (s_upload_task == NULL) {
-        BaseType_t created = xTaskCreate(upload_worker_task,
-                                         "upload_worker",
-                                         NETWORK_WORKER_UPLOAD_TASK_STACK,
-                                         NULL,
-                                         NETWORK_WORKER_UPLOAD_TASK_PRIORITY,
-                                         &s_upload_task);
-        if (created != pdPASS) {
-            s_upload_task = NULL;
-            return ESP_ERR_NO_MEM;
-        }
+    const size_t storage_bytes = (size_t)depth * (size_t)item_size;
+    uint8_t *storage = heap_caps_calloc(1U,
+                                        storage_bytes,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (storage == NULL) {
+        heap_caps_free(control);
+        return NULL;
     }
-    if (s_command_task == NULL) {
-        BaseType_t created = xTaskCreate(command_worker_task,
-                                         "command_worker",
-                                         NETWORK_WORKER_COMMAND_TASK_STACK,
-                                         NULL,
-                                         NETWORK_WORKER_COMMAND_TASK_PRIORITY,
-                                         &s_command_task);
-        if (created != pdPASS) {
-            s_command_task = NULL;
-            return ESP_ERR_NO_MEM;
-        }
+
+    QueueHandle_t queue = xQueueCreateStatic(depth, item_size, storage, control);
+    if (queue == NULL) {
+        heap_caps_free(storage);
+        heap_caps_free(control);
+        return NULL;
     }
-    if (s_snapshot_task == NULL) {
-        BaseType_t created = xTaskCreate(snapshot_worker_task,
-                                         "snapshot_worker",
-                                         NETWORK_WORKER_UPLOAD_TASK_STACK,
-                                         NULL,
-                                         NETWORK_WORKER_UPLOAD_TASK_PRIORITY - 1U,
-                                         &s_snapshot_task);
-        if (created != pdPASS) {
-            s_snapshot_task = NULL;
-            return ESP_ERR_NO_MEM;
-        }
+    allocation->control = control;
+    allocation->storage = storage;
+    return queue;
+}
+
+static void network_worker_delete_split_queue(
+    QueueHandle_t *queue,
+    network_worker_queue_allocation_t *allocation)
+{
+    if (queue != NULL && *queue != NULL) {
+        vQueueDelete(*queue);
+        *queue = NULL;
     }
+    if (allocation != NULL) {
+        heap_caps_free(allocation->storage);
+        heap_caps_free(allocation->control);
+        allocation->storage = NULL;
+        allocation->control = NULL;
+    }
+}
+
+static void network_worker_drain_work_queue(QueueHandle_t queue)
+{
+    if (queue == NULL) {
+        return;
+    }
+
+    network_worker_work_item_t item = {0};
+    while (xQueueReceive(queue, &item, 0) == pdTRUE) {
+        release_work_item(&item);
+        memset(&item, 0, sizeof(item));
+    }
+}
+
+static void network_worker_rollback_init(void)
+{
+    s_workers_ready = false;
+
+    if (s_snapshot_task != NULL) {
+        vTaskDeleteWithCaps(s_snapshot_task);
+        s_snapshot_task = NULL;
+    }
+    if (s_command_task != NULL) {
+        vTaskDeleteWithCaps(s_command_task);
+        s_command_task = NULL;
+    }
+    if (s_upload_task != NULL) {
+        vTaskDeleteWithCaps(s_upload_task);
+        s_upload_task = NULL;
+    }
+    if (s_worker_task != NULL) {
+        vTaskDeleteWithCaps(s_worker_task);
+        s_worker_task = NULL;
+    }
+
+    network_worker_drain_work_queue(s_command_queue);
+    network_worker_drain_work_queue(s_work_queue);
+    network_worker_delete_split_queue(&s_command_queue, &s_command_queue_allocation);
+    network_worker_delete_split_queue(&s_work_queue, &s_work_queue_allocation);
+    network_worker_delete_split_queue(&s_ap_disconnect_queue,
+                                      &s_ap_disconnect_queue_allocation);
+    network_worker_delete_split_queue(&s_event_queue, &s_event_queue_allocation);
+
+    if (s_command_queue_mutation_lock != NULL) {
+        vSemaphoreDeleteWithCaps(s_command_queue_mutation_lock);
+        s_command_queue_mutation_lock = NULL;
+    }
+    if (s_work_queue_mutation_lock != NULL) {
+        vSemaphoreDeleteWithCaps(s_work_queue_mutation_lock);
+        s_work_queue_mutation_lock = NULL;
+    }
+    if (s_pending_station_lock != NULL) {
+        vSemaphoreDeleteWithCaps(s_pending_station_lock);
+        s_pending_station_lock = NULL;
+    }
+    heap_caps_free(s_command_ack_response);
+    s_command_ack_response = NULL;
+
+    s_snapshot_upload_pending = false;
+    s_command_pull_pending = false;
+    s_smart_home_poll_pending = false;
+    s_home_ai_rule_sync_pending = false;
+    s_home_ai_rule_notification_pending = false;
+    memset(s_pending_stations, 0, sizeof(s_pending_stations));
+}
+
+esp_err_t network_worker_init(void)
+{
+    if (network_worker_initialized()) {
+        return ESP_OK;
+    }
+    if (s_pending_station_lock != NULL ||
+        s_work_queue_mutation_lock != NULL ||
+        s_command_queue_mutation_lock != NULL ||
+        s_event_queue != NULL ||
+        s_ap_disconnect_queue != NULL ||
+        s_work_queue != NULL ||
+        s_command_queue != NULL ||
+        s_event_queue_allocation.control != NULL ||
+        s_event_queue_allocation.storage != NULL ||
+        s_ap_disconnect_queue_allocation.control != NULL ||
+        s_ap_disconnect_queue_allocation.storage != NULL ||
+        s_work_queue_allocation.control != NULL ||
+        s_work_queue_allocation.storage != NULL ||
+        s_command_queue_allocation.control != NULL ||
+        s_command_queue_allocation.storage != NULL ||
+        s_command_ack_response != NULL ||
+        s_worker_task != NULL ||
+        s_upload_task != NULL ||
+        s_command_task != NULL ||
+        s_snapshot_task != NULL) {
+        network_worker_rollback_init();
+    }
+
+    const UBaseType_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const UBaseType_t psram_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    const char *failed_stage = "pending_station_lock_internal";
+
+    s_pending_station_lock = xSemaphoreCreateMutexWithCaps(internal_caps);
+    if (s_pending_station_lock == NULL) {
+        goto failed;
+    }
+    failed_stage = "work_queue_lock_internal";
+    s_work_queue_mutation_lock = xSemaphoreCreateMutexWithCaps(internal_caps);
+    if (s_work_queue_mutation_lock == NULL) {
+        goto failed;
+    }
+    failed_stage = "command_queue_lock_internal";
+    s_command_queue_mutation_lock = xSemaphoreCreateMutexWithCaps(internal_caps);
+    if (s_command_queue_mutation_lock == NULL) {
+        goto failed;
+    }
+    failed_stage = "command_ack_response_psram";
+    s_command_ack_response =
+        heap_caps_calloc(1U, SERVER_CLIENT_SMALL_BODY_BYTES, psram_caps);
+    if (s_command_ack_response == NULL) {
+        goto failed;
+    }
+    failed_stage = "event_queue_split";
+    s_event_queue = network_worker_create_split_queue(NETWORK_WORKER_QUEUE_DEPTH,
+                                                      sizeof(network_worker_item_t),
+                                                      &s_event_queue_allocation);
+    if (s_event_queue == NULL) {
+        goto failed;
+    }
+    failed_stage = "ap_disconnect_queue_split";
+    s_ap_disconnect_queue =
+        network_worker_create_split_queue(GATEWAY_CONFIG_MAX_CHILDREN,
+                                          sizeof(network_worker_item_t),
+                                          &s_ap_disconnect_queue_allocation);
+    if (s_ap_disconnect_queue == NULL) {
+        goto failed;
+    }
+    failed_stage = "work_queue_split";
+    s_work_queue = network_worker_create_split_queue(NETWORK_WORKER_WORK_QUEUE_DEPTH,
+                                                     sizeof(network_worker_work_item_t),
+                                                     &s_work_queue_allocation);
+    if (s_work_queue == NULL) {
+        goto failed;
+    }
+    failed_stage = "command_queue_split";
+    s_command_queue = network_worker_create_split_queue(NETWORK_WORKER_WORK_QUEUE_DEPTH,
+                                                        sizeof(network_worker_work_item_t),
+                                                        &s_command_queue_allocation);
+    if (s_command_queue == NULL) {
+        goto failed;
+    }
+
+    failed_stage = "network_task_internal";
+    if (xTaskCreateWithCaps(network_worker_task,
+                            "network_worker",
+                            NETWORK_WORKER_TASK_STACK,
+                            NULL,
+                            NETWORK_WORKER_TASK_PRIORITY,
+                            &s_worker_task,
+                            internal_caps) != pdPASS) {
+        s_worker_task = NULL;
+        goto failed;
+    }
+    failed_stage = "upload_task_psram";
+    if (xTaskCreateWithCaps(upload_worker_task,
+                            "upload_worker",
+                            NETWORK_WORKER_UPLOAD_TASK_STACK,
+                            NULL,
+                            NETWORK_WORKER_UPLOAD_TASK_PRIORITY,
+                            &s_upload_task,
+                            psram_caps) != pdPASS) {
+        s_upload_task = NULL;
+        goto failed;
+    }
+    failed_stage = "command_task_internal";
+    if (xTaskCreateWithCaps(command_worker_task,
+                            "command_worker",
+                            NETWORK_WORKER_COMMAND_TASK_STACK,
+                            NULL,
+                            NETWORK_WORKER_COMMAND_TASK_PRIORITY,
+                            &s_command_task,
+                            internal_caps) != pdPASS) {
+        s_command_task = NULL;
+        goto failed;
+    }
+    failed_stage = "snapshot_task_psram";
+    if (xTaskCreateWithCaps(snapshot_worker_task,
+                            "snapshot_worker",
+                            NETWORK_WORKER_UPLOAD_TASK_STACK,
+                            NULL,
+                            NETWORK_WORKER_UPLOAD_TASK_PRIORITY - 1U,
+                            &s_snapshot_task,
+                            psram_caps) != pdPASS) {
+        s_snapshot_task = NULL;
+        goto failed;
+    }
+
+    s_workers_ready = true;
+    ESP_LOGI(TAG,
+             "NETWORK_WORKER_INIT_OK task_stacks_internal=%u task_stacks_psram=%u queue_storage_psram=4 queue_control_internal=4 command_ack_buffer_psram=%u",
+             (unsigned int)(NETWORK_WORKER_TASK_STACK +
+                            NETWORK_WORKER_COMMAND_TASK_STACK),
+             (unsigned int)(NETWORK_WORKER_UPLOAD_TASK_STACK * 2U),
+             (unsigned int)SERVER_CLIENT_SMALL_BODY_BYTES);
     return ESP_OK;
+
+failed:
+    network_worker_rollback_init();
+    return network_worker_init_failed(failed_stage);
 }
 
 esp_err_t network_worker_enable_local_http_server(void)
@@ -2491,7 +2830,7 @@ esp_err_t network_worker_submit_peer_server_json(network_worker_server_json_type
                                                  const char *device_id,
                                                  const char *source)
 {
-    if (json_body == NULL || type > NETWORK_WORKER_SERVER_JSON_ALARM) {
+    if (json_body == NULL || type >= NETWORK_WORKER_SERVER_JSON_COUNT) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -2529,6 +2868,60 @@ esp_err_t network_worker_submit_peer_server_json(network_worker_server_json_type
     }
     strlcpy(item.source, source != NULL ? source : "server_json", sizeof(item.source));
     /* 入队成功后 json_body 生命周期转交给 upload_worker。 */
+    return enqueue_upload_work_item(&item);
+}
+
+static esp_err_t submit_home_ai_json(network_worker_server_json_type_t type,
+                                      char *json_body,
+                                      const char *source)
+{
+    return network_worker_submit_server_json(type,
+                                             json_body,
+                                             source != NULL ? source : "home_ai");
+}
+
+esp_err_t network_worker_submit_home_ai_events(char *json_body, const char *source)
+{
+    return submit_home_ai_json(NETWORK_WORKER_SERVER_JSON_HOME_AI_EVENTS, json_body, source);
+}
+
+esp_err_t network_worker_submit_home_ai_virtual_state(char *json_body, const char *source)
+{
+    return submit_home_ai_json(NETWORK_WORKER_SERVER_JSON_HOME_AI_VIRTUAL_STATE, json_body, source);
+}
+
+esp_err_t network_worker_submit_home_ai_deployment(char *json_body, const char *source)
+{
+    return submit_home_ai_json(NETWORK_WORKER_SERVER_JSON_HOME_AI_DEPLOYMENT, json_body, source);
+}
+
+esp_err_t network_worker_submit_home_ai_history(char *json_body, const char *source)
+{
+    return submit_home_ai_json(NETWORK_WORKER_SERVER_JSON_HOME_AI_HISTORY, json_body, source);
+}
+
+esp_err_t network_worker_submit_environment_alarm_json(
+    char *json_body,
+    uint64_t event_seq,
+    network_worker_environment_alarm_completion_fn completion,
+    void *completion_context,
+    const char *source)
+{
+    if (json_body == NULL || event_seq == 0U || completion == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    network_worker_work_item_t item = {
+        .work_type = NETWORK_WORKER_WORK_UPLOAD_JSON,
+        .json_type = NETWORK_WORKER_SERVER_JSON_ENVIRONMENT_ALARM,
+        .json_body = json_body,
+        .environment_event_seq = event_seq,
+        .environment_completion = completion,
+        .environment_completion_context = completion_context,
+    };
+    strlcpy(item.source,
+            source != NULL && source[0] != '\0' ? source : "environment_alarm",
+            sizeof(item.source));
     return enqueue_upload_work_item(&item);
 }
 
@@ -2746,6 +3139,24 @@ esp_err_t network_worker_enqueue_smart_home_poll(void)
 {
     network_worker_work_item_t item = {
         .work_type = NETWORK_WORKER_WORK_SMART_HOME_POLL,
+    };
+    strlcpy(item.source, "scheduler", sizeof(item.source));
+    return enqueue_command_work_item(&item);
+}
+
+esp_err_t network_worker_enqueue_home_ai_rule_sync(void)
+{
+    network_worker_work_item_t item = {
+        .work_type = NETWORK_WORKER_WORK_HOME_AI_RULE_SYNC,
+    };
+    strlcpy(item.source, "scheduler", sizeof(item.source));
+    return enqueue_command_work_item(&item);
+}
+
+esp_err_t network_worker_enqueue_home_ai_rule_notification(void)
+{
+    network_worker_work_item_t item = {
+        .work_type = NETWORK_WORKER_WORK_HOME_AI_RULE_NOTIFICATION,
     };
     strlcpy(item.source, "scheduler", sizeof(item.source));
     return enqueue_command_work_item(&item);

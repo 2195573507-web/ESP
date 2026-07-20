@@ -11,9 +11,11 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "s3_scheduler.h"
 
@@ -168,25 +170,60 @@ esp_err_t s3_event_bus_init(s3_event_bus_release_fn_t release_fn)
     if (release_fn == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_lock == NULL) {
-        s_lock = xSemaphoreCreateMutex();
-        if (s_lock == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_signal == NULL) {
-        s_signal = xSemaphoreCreateCounting(S3_EVENT_BUS_CRITICAL_DEPTH +
-                                                S3_EVENT_BUS_REALTIME_DEPTH +
-                                                S3_EVENT_BUS_STATE_COUNT +
-                                                S3_EVENT_BUS_BACKGROUND_DEPTH,
-                                            0U);
-        if (s_signal == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
+    if (s_lock != NULL && s_signal != NULL) {
+        s_release_fn = release_fn;
+        return ESP_OK;
     }
 
+    /* A half-created bus is unusable. Rebuild both internal control objects. */
+    if (s_signal != NULL) {
+        vSemaphoreDeleteWithCaps(s_signal);
+        s_signal = NULL;
+    }
+    if (s_lock != NULL) {
+        vSemaphoreDeleteWithCaps(s_lock);
+        s_lock = NULL;
+    }
+
+    const UBaseType_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    SemaphoreHandle_t lock = xSemaphoreCreateMutexWithCaps(internal_caps);
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    SemaphoreHandle_t signal =
+        xSemaphoreCreateCountingWithCaps(S3_EVENT_BUS_CRITICAL_DEPTH +
+                                             S3_EVENT_BUS_REALTIME_DEPTH +
+                                             S3_EVENT_BUS_STATE_COUNT +
+                                             S3_EVENT_BUS_BACKGROUND_DEPTH,
+                                         0U,
+                                         internal_caps);
+    if (signal == NULL) {
+        vSemaphoreDeleteWithCaps(lock);
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_lock = lock;
+    s_signal = signal;
     s_release_fn = release_fn;
     return ESP_OK;
+}
+
+void s3_event_bus_deinit(void)
+{
+    if (s_lock != NULL) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        reset_locked();
+        xSemaphoreGive(s_lock);
+    }
+    if (s_signal != NULL) {
+        vSemaphoreDeleteWithCaps(s_signal);
+        s_signal = NULL;
+    }
+    if (s_lock != NULL) {
+        vSemaphoreDeleteWithCaps(s_lock);
+        s_lock = NULL;
+    }
+    s_release_fn = NULL;
 }
 
 void s3_event_bus_reset(void)

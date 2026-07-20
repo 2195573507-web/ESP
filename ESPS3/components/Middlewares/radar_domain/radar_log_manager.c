@@ -5,21 +5,51 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "radar_config.h"
+#include "radar_person_continuity.h"
 
 static const char TAG[] = "radar_log";
 static TaskHandle_t s_task;
-static radar_spatial_snapshot_t s_snapshots[RADAR_SOURCE_COUNT];
-static radar_rate_manager_t s_rate_managers[RADAR_SOURCE_COUNT];
+static bool s_task_with_caps;
+
+typedef struct {
+    radar_spatial_snapshot_t published_snapshots[RADAR_SOURCE_COUNT];
+    radar_spatial_snapshot_t task_snapshots[RADAR_SOURCE_COUNT];
+    radar_spatial_snapshot_t previous_snapshots[RADAR_SOURCE_COUNT];
+    radar_rate_manager_t published_rate_managers[RADAR_SOURCE_COUNT];
+    radar_rate_manager_t task_rate_managers[RADAR_SOURCE_COUNT];
+    radar_rate_mode_t previous_modes[RADAR_SOURCE_COUNT];
+    bool have_previous[RADAR_SOURCE_COUNT];
+} radar_log_storage_t;
+
+static radar_log_storage_t *s_storage;
 static bool s_pending[RADAR_SOURCE_COUNT];
 static uint32_t s_log_drop_count[RADAR_SOURCE_COUNT];
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_stack_free_words;
 static bool s_stack_pending;
+
+#define RADAR_LOG_TASK_STACK 6144U
+
+static radar_log_storage_t *allocate_log_storage(void)
+{
+    radar_log_storage_t *storage = heap_caps_calloc(1U,
+                                                    sizeof(*storage),
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (storage == NULL) {
+        ESP_LOGW(TAG, "PSRAM storage allocation failed; falling back to internal RAM");
+        storage = heap_caps_calloc(1U,
+                                   sizeof(*storage),
+                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return storage;
+}
 
 static uint64_t now_ms(void)
 {
@@ -58,7 +88,11 @@ static bool state_changed(const radar_spatial_snapshot_t *snapshot,
            previous_snapshot->sensor_state != snapshot->sensor_state ||
            previous_snapshot->occupancy_state != snapshot->occupancy_state ||
            previous_snapshot->motion_state != snapshot->motion_state ||
-           previous_snapshot->active_track_count != snapshot->active_track_count;
+           previous_snapshot->active_track_count != snapshot->active_track_count ||
+           previous_snapshot->visible_person_count != snapshot->visible_person_count ||
+           previous_snapshot->retained_person_count != snapshot->retained_person_count ||
+           previous_snapshot->business_person_count != snapshot->business_person_count ||
+           previous_snapshot->count_state != snapshot->count_state;
 }
 
 static void emit_source_logs(radar_source_id_t source,
@@ -129,7 +163,8 @@ static void emit_source_logs(radar_source_id_t source,
                  room != NULL ? room : "unknown");
         *last_track_log_ms = current_ms;
     }
-    if (transition || elapsed(current_ms, *last_summary_log_ms, 1000U)) {
+    const bool summary_due = transition || elapsed(current_ms, *last_summary_log_ms, 1000U);
+    if (summary_due) {
         const radar_tracker_diagnostics_t *diagnostics = &snapshot->diagnostics.tracker;
         ESP_LOGI(TAG,
                  "RADAR_TRACKER: active=%u created=%lu matched=%lu deleted=%lu stale=%lu tentative=%u velocity_outliers=%lu source=%s room=%s",
@@ -142,6 +177,20 @@ static void emit_source_logs(radar_source_id_t source,
                  (unsigned long)diagnostics->velocity_outliers, source_name,
                  room != NULL ? room : "unknown");
         *last_summary_log_ms = current_ms;
+    }
+    if (summary_due) {
+        ESP_LOGI(TAG,
+                 "RADAR_COUNTS: source=%s raw_target_count=%u accepted_target_count=%u visible_track_count=%u confirmed_active_track_count=%u history_target_count=%u visible_person_count=%u retained_person_count=%u business_person_count=%u count_state=%s",
+                 source_name,
+                 (unsigned int)snapshot->raw_target_count,
+                 (unsigned int)snapshot->accepted_target_count,
+                 (unsigned int)snapshot->visible_track_count,
+                 (unsigned int)snapshot->confirmed_active_track_count,
+                 (unsigned int)snapshot->history_target_count,
+                 (unsigned int)snapshot->visible_person_count,
+                 (unsigned int)snapshot->retained_person_count,
+                 (unsigned int)snapshot->business_person_count,
+                 radar_person_count_state_name(snapshot->count_state));
     }
     if (drops > 0U && elapsed(current_ms, *last_drop_log_ms, 1000U)) {
         ESP_LOGW(TAG, "RADAR_LOG_DROP count=%lu source=%s room=%s", (unsigned long)drops,
@@ -163,12 +212,7 @@ static void emit_source_logs(radar_source_id_t source,
 
 static void log_task(void *arg)
 {
-    (void)arg;
-    static radar_spatial_snapshot_t snapshots[RADAR_SOURCE_COUNT];
-    static radar_spatial_snapshot_t previous_snapshots[RADAR_SOURCE_COUNT];
-    static radar_rate_manager_t rate_managers[RADAR_SOURCE_COUNT];
-    static radar_rate_mode_t previous_modes[RADAR_SOURCE_COUNT];
-    static bool have_previous[RADAR_SOURCE_COUNT];
+    radar_log_storage_t *storage = (radar_log_storage_t *)arg;
     uint64_t last_state_log_ms[RADAR_SOURCE_COUNT] = {0};
     uint64_t last_track_log_ms[RADAR_SOURCE_COUNT] = {0};
     uint64_t last_summary_log_ms[RADAR_SOURCE_COUNT] = {0};
@@ -183,8 +227,8 @@ static void log_task(void *arg)
         portENTER_CRITICAL(&s_lock);
         for (size_t i = 0U; i < RADAR_SOURCE_COUNT; ++i) {
             if (s_pending[i]) {
-                snapshots[i] = s_snapshots[i];
-                rate_managers[i] = s_rate_managers[i];
+                storage->task_snapshots[i] = storage->published_snapshots[i];
+                storage->task_rate_managers[i] = storage->published_rate_managers[i];
                 s_pending[i] = false;
                 pending[i] = true;
             }
@@ -213,14 +257,17 @@ static void log_task(void *arg)
             if (source != RADAR_SOURCE_S3_LOCAL) continue;
 #endif
             if (!pending[source]) continue;
-            emit_source_logs(source, &snapshots[source], &rate_managers[source],
-                             &previous_snapshots[source], previous_modes[source],
-                             have_previous[source], current_ms, &last_state_log_ms[source],
+            emit_source_logs(source, &storage->task_snapshots[source],
+                             &storage->task_rate_managers[source],
+                             &storage->previous_snapshots[source],
+                             storage->previous_modes[source],
+                             storage->have_previous[source], current_ms,
+                             &last_state_log_ms[source],
                              &last_track_log_ms[source], &last_summary_log_ms[source],
                              &last_drop_log_ms[source], drops[source]);
-            previous_snapshots[source] = snapshots[source];
-            previous_modes[source] = rate_managers[source].mode;
-            have_previous[source] = true;
+            storage->previous_snapshots[source] = storage->task_snapshots[source];
+            storage->previous_modes[source] = storage->task_rate_managers[source].mode;
+            storage->have_previous[source] = true;
         }
     }
 }
@@ -228,12 +275,69 @@ static void log_task(void *arg)
 esp_err_t radar_log_manager_start(void)
 {
     if (s_task != NULL) return ESP_OK;
-    const BaseType_t created = xTaskCreate(log_task, "radar_log", 6144U, NULL, 1U, &s_task);
+    if (s_storage == NULL) {
+        s_storage = allocate_log_storage();
+        if (s_storage == NULL) return ESP_ERR_NO_MEM;
+    }
+    s_task_with_caps = true;
+    BaseType_t created = xTaskCreateWithCaps(log_task,
+                                             "radar_log",
+                                             RADAR_LOG_TASK_STACK,
+                                             s_storage,
+                                             1U,
+                                             &s_task,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (created != pdPASS) {
+        ESP_LOGW(TAG, "PSRAM task stack allocation failed; falling back to internal RAM");
+        s_task_with_caps = false;
+        created = xTaskCreate(log_task,
+                              "radar_log",
+                              RADAR_LOG_TASK_STACK,
+                              s_storage,
+                              1U,
+                              &s_task);
+    }
     if (created != pdPASS) {
         s_task = NULL;
+        s_task_with_caps = false;
+        heap_caps_free(s_storage);
+        s_storage = NULL;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+esp_err_t radar_log_manager_stop(void)
+{
+    TaskHandle_t task = s_task;
+    const bool task_with_caps = s_task_with_caps;
+    s_task = NULL;
+    s_task_with_caps = false;
+    if (task != NULL) {
+        if (task_with_caps) {
+            vTaskDeleteWithCaps(task);
+        } else {
+            vTaskDelete(task);
+        }
+    }
+
+    portENTER_CRITICAL(&s_lock);
+    radar_log_storage_t *storage = s_storage;
+    s_storage = NULL;
+    memset(s_pending, 0, sizeof(s_pending));
+    memset(s_log_drop_count, 0, sizeof(s_log_drop_count));
+    s_stack_free_words = 0U;
+    s_stack_pending = false;
+    portEXIT_CRITICAL(&s_lock);
+    if (storage != NULL) {
+        heap_caps_free(storage);
+    }
+    return ESP_OK;
+}
+
+bool radar_log_manager_is_started(void)
+{
+    return s_task != NULL;
 }
 
 void radar_log_manager_publish(radar_source_id_t source,
@@ -245,11 +349,15 @@ void radar_log_manager_publish(radar_source_id_t source,
     if (source != RADAR_SOURCE_S3_LOCAL) return;
 #endif
     portENTER_CRITICAL(&s_lock);
+    if (s_storage == NULL) {
+        portEXIT_CRITICAL(&s_lock);
+        return;
+    }
     if (s_pending[source] && s_log_drop_count[source] < UINT32_MAX) {
         ++s_log_drop_count[source];
     }
-    s_snapshots[source] = *snapshot;
-    s_rate_managers[source] = *rate_manager;
+    s_storage->published_snapshots[source] = *snapshot;
+    s_storage->published_rate_managers[source] = *rate_manager;
     s_pending[source] = true;
     portEXIT_CRITICAL(&s_lock);
 }

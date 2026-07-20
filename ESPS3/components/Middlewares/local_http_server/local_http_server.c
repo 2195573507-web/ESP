@@ -29,6 +29,7 @@
 #include "freertos/semphr.h"
 #include "gateway_config.h"
 #include "gateway_wifi.h"
+#include "home_ai_local_handler.h"
 #include "offline_policy.h"
 #include "protocol_adapter.h"
 #include "radar_local_handler.h"
@@ -55,7 +56,6 @@ static int64_t s_last_sensor_ingress_failure_log_ms;
 
 #define LOCAL_HTTP_SENSOR_INGRESS_ADMISSION_TIMEOUT_MS 100U
 #define LOCAL_HTTP_SENSOR_DIAGNOSTIC_LOG_MS 5000LL
-#define ESP111_PROTOCOL_LOCAL_JSON_LOCAL_ID "local_id"
 
 typedef struct {
     int content_length;
@@ -444,7 +444,9 @@ static esp_err_t read_json_body(httpd_req_t *req,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    char *body = heap_caps_calloc(1, (size_t)req->content_len + 1U, MALLOC_CAP_8BIT);
+    char *body = heap_caps_calloc(1,
+                                  (size_t)req->content_len + 1U,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (body == NULL) {
         if (out_metrics != NULL) {
             out_metrics->recv_duration_ms =
@@ -522,7 +524,9 @@ static esp_err_t enqueue_body_buffer_with_admission(
     }
 
     s3_runtime_ingress_t *ingress =
-        heap_caps_calloc(1, sizeof(*ingress), MALLOC_CAP_8BIT);
+        heap_caps_calloc(1,
+                         sizeof(*ingress),
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ingress == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -1076,7 +1080,7 @@ esp_err_t local_http_server_start_with_reason(const char *reason)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = gateway_config_get()->local_http_port;
     config.max_open_sockets = 4;
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 15;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8192;
 
@@ -1108,6 +1112,8 @@ esp_err_t local_http_server_start_with_reason(const char *reason)
         {.uri = ESP111_PROTOCOL_ROUTE_RADAR_DEBUG, .method = HTTP_GET, .handler = radar_debug_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_DEVICE_STREAM, .method = HTTP_POST, .handler = device_stream_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_VOICE_TURN, .method = HTTP_POST, .handler = voice_proxy_handle_turn},
+        {.uri = ESP111_PROTOCOL_ROUTE_VOICE_SESSION, .method = HTTP_POST, .handler = home_ai_voice_session_handler},
+        {.uri = ESP111_PROTOCOL_ROUTE_VOICE_OFFLINE_COMMAND, .method = HTTP_POST, .handler = home_ai_offline_voice_command_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_WAKE_PROMPT_AUDIO, .method = HTTP_GET, .handler = wake_prompt_cache_gateway_handle_http},
         {.uri = ESP111_PROTOCOL_ROUTE_COMMANDS_PENDING, .method = HTTP_GET, .handler = commands_pending_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_COMMAND_ACK_WILDCARD, .method = HTTP_POST, .handler = command_ack_handler},

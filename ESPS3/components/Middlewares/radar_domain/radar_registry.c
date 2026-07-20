@@ -161,6 +161,7 @@ static void initialize_slot(radar_source_id_t source)
     memset(slot, 0, sizeof(*slot));
     slot->entry.source = source;
     slot->entry.snapshot.state = RADAR_STATE_UNKNOWN;
+    slot->entry.count_summary.count_state = RADAR_PERSON_COUNT_UNKNOWN;
     copy_text(slot->entry.device_id, sizeof(slot->entry.device_id), s_device_ids[source]);
     copy_text(slot->entry.room_id, sizeof(slot->entry.room_id), s_room_ids[source]);
 }
@@ -276,9 +277,19 @@ static void copy_payload_to_snapshot(radar_registry_entry_t *entry,
     }
 }
 
+static radar_count_summary_t fallback_count_summary(const radar_protocol_payload_t *payload)
+{
+    radar_count_summary_t summary = {.count_state = RADAR_PERSON_COUNT_UNKNOWN};
+    if (payload != NULL) {
+        summary.visible_track_count = payload->target_count;
+    }
+    return summary;
+}
+
 radar_registry_update_result_t radar_registry_update_remote(
     radar_source_id_t source,
     const radar_protocol_payload_t *payload,
+    const radar_count_summary_t *count_summary,
     uint32_t session_generation,
     uint64_t received_at_ms,
     bool *out_state_changed)
@@ -329,6 +340,7 @@ radar_registry_update_result_t radar_registry_update_remote(
     }
 
     copy_payload_to_snapshot(entry, payload, received_at_ms);
+    entry->count_summary = count_summary != NULL ? *count_summary : fallback_count_summary(payload);
     entry->source_online = payload->uart_online && payload->frame_fresh;
     entry->sequence = payload->sequence;
     entry->source_uptime_ms = payload->uptime_ms;
@@ -347,6 +359,7 @@ radar_registry_update_result_t radar_registry_update_remote(
 }
 
 bool radar_registry_update_local(const radar_snapshot_t *snapshot,
+                                 const radar_count_summary_t *count_summary,
                                  const radar_registry_local_diagnostics_t *service_diagnostics,
                                  uint64_t received_at_ms,
                                  bool *out_state_changed)
@@ -362,6 +375,8 @@ bool radar_registry_update_local(const radar_snapshot_t *snapshot,
     const bool old_online = entry->source_online;
     const radar_presence_state_t old_state = entry->snapshot.state;
     entry->snapshot = *snapshot;
+    entry->count_summary = count_summary != NULL ? *count_summary :
+        (radar_count_summary_t){.count_state = RADAR_PERSON_COUNT_UNKNOWN};
     entry->source_online = snapshot->uart_online && snapshot->frame_fresh;
     entry->source_uptime_ms = received_at_ms;
     entry->last_report_ms = received_at_ms;
@@ -429,6 +444,8 @@ void radar_registry_refresh(uint64_t now_ms)
             entry->snapshot.frame_fresh = false;
             entry->snapshot.current_target_count = 0U;
             memset(entry->snapshot.targets, 0, sizeof(entry->snapshot.targets));
+            memset(&entry->count_summary, 0, sizeof(entry->count_summary));
+            entry->count_summary.count_state = RADAR_PERSON_COUNT_UNKNOWN;
             sat_inc_u32(&entry->snapshot.state_seq);
             entry->snapshot.state_since_ms = now_ms;
             entry->last_state_change_ms = now_ms;

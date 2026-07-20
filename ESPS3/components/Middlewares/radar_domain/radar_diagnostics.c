@@ -4,9 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "radar_config.h"
 #include "radar_local_adapter.h"
@@ -20,7 +22,7 @@
 static const char TAG[] = "radar_diag";
 static TaskHandle_t s_task;
 /* The full value snapshot is larger than the diagnostics task's safe stack budget. */
-static radar_diag_snapshot_t s_task_snapshot;
+static radar_diag_snapshot_t *s_task_snapshot;
 static radar_registry_entry_t s_registry_entries[RADAR_SOURCE_COUNT];
 
 static uint64_t now_ms(void)
@@ -381,9 +383,9 @@ static void diagnostics_task(void *arg)
         const uint64_t current_ms = now_ms();
         radar_registry_refresh(current_ms);
 
-        if (radar_diag_snapshot_copy(&s_task_snapshot)) {
-            for (size_t i = 0U; i < s_task_snapshot.registry_count; ++i) {
-                const radar_diag_registry_snapshot_t *entry = &s_task_snapshot.registry[i];
+        if (radar_diag_snapshot_copy(s_task_snapshot)) {
+            for (size_t i = 0U; i < s_task_snapshot->registry_count; ++i) {
+                const radar_diag_registry_snapshot_t *entry = &s_task_snapshot->registry[i];
                 if (have_previous &&
                     (entry->snapshot.state != previous_state[i] ||
                      entry->source_online != previous_online[i])) {
@@ -393,10 +395,10 @@ static void diagnostics_task(void *arg)
                 previous_state[i] = entry->snapshot.state;
                 previous_online[i] = entry->source_online;
             }
-            have_previous = s_task_snapshot.registry_count == RADAR_SOURCE_COUNT;
+            have_previous = s_task_snapshot->registry_count == RADAR_SOURCE_COUNT;
 
-            if (s_task_snapshot.has_local_spatial) {
-                const radar_spatial_snapshot_t *spatial = &s_task_snapshot.local_spatial;
+            if (s_task_snapshot->has_local_spatial) {
+                const radar_spatial_snapshot_t *spatial = &s_task_snapshot->local_spatial;
                 if (have_previous &&
                     (spatial->sensor_state != previous_sensor ||
                      spatial->occupancy_state != previous_occupancy ||
@@ -404,10 +406,10 @@ static void diagnostics_task(void *arg)
                      spatial->diagnostics.recovery.state != previous_recovery)) {
                     ESP_LOGI(TAG,
                              "local transition sensor=%s occupancy=%s motion=%s recovery=%s frame_age_ms=%lu",
-                             s_task_snapshot.sensor_state,
-                             s_task_snapshot.occupancy_state,
-                             s_task_snapshot.motion_state,
-                             s_task_snapshot.recovery_state,
+                             s_task_snapshot->sensor_state,
+                             s_task_snapshot->occupancy_state,
+                             s_task_snapshot->motion_state,
+                             s_task_snapshot->recovery_state,
                              (unsigned long)spatial->frame_age_ms);
                 }
                 previous_sensor = spatial->sensor_state;
@@ -422,7 +424,7 @@ static void diagnostics_task(void *arg)
             if (false && (last_log_ms == 0U ||
                           current_ms - last_log_ms >= RADAR_CONFIG_DIAGNOSTICS_LOG_MS)) {
                 last_log_ms = current_ms;
-                log_summary(&s_task_snapshot, current_ms);
+                log_summary(s_task_snapshot, current_ms);
                 ESP_LOGI(TAG,
                          "RADAR_DIAG_STACK_MONITOR free_words=%u",
                          (unsigned int)uxTaskGetStackHighWaterMark(NULL));
@@ -440,14 +442,40 @@ esp_err_t radar_diagnostics_start(void)
     if (!radar_registry_init()) {
         return ESP_ERR_NO_MEM;
     }
-    BaseType_t created = xTaskCreate(diagnostics_task,
-                                     "radar_diag",
-                                     RADAR_CONFIG_DIAGNOSTICS_TASK_STACK,
-                                     NULL,
-                                     RADAR_CONFIG_DIAGNOSTICS_TASK_PRIORITY,
-                                     &s_task);
+    if (s_task_snapshot == NULL) {
+        s_task_snapshot = heap_caps_calloc(1U,
+                                           sizeof(*s_task_snapshot),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_task_snapshot == NULL) {
+            ESP_LOGW(TAG, "PSRAM snapshot allocation failed; falling back to internal RAM");
+            s_task_snapshot = heap_caps_calloc(1U,
+                                               sizeof(*s_task_snapshot),
+                                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (s_task_snapshot == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    BaseType_t created = xTaskCreateWithCaps(diagnostics_task,
+                                             "radar_diag",
+                                             RADAR_CONFIG_DIAGNOSTICS_TASK_STACK,
+                                             NULL,
+                                             RADAR_CONFIG_DIAGNOSTICS_TASK_PRIORITY,
+                                             &s_task,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (created != pdPASS) {
+        ESP_LOGW(TAG, "PSRAM task stack allocation failed; falling back to internal RAM");
+        created = xTaskCreate(diagnostics_task,
+                              "radar_diag",
+                              RADAR_CONFIG_DIAGNOSTICS_TASK_STACK,
+                              NULL,
+                              RADAR_CONFIG_DIAGNOSTICS_TASK_PRIORITY,
+                              &s_task);
+    }
     if (created != pdPASS) {
         s_task = NULL;
+        heap_caps_free(s_task_snapshot);
+        s_task_snapshot = NULL;
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG,

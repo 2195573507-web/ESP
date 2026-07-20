@@ -2,6 +2,7 @@
 #define RADAR_SPATIAL_STATE_H
 
 #include "radar_coordinate_transform.h"
+#include "radar_person_continuity.h"
 #include "radar_target_tracker.h"
 
 #ifdef __cplusplus
@@ -13,6 +14,7 @@ typedef struct {
     radar_spatial_config_t config;
     radar_zone_map_t zone_map;
     radar_target_tracker_t tracker;
+    radar_person_continuity_t person_continuity;
     radar_spatial_snapshot_t snapshot;
     uint32_t last_frame_seq;
     uint32_t motion_enter_streak;
@@ -25,6 +27,7 @@ radar_spatial_config_t radar_spatial_default_config(void);
 void radar_spatial_state_init(radar_spatial_state_t *state,
                               const radar_spatial_config_t *config,
                               uint64_t now_ms);
+void radar_spatial_state_set_source(radar_spatial_state_t *state, uint8_t source_id);
 void radar_spatial_state_on_frame(radar_spatial_state_t *state,
                                   const radar_frame_t *frame,
                                   bool uart_recovered,

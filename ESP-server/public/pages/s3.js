@@ -1009,9 +1009,11 @@
                 ${renderDeviceOverview(data.devices || [])}
                 ${renderSmartHomeOverview(data)}
                 ${renderAlarmPanel(data)}
+                <section class="s3-section" data-home-ai-dashboard></section>
             </div>
         `;
         container.dataset.s3DashboardReady = "true";
+        window.HomeAiDashboard?.mount(container.querySelector("[data-home-ai-dashboard]"));
     }
 
     function renderLoading(container) {

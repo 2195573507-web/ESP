@@ -136,10 +136,14 @@ function normalizeV3AirQuality(payload) {
         };
     }
 
-    // C5 owns this object. Keep every supplied field, including future v3 fields.
+    // Keep C5-owned V3 fields intact while retaining the established canonical aliases.
+    const compatibility = readAirQualityCompatibility(input);
     return {
         ok: true,
-        airQuality: input
+        airQuality: {
+            ...input,
+            ...compatibility
+        }
     };
 }
 

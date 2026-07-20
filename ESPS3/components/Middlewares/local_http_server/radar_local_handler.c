@@ -11,6 +11,7 @@
 #include "radar_ingest.h"
 #include "radar_gateway_ingest.h"
 #include "radar_local_adapter.h"
+#include "radar_person_continuity.h"
 #include "radar_registry.h"
 #include "radar_service.h"
 
@@ -135,7 +136,7 @@ esp_err_t radar_local_handler(httpd_req_t *req)
 esp_err_t radar_debug_handler(httpd_req_t *req)
 {
     if (req == NULL) return ESP_ERR_INVALID_ARG;
-    char body[2048];
+    char body[4096];
     size_t used = 0U;
     bool first_target = true;
     if (!append_text(body, sizeof(body), &used, "{\"targets\":[")) {
@@ -167,6 +168,7 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
         if (!radar_gateway_ingest_get_output(local_id, &output)) continue;
         for (uint8_t index = 0U; index < output.target_count; ++index) {
             const radar_gateway_target_output_t *target = &output.targets[index];
+            if (!target->visible) continue;
             if (!append_text(body, sizeof(body), &used,
                              "%s{\"source_id\":%u,\"id\":%lu,\"x_mm\":%ld,\"y_mm\":%ld,"
                              "\"speed_cm_s\":%d,\"confidence\":%u,\"visible\":%s}",
@@ -204,7 +206,15 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
             ? debug_presence_occupancy_name(entry.snapshot.state) : "unknown";
         const char *recovery_state = online ? "RUNNING" : "FAILED";
         uint32_t targets = has_entry ? entry.snapshot.current_target_count : 0U;
-        uint32_t tracks = targets;
+        uint32_t tracks = 0U;
+        uint32_t raw_targets = 0U;
+        uint32_t accepted_targets = 0U;
+        uint32_t confirmed_active_tracks = 0U;
+        uint32_t history_tracks = 0U;
+        uint32_t visible_persons = 0U;
+        uint32_t retained_persons = 0U;
+        uint32_t business_persons = 0U;
+        radar_person_count_state_t count_state = RADAR_PERSON_COUNT_UNKNOWN;
         uint32_t accepted = has_entry ? entry.diagnostics.accepted_count : 0U;
         uint32_t bad_header = 0U;
         uint32_t bad_tail = 0U;
@@ -219,6 +229,17 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
                 ? debug_occupancy_name(local_snapshot.occupancy_state) : "unknown";
             recovery_state = debug_recovery_state_name(local_service.recovery.state);
             tracks = has_local_snapshot ? local_snapshot.track_count : 0U;
+            if (has_local_snapshot) {
+                raw_targets = local_snapshot.count_summary.raw_target_count;
+                accepted_targets = local_snapshot.count_summary.accepted_target_count;
+                tracks = local_snapshot.count_summary.visible_track_count;
+                confirmed_active_tracks = local_snapshot.count_summary.confirmed_active_track_count;
+                history_tracks = local_snapshot.count_summary.history_target_count;
+                visible_persons = local_snapshot.count_summary.visible_person_count;
+                retained_persons = local_snapshot.count_summary.retained_person_count;
+                business_persons = local_snapshot.count_summary.business_person_count;
+                count_state = local_snapshot.count_summary.count_state;
+            }
             accepted = local_service.parser.valid_frames;
             bad_header = local_service.parser.bad_header;
             bad_tail = local_service.parser.bad_tail;
@@ -234,7 +255,15 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
                 sensor_state = online ? "online" : "offline";
                 occupancy = debug_occupancy_name(output.occupancy);
                 targets = output.target_count;
-                tracks = output.target_count;
+                raw_targets = output.count_summary.raw_target_count;
+                accepted_targets = output.count_summary.accepted_target_count;
+                tracks = output.count_summary.visible_track_count;
+                confirmed_active_tracks = output.count_summary.confirmed_active_track_count;
+                history_tracks = output.count_summary.history_target_count;
+                visible_persons = output.count_summary.visible_person_count;
+                retained_persons = output.count_summary.retained_person_count;
+                business_persons = output.count_summary.business_person_count;
+                count_state = output.count_summary.count_state;
                 last_update = output.updated_at_ms;
             }
         }
@@ -242,7 +271,11 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
         if (!append_text(body, sizeof(body), &used,
                          "%s{\"source\":\"%s\",\"device_id\":\"%s\",\"online\":%s,"
                          "\"sensor_state\":\"%s\",\"occupancy\":\"%s\",\"targets\":%lu,"
-                         "\"tracks\":%lu,\"accepted\":%lu,\"bad_header\":%lu,"
+                         "\"tracks\":%lu,\"raw_target_count\":%lu,\"accepted_target_count\":%lu,"
+                         "\"visible_track_count\":%lu,\"confirmed_active_track_count\":%lu,"
+                         "\"history_target_count\":%lu,\"visible_person_count\":%lu,"
+                         "\"retained_person_count\":%lu,\"business_person_count\":%lu,"
+                         "\"count_state\":\"%s\",\"accepted\":%lu,\"bad_header\":%lu,"
                          "\"bad_tail\":%lu,\"resync\":%lu,\"recovery_state\":\"%s\","
                          "\"last_update\":%llu}",
                          source == RADAR_SOURCE_S3_LOCAL ? "" : ",",
@@ -253,6 +286,15 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
                          occupancy,
                          (unsigned long)targets,
                          (unsigned long)tracks,
+                         (unsigned long)raw_targets,
+                         (unsigned long)accepted_targets,
+                         (unsigned long)tracks,
+                         (unsigned long)confirmed_active_tracks,
+                         (unsigned long)history_tracks,
+                         (unsigned long)visible_persons,
+                         (unsigned long)retained_persons,
+                         (unsigned long)business_persons,
+                         radar_person_count_state_name(count_state),
                          (unsigned long)accepted,
                          (unsigned long)bad_header,
                          (unsigned long)bad_tail,

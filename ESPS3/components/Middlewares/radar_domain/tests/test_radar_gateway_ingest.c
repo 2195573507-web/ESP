@@ -49,6 +49,10 @@ static void test_schema_and_identity_boundary(void)
     assert(parsed.local_id == 2U && parsed.request_sequence == 10U);
     assert(parsed.targets[0].slot == 0U && parsed.targets[0].resolution_mm == 320U);
     assert(output.local_id == 2U && output.radar_online);
+    assert(output.count_summary.raw_target_count == 1U);
+    assert(output.count_summary.accepted_target_count == 0U);
+    assert(output.count_summary.visible_track_count == 0U);
+    assert(output.count_summary.business_person_count == 0U);
     assert(radar_gateway_ingest_process_json(valid_json,
                                              strlen(valid_json),
                                              "sensair_shuttle_01",

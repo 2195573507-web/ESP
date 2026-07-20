@@ -1,0 +1,118 @@
+# Home AI Agent v2.0 实施进度
+
+## 2026-07-19
+
+- 已从前一模型中断点恢复，不重复 Phase 0 审计。
+- 已确认工作区 dirty 状态及大量用户既有修改/删除内容，后续不执行破坏性 Git 操作。
+- 已读取流程技能；用户指定的 v2.0 文档视为已批准设计，不另起设计阶段。
+- 下一步：运行当前 Home AI host tests 和 fresh S3 build，定位最近新增历史/上报/网络接口的真实编译问题。
+- host tests 全部通过：voice session、room state、rule engine、virtual device、history store。
+- fresh S3 build 通过（隔离目录 `/tmp/espcomplete-home-ai-pre-runtime-s3-v2`）：镜像 `0x123860`，最小 app 分区剩余 84%，独立 `home_ai` 分区 2 MB。
+- 已确认下一组实现边界：新增 runtime 小模块并接入既有 scheduler/orchestrator；改造 smart-home pending 分支为虚拟设备执行；Server package route 与 S3 checksum/rollback 对齐。
+- ESP-server 基线 `npm test` 通过：smoke regression 与 Home AI schema tests 均通过，使用临时 SQLite/端口，未启动生产服务。
+- Phase 5 fresh S3 build 已通过：`/tmp/espcomplete-home-ai-phase5-s3`，镜像 `0x12aab0`，最小 app 分区剩余 83%。
+- Phase 5 fresh C51/C52 构建会话已结束，待从各自构建日志确认最终镜像和 warning 状态。
+- Phase 6 最新历史保留补丁尚未构建；只读检查发现 `home_ai_history_flush()` 在局部变量声明前引用 `pending`，下一步先用 host tests 固化保留/淘汰/重启语义并修复。
+- Phase 5 C51/C52 fresh build 均通过：镜像 `0x1acca0`，最小 app 分区剩余 67%；S3 镜像 `0x12aab0`，最小 app 分区剩余 83%。
+- Phase 6 历史模块已修复编译错误，并完成 24h 保护、72h prune、80% 告警、受保护拒绝、优先级替换和跨进程重启索引恢复测试；全部 Home AI host tests 通过。
+- 新增容量压力 `offline_buffer` 边沿事件，复用现有 event/replay worker，无新 task，避免 reporter 递归。
+- 续接恢复已完成：重新读取 v2.0 唯一实施依据、阶段文件和 dirty worktree；Phase 6 仍保持 `in_progress`，Server Phase 7-10 的已写代码在完成对应 API/Web/回归门禁前不提前标记完成。
+- 识别到跨端播放语义尚未闭环：`speaker.play_audio` 已携带提示文本，但 C5 当前仍播放固定 wake-prompt PCM；后续将复用现有 Server TTS、S3 wake-prompt gateway 和 C5 播放资源管理链路，保留原唤醒确认行为不变。
+- Phase 6 Home AI host tests 再次全部通过；fresh S3 构建首次尝试因旧摘要中的 ESP-IDF 路径不存在而未启动，正在从本机安装定位真实路径。
+- 实际 ESP-IDF 路径已定位为 `/Users/zhiqin/.espressif/v5.5.4/esp-idf`；Phase 6 fresh S3 build 通过，镜像 `0x12b530`，最小 app 分区剩余 83%，未见编译 warning/error。
+- 动态提示音三端协议已闭环：Server 支持 95-byte `prompt_text` 与文本哈希缓存，S3 固定缓冲解码并缓存/流式返回精确文本 PCM，C51/C52 新增 `wake_prompt_cache_play_text()`，原 wake ACK 播放保持不变。
+- 动态提示音后的 fresh builds 全部通过：C51/C52 镜像均为 `0x1ace80`（app 剩余 66%），S3 镜像 `0x12ba40`（app 剩余 83%）；C51/C52 相关实现字节一致。
+- ESP-server 完整 `npm test` 通过：smoke regression（含自定义提示音 miss/hit/超长拒绝）、Home AI Schema、Home AI control-plane 全部 PASS；Phase 6 标记完成，进入 Phase 7。
+- 本轮从 Phase 7 检查点恢复；`session-catchup.py` 无未同步报告，并已按 v2.0 原文纠正 Phase 8-10 跟踪标题，既有产品代码和用户 dirty 修改均未触碰。
+- Phase 7 源码审计完成：确认 `/config` 未被 S3 消费、override 未下发，已确定复用现有 rule sync/notification worker 的 checksum 配置快照方案，下一步先补协议与 host/API tests 再接运行链路。
+- Phase 7 配置链路已接线：Server 生成 canonical checksum 快照与配置通知；S3 复用现有 network worker 拉取并在 runtime lock 内应用，转换 Server epoch override TTL，保留本地 overrides，并让 BME、语音路由和 quiet schedule 跟随动态 source/room 映射。
+- Phase 7 门禁通过：Home AI host tests、Server `npm test`、Node syntax、`git diff --check` 全部 PASS；fresh S3 镜像 `0x12d090`（app 分区剩余 83%）；桌面/移动 Playwright 全流程无 console/page/request 错误、无横向溢出。Phase 7 标记完成，进入 Phase 8。
+- Phase 8 已完成初步源码审计，下一步先扩展 command/decision 关联和严格分层响应，再补 API/host-style Node tests。
+- Phase 8 完成：严格 intent/tool 白名单、最多 4 步/每步 4 动作与 3 工具并发上限、60 秒整体 deadline、分层 response_type/steps/speech_policy、控制 JSON 与语音分离、实际结果摘要、WAITING_ACK/PARTIAL/FAILED 状态均已落库。
+- smart-home command 增加 decision_id；新增 durable ACK 暂存/回放，覆盖 S3 ACK 早于最终 decision 持久化的竞态；新增 Agent decision 列表/详情 API。
+- Phase 8 门禁通过：Node syntax、完整 `npm test`（含正常 ACK、早到 ACK、意图工具越权拒绝和决策 API）、`git diff --check` 全部 PASS；本阶段无固件改动，进入 Phase 9。
+- Phase 9 完成：天气工具严格校验 IANA 时区/坐标、未来/过期数据拒绝并直接报错；新闻强制 HTTPS 与未来时间过滤；成功 weather 结果写入带 expiry 的 `weather_context`，失败立即标记 unavailable。
+- Server `/api/home-ai/v1/config` 快照新增 `weather_context`；S3 在原有配置同步锁内校验并转换 weather TTL，过期/失败时规则引擎 `weather_available=false`，天气依赖规则 fail-closed，不新增任务或网络栈。
+- 新增场景简报 eligibility、置信度/有人/C5/静音/重复门禁、客厅 web-only 路由和 30 分钟去重记录；Web 增加工具与简报标签、决策步骤/ACK 展示、位置/新闻配置与天气刷新。
+- Phase 9 门禁通过：Node syntax、完整 `npm test`、Home AI host tests、fresh S3 build（`0x12d300`，83% app 空闲）、`git diff --check`、桌面路径/390px 移动浏览器验收全部 PASS。
+- Phase 10 完成：明确反馈才进入 habit evidence；Memory candidate 可修改、确认、禁止/允许自动化和删除；habit 达到 5 个样本且置信度不低于 0.85 后生成规则候选。
+- 自动发布门禁改为 Server 自主计算，客户端提交的 gate 布尔值不能绕过；门禁覆盖实际 evidence、Schema/资源、冲突、安全、影响范围、历史 room-state 回放、新鲜度和触发率预测。
+- 新候选只对目标规则启动 3-7 天 probation；S3 decision/suppressed 事件和明确反馈共同更新触发、失败、覆盖、冲突、快速反转、传感器不可靠和重复播报指标，异常自动回滚，证据不足到期自动暂停。
+- Phase 10 门禁通过：完整 `npm test`、Home AI host tests、Node syntax、`git diff --check`；隔离 SQLite/临时端口的桌面与 390x844 Edge 验收覆盖反馈、Memory 全生命周期、伪造门禁拒绝、probation 重评估和 Agent decision，无 console/page/request 错误，移动端无横向溢出。
+- 最终资源门禁发现 S3 静态 DIRAM 仅余 5,345 bytes；已将规则三代存储/运行态、12 槽用户覆盖和 9 槽虚拟设备改为启动期一次性固定 PSRAM backing，容量、无新 task 和重复 init 清空语义保持不变。
+- 资源迁移后 Home AI host tests 全部 PASS；新增 rule engine 重复初始化清空并重新加载回归用例，`git diff --check` PASS。下一步以隔离目录 fresh build 和 map diff 验证实际内部 RAM 回收量。
+- 最终 S3 fresh build `/tmp/espcomplete-home-ai-final-s3-psram.j291tc` PASS：镜像 `0x12d250`，app 余 83%；DIRAM 由 98.44% 降到 89.31%，回收 31,200 bytes，IRAM 零变化，Flash non-RAM 减少 188 bytes。
+- 最终 C51 `/tmp/espcomplete-home-ai-final-c51.cU378W` 与 C52 `/tmp/espcomplete-home-ai-final-c52.gNNLks` 顺序 fresh build PASS：镜像均为 `0x1ace80`，app 余 66%，构建日志无 warning/error。
+- 最终 Server `npm test`、全量 JS syntax、C51/C52/S3 radar、S3 continuity/spatial/ingest、environment alarm 和 Home AI host tests 全部 PASS；跨端 common macro、S3 route/Server handler、C51/C52 源码镜像一致性检查通过。
+- 已生成 `docs/Home_AI_Agent_Repositioned_Implementation_Report_v2.0.md`，等待最后一次 tracked/untracked whitespace、`git diff --check` 和状态门禁后关闭最终验收。
+- 最终 tracked `git diff --check` 与本轮 untracked 实现/测试/报告 whitespace 等价检查均 PASS；原始 v2.0 计划的引用块保留既有 Markdown 强制换行尾空格，不修改唯一实施依据。最终验收标记完成。
+- 完成状态复核：发现六类真实源码缺口，已撤销 Phase 0-10/最终验收的完成标记；既有通过记录保留为历史证据，但不再作为当前完成结论。
+- 当前重新进入 Phase 0 逐项矩阵核验；下一步对照 v2.0 原文确认协议、容量、运行时接线和测试边界，再按阶段顺序修复。
+- 本轮从缺口复核断点恢复；已完整读取 `using-superpowers`、`brainstorming` 与 `planning-with-files-zh`。用户指定的 v2.0 文档继续作为已批准且唯一的设计依据，不另行发散或暂停审批；Phase 0 保持 `in_progress`。
+- Phase 0 当前基线：Server `npm test` 三组通过，S3 Home AI host tests 通过，C51/C52 shared protocol header 字节一致。三端 fresh build 首次因 ESP-IDF Python 环境未初始化而未启动，已定位为缺少显式 `IDF_PYTHON_ENV_PATH`，正在用现有 3.14 环境重跑。
+- Phase 0 完成：只读矩阵确认 C5/S3/Server/Web 真实职责、接口、分区、固定容量和既有 task 复用；Server 原始音频无落盘证据，自动 retention scheduler 仍是后续缺口。三端 fresh build 与资源报告通过，未执行硬件/生产操作；进入 Phase 1。
+- Phase 1 完成：S3 voice session mutex 改为静态存储；房间协议三端新增 `voice_terminal_device_id`，Server/S3 同步做固定长度、字符集、已知终端与唯一性校验，默认/重绑配置和 host 回归覆盖；Server、Home AI host、三端 fresh build、warning 扫描与 `git diff --check` 通过；进入 Phase 2。
+- Phase 2 完成：room-state 对 `entries == NULL && count > 0` fail-closed，`count == 0` 保持 unknown 降级；Home AI/radar/Server 回归通过，S3 fresh build `0x12d430`（83% app 空闲），warning/error 扫描和 `git diff --check` 通过；进入 Phase 3。
+- Phase 3 完成：规则引擎新增 unknown presence 下非 safety 灯 `turn_off` 的可解释 `suppressed_unknown_presence`，safety 例外保留；Home AI、环境告警、Server 回归和 S3 fresh build `0x12d490` 通过，warning/error 扫描与 `git diff --check` 通过；进入 Phase 4。
+- Phase 4 完成：smart-home virtual command 改为 APPLIED/NOOP 后才建立覆盖，ACK `verified` 与 dashboard completed 只取本地虚拟执行事实；新增独立 gateway host test，Home AI/Server/S3 fresh build `0x12d4c0`、warning/error 与 `git diff --check` 通过；进入 Phase 5。
+- 2026-07-19 Phase 5 续接：已运行 planning session catch-up 并复核 v2.0 5.4/5.5/6.15/6.16 与 Phase 5 原文；确认本阶段限定为配置驱动终端路由、固定容量 generation/ACK 生命周期和七组合紧急路由证明，不改变旧通用 `speaker.play_audio` 兼容行为。
+- Phase 5 测试入口首次直接执行 `run_host_tests.sh` 返回 exit 126（脚本无可执行位）；不修改用户文件权限，后续改用 `sh ESPS3/components/Middlewares/home_ai/tests/run_host_tests.sh`。
+- Phase 5 固件 host 门禁通过：voice session、配置驱动 voice router、command ACK policy、room state、rule engine、virtual device 及 history 五种场景全绿；新增覆盖动态终端重绑/空终端、紧急七组合、部分与全部 enqueue 失败、双终端 pending ACK、重复 ACK 和超时释放。`git diff --check` 通过，C51/C52 命令执行源与协议头逐字一致。
+- Phase 5 完成：Server `npm test`、Home AI host、三端 fresh build、三端 warning/error 日志扫描、C51/C52 源码镜像与 `git diff --check` 全部通过。S3 镜像 `0x12da40`（83% app 空闲），C51/C52 均 `0x1ace80`；未 flash/monitor，进入 Phase 6。
+- Phase 6 审计完成：规则/历史核心链保持现有实现，不重写；本阶段开始修复 runtime 固定数组清零、weather fail-closed 兼容、rooms/terminal 离线快照、空规则版本跳过和离线计数可观测性。
+- Phase 6 完成：新增 weather parser（旧缺字段 unavailable、存在非法字段拒绝）、rooms/terminal CRC 快照（启动恢复且不恢复 weather/overrides）、runtime 全数组按元素大小清零、空规则同版本跳过和 offline drop/storage/protected 计数 60 秒限频事件；Home AI host、Server、C5/S3 radar、environment alarm、smart gateway、S3 fresh build 与 warning/error 扫描全部 PASS。S3 `0x12dfc0`，DIRAM `305631/341760`（余 36129），IRAM `16384/16384`；未 flash/monitor，进入 Phase 7。
+- Phase 6 新增 weather/config-store host 测试首次通过；event-reporter host 编译首次因测试桩缺少同文件 `network_worker_submit_home_ai_virtual_state` 声明而被 `-Werror` 拒绝，已补齐测试桩声明后重跑，生产接口未改。
+
+## 2026-07-20
+
+- Phase 7 重新门禁完成：Server `npm test` 四组、全套 Home AI、C51/C52/S3 radar、S3 radar domain、environment alarm 和 smart-home gateway host tests 全部 PASS；`git diff --check` PASS。
+- Phase 7 三端隔离 fresh build PASS：S3 `/tmp/espcomplete-home-ai-phase7-s3-rerun.ggd0oO` 镜像 `0x12dfc0`，app 余 83%，DIRAM `305631/341760`（余 36129），IRAM `16384/16384`；C51/C52 镜像均 `0x1ace80`，app 余 66%，HP SRAM 均 `188754/320928`。三个 IDF build 日志均无 `warning:`、`error:`、`fatal error` 或 `FAILED`。
+- Phase 7 隔离 Web 验收使用临时 SQLite `/tmp/esp-home-ai-phase7-web-rerun.rR5JWP/home.sqlite` 和端口 `45129`；桌面端验证房间重命名后规则显示 `MIGRATED` 与迁移摘要、留存策略保存和 API 回读，390x844 移动端验证留存布局，无横向溢出、console/page/request error。临时 Server 已按 SIGINT drain 后关闭。
+- Phase 7 标记完成，进入 Phase 8；旧进度中的 Phase 8-10 结论只作历史记录，当前仍按 v2.0 原文重新核验源码、测试和门禁。
+- Phase 8 续接源码复核完成：提示词 profile 未实际驱动模型、voice turn 未进入 Agent 编排、计划缺简单前置条件。Phase 10 当前缺口为 probation 无自主到期收口、公共评估信任客户端 metrics/force、自动回滚未绑定试运行包；Phase 9 另有新闻 URL 泛化错误码待修复。
+- Phase 8 分层链路完成重验：12 类 system prompt 实际驱动 conversation/intent/tool/plan/final speech；voice ASR 文本增量进入 Agent 编排并保留普通对话回退；复杂步骤支持 `previous_step_succeeded`，控制 JSON 不进入 TTS，ACK 前不宣称完成。
+- Phase 8 同步补齐 S3 内置离线固定命令入口和 `speaker.stop_audio` 三端协议；C5 只转发受信任文本 token 并执行播放中止，不承担 ASR/复杂语义。词表/否定句拒绝、房间选择、静音失败回滚、暂停/保持清理、撤销与停止路由均有 host 回归。
+- Phase 8 门禁 PASS：Server 完整 `npm test`、全量 JS syntax、Home AI host tests、三端 fresh build、warning/error 扫描、C51/C52 命令源码镜像和 `git diff --check`。S3 `0x12f460`（app 余 83%），C51/C52 均 `0x1acf90`（app 余 66%）；未 flash/monitor，进入 Phase 9。
+- Phase 9 修复 `get_news` 非 URL 的原生 `TypeError`：未配置、非法 URL、非 HTTPS 现在统一返回 `NEWS_NOT_CONFIGURED`，新增三种回归；天气失败/过期仍直接报错并同步 unavailable，场景简报门禁与去重保持不变。
+- Phase 9 门禁 PASS：Server 完整 `npm test`、Home AI host tests、Node syntax、S3 fresh build `/tmp/espcomplete-home-ai-phase9-s3`（`0x12f460`，app 余 83%）、构建 warning/error 扫描和 `git diff --check`；未 flash/monitor，进入 Phase 10。
+- Phase 10 完成：Memory 首次确认未指定时默认 `automation_allowed=false`；公共 candidate/probation evaluate API 不再信任客户端 `metrics`、`force` 或 `gates`，自动发布和回滚只使用 Server 已落库证据。
+- 新增 Server probation 自主扫描：启动时立即执行，之后每 5 分钟扫描，单飞且每批最多 100 条。自动回滚必须确认当前活动版本仍是该 probation 包，并显式恢复该包发布前版本；已有更新包时拒绝误回滚。
+- Phase 10 门禁 PASS：Server `npm test` 六组、全量 `node --check`、S3 Home AI 十一类 host tests、既有 radar/environment/smart-home/BLE/Debug parser 回归和三端 fresh build 全部通过；构建日志扫描无 warning/error/fatal/FAILED。
+- Phase 10 三端构建：S3 `/tmp/espcomplete-home-ai-phase10-s3` 镜像 `0x12f460`，app 余 83%；C51/C52 `/tmp/espcomplete-home-ai-phase10-c51` 与 `/tmp/espcomplete-home-ai-phase10-c52` 均为 `0x1acf90`，app 余 66%。S3 DIRAM `305631/341760`（余 `36129`）、IRAM `16384/16384`；C51/C52 HP SRAM 均为 `188754/320928`（余 `132174`）。
+- Phase 10 Web 隔离验收 PASS：临时 SQLite、临时端口 `45133`，桌面和 390x844 移动 Edge 覆盖反馈、Memory 候选/确认/禁止自动化、工具/简报配置和 decision；无横向溢出、console/page/request error，临时 Server 已关闭。
+- 最终验收进入文档与工作区门禁收尾：产品代码、host 回归、三端构建和 Web 隔离验收均已完成，未执行 flash、monitor 或真实生产服务。
+- 最终复跑：`ESP-server/npm test` 六组全部 PASS；S3 Home AI voice session/router、local voice command、ACK policy、weather、config、event reporter、room state、rule engine、virtual device、history host tests 全部 PASS。
+- 最终静态门禁：`git diff --check` PASS；排除作为唯一输入依据的原始 v2.0 计划尾空格后，所有未跟踪实现/测试/报告文件检查通过；三份 Phase 10 构建日志无 warning/error/fatal/FAILED。
+- 真实 `ESP-server/db/database.db` 位于 `.gitignore` 的 `*.db` 范围，无 Git 差异，本轮测试均使用临时 SQLite；未启动真实生产 Server。
+- 最终验收完成：计划、进度、发现和实施报告已同步，工作区仍保留用户原有 dirty 修改/删除，未 stage、commit 或执行破坏性清理。
+- 完成审计续接已重新读取 v2.0 5.1/5.4/5.5、6.2/6.14-6.19、13-17 与当前 voice session/router/runtime。确认紧急提醒生命周期、语音会话阶段生产接线和主动唤醒 temporary-awake 为真实软件缺口；离线 PCM->token 不在 6.14 当前固件实现定义内，不下沉复杂 ASR 到 C5，也不把文本入口 host test 误报为实机离线语音成功。
+- 跟踪追加的第一次补丁因预期 `findings.md` 章节标题不存在而原子失败，未改写任何文件；已按实际 EOF 上下文重新追加。
+- 紧急链路复核确认：复用 environment alarm reporter 的已深拷贝事件作为输入；新增固定槽语音协调状态机，不复制阈值/恢复判断。Server/Web 需补幂等用户确认入口；播放 ACK 仅释放 generation/inflight，不作为用户确认。
+- 已确定实现契约：8 个 PSRAM 固定紧急槽、每 tick 最多 2 次派发、同一 `env_<alarm_id>` 生命周期、未确认按 1/3/5 分钟后每 5 分钟、用户确认后每 10 分钟、恶化立即重升级、恢复播报成功 ACK 后 RESOLVED；无目标恢复只上传并收口。确认通过现有 config checksum 通知同步。
+- Phase 11 第一次 Home AI host 回归：voice session 通过；voice router 旧测试因在 `NORMAL` 状态仍期望 `TEMPORARY_AWAKE` 而失败。产品实现按 6.18 只在 scheduled/sleep quiet 时临时退出静音，测试将改为真实夜间前置条件并补状态转换覆盖。
+- 紧急协调器首次 host 编译因测试命令缺少既有 `radar_registry.h` 间接 include 路径失败；environment alarm engine/adapter/reporter 全套同期通过，产品链接尚未执行。测试命令补齐 radar_domain/radar_ld2450 include 后重跑。
+- 紧急协调器第二次 host 编译已完成，链接阶段只缺独立测试进程的 `esp_timer_get_time` 与静态 semaphore 桩；补齐与 voice-session 测试相同的桩，不改产品源码。
+- 紧急协调器第三次 host 编译提示测试文件未包含 FreeRTOS stub 类型头；加入既有 `FreeRTOS.h/semphr.h` 后继续，仍未改变产品实现。
+- Phase 11 完成：C51/C52/S3 语音 state 协议与生产状态链保持镜像；主动唤醒只在静音房间启用固定 10 分钟 temporary-awake；紧急协调器、用户确认同步、恶化重升级和恢复 ACK 已接入既有 reporter/runtime/command/config 链，无新增 task。
+- Phase 11 三端 fresh build 和 size PASS：S3 `/tmp/espcomplete-home-ai-phase11-s3` 镜像 `0x1306b0`、app 余 83%、DIRAM 307399/341760、IRAM 16384/16384；C51/C52 镜像均 `0x1ad2b0`、app 余 66%、HP SRAM 188762/320928。
+- 最终完整回归 PASS：Server `npm test` 六组与全量 `node --check`；Home AI 十二类、environment alarm、C51/C52/S3 radar、S3 continuity/spatial/ingest、smart-home gateway、Debug parser；协议镜像和 7 条 S3 Server route 一致。
+- Web 最终隔离验收先发现确认后刷新仍显示“需确认”，已用 Server 派生 `user_acknowledged` 修复；桌面与 390x844 移动 Edge 均验证确认落库、即时已确认状态、无 console/page/request error、无横向溢出，临时 Server 已关闭。
+- 最终 `git diff --check`、未跟踪实现文件尾空格等价检查和三端 Phase 11 构建日志 warning/error/fatal/FAILED 扫描全部 PASS。未 flash、未 monitor、未启动真实生产 Server、未操作真实数据库。
+- Phase 14 fresh build 完成：S3 使用 `/tmp/espcomplete-home-ai-final-s3`，C51 使用 `/tmp/espcomplete-home-ai-final-audit-c51`，C52 使用 `/tmp/espcomplete-home-ai-final-audit-c52`；三端均以 ESP-IDF 5.5.4 与 `idf5.5_py3.14_env` 从零配置并链接成功。
+- Phase 14 `idf.py size`：S3 镜像 `0x1306b0`（`0x5cf950`/83% app 空闲），DIRAM `307399/341760`（余 `34361`），IRAM `16384/16384`；C51/C52 镜像均 `0x1ad2b0`（`0x352d50`/66% app 空闲），HP SRAM 均 `188762/320928`（余 `132166`）。
+- Phase 14 构建、环境和 size 日志精确扫描无 `warning:`、`error:`、`fatal error` 或 `FAILED`；`git diff --check` 通过。
+- Phase 14 回归复跑：Server 六组 `npm test`、99 个 JS `node --check`、Home AI 15 次 host 执行（12 个目标，history 五种模式）、环境告警、C51/C52/S3 雷达、smart-home gateway 和 Debug parser 全部 PASS。
+- Phase 14 协议/职责门禁：C51/C52 `system_server_client.c` SHA-256 相同，C51/C52 协议头 SHA-256 相同，S3 只增加 Server-only route；S3 七条 gateway route 与 Server handler 一一对应，紧急路由测试覆盖 9 种 presence 组合。
+- Phase 14 已完成。保留所有用户既有 dirty 修改/删除；未 stage、commit、flash、串口 monitor、启动真实 Server 或操作真实数据库。剩余事项仅为报告第 8 节的硬件验收。
+
+## 2026-07-20
+
+- 继续完成审计：确认 Phase 14 的“完成”不能覆盖当前源码复核发现的两项计划缺口。`network_worker` 进入 `LINK_STABLE` 时目前只请求 BME replay，Home AI 规则检查仍等待 60 秒通知或 15 分钟兜底；`promptCache` 对 `home_ai_text_*` 动态 TTS 永久写入 PCM/JSON。
+- 开始 Phase 15：保留现有静态 wake prompt 磁盘缓存，改为动态 Home AI prompt 的有界进程内短期缓存；同时在稳定联网入口复用现有 Home AI rule-sync command worker 做一次性立即检查。
+- Phase 15 修复完成：`network_worker` 只在进入 `LINK_STABLE` 的边沿排入一次 Home AI full sync；新增可信 owner 掉线释放，避免语音租约等待 30 秒过期；规则超限 host case 现在明确拒绝并保留旧包。
+- Phase 15 Server 隐私收口：`home_ai_text_*` 动态 TTS 不再写 PCM/JSON 文件，使用 15 分钟 TTL、16 项、8 MiB LRU 内存上限并发送 `no-store`；voice turn 在 body-parser、校验/配置/并发拒绝及成功/失败/超时/断开 finally 路径清零原始 PCM。静态 wake prompt 配置缓存保持兼容。
+- Phase 15 定向门禁：Home AI host 全部 PASS（联网恢复契约、voice session/router/emergency/local command/ACK/weather/config/reporter/room/rule/virtual/history）；Server 新增 prompt-cache 与 raw-audio lifecycle tests 均 PASS；完整 `npm test`（smoke + 7 个测试文件）PASS。
+- Phase 15 全局回归：101 个非 `node_modules` JavaScript 文件 `node --check` PASS；S3 radar/continuity/spatial/ingest、environment alarm、smart-home gateway、C5 LD2450 parser、Debug parser 全部 PASS；桌面 1440px 与 390x844 Edge Web 回归无 console/page/request 错误和横向溢出。
+- Phase 15 三端最终隔离构建：S3 `/tmp/espcomplete-home-ai-phase15-s3` 增量重链镜像 `0x130790`，DIRAM `307399/341760`、IRAM `16384/16384`；C51 `/tmp/espcomplete-home-ai-phase15-c51` 与 C52 `/tmp/espcomplete-home-ai-phase15-c52` 均 `0x1ad2b0`，HP SRAM `188762/320928`；构建/size 日志无 warning/error/fatal/FAILED，`git diff --check` PASS。
+- Phase 15 已完成。工作区原有 dirty 修改/删除全部保留；未 stage、commit、flash、串口 monitor、启动生产 Server 或操作真实数据库。
+- Phase 15 最终交付前复跑：Server smoke + 7 文件、101 个 JS syntax、Home AI 13 类/17 次、C51/C52/S3 radar、environment alarm、smart-home gateway、C5 BLE stream、Debug parser 全部 PASS；三端 Phase 15 日志无 warning/error/fatal/FAILED，C51/C52 八个镜像文件、共享 Home AI 协议宏值、`git diff --check` 和未跟踪文件尾空格检查均通过。实施报告已更新到最终构建路径、资源、测试、Web、硬件验收和风险边界。

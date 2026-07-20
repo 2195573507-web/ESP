@@ -16,6 +16,7 @@
 #include "app_debug_config.h"
 #include "app_runtime.h"
 #include "app_stack_monitor.h"
+#include "c5_voice_session_client.h"
 #include "c5_resource_manager.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -61,6 +62,7 @@ typedef struct {
     uint32_t mic_generation;
     uint32_t release_retry_count;
     c5_voice_lease_t lease;
+    c5_voice_session_lease_t gateway_session;
 } voice_chain_context_t;
 
 static voice_chain_context_t s_voice;
@@ -70,6 +72,7 @@ static voice_chain_item_t s_terminal_event;
 
 static esp_err_t voice_chain_pause_mic(void);
 static esp_err_t voice_chain_quiesce_mic_for_speaker(const char *reason);
+static esp_err_t voice_chain_release_gateway_session(const char *reason);
 static void voice_chain_abort_round(const char *reason);
 static esp_err_t voice_chain_queue_event(const voice_chain_item_t *item, const char *label);
 static esp_err_t voice_chain_queue_terminal_event(const voice_chain_item_t *item,
@@ -352,6 +355,12 @@ static esp_err_t voice_chain_server_playback_start_sink(void *user_ctx)
     if (!c5_resource_manager_lease_is_current(s_voice.lease.generation)) {
         return ESP_ERR_INVALID_STATE;
     }
+    esp_err_t session_ret = c5_voice_session_client_transition(
+        &s_voice.gateway_session,
+        C5_VOICE_SESSION_STATE_PLAYING);
+    if (session_ret != ESP_OK) {
+        return session_ret;
+    }
     ESP_LOGI(TAG, "server voice PCM playback start");
     voice_chain_set_state(VOICE_PLAYING);
     (void)local_wake_word_on_recording_finished();
@@ -399,6 +408,21 @@ static esp_err_t voice_chain_release_voice_resources(const char *reason)
     } else {
         ESP_LOGW(TAG,
                  "voice resources release failed reason=%s ret=%s",
+                 reason != NULL ? reason : "<none>",
+                 esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static esp_err_t voice_chain_release_gateway_session(const char *reason)
+{
+    if (!c5_voice_session_client_is_valid(&s_voice.gateway_session)) {
+        return ESP_OK;
+    }
+    esp_err_t ret = c5_voice_session_client_release(&s_voice.gateway_session);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "S3 voice session release failed reason=%s ret=%s; local lease invalidated",
                  reason != NULL ? reason : "<none>",
                  esp_err_to_name(ret));
     }
@@ -487,6 +511,10 @@ static esp_err_t voice_chain_finish_or_recover_to_listening(const char *reason, 
     if (first_ret == ESP_OK && release_ret != ESP_OK) {
         first_ret = release_ret;
     }
+    esp_err_t session_ret = voice_chain_release_gateway_session(reason);
+    if (first_ret == ESP_OK && session_ret != ESP_OK) {
+        first_ret = session_ret;
+    }
     if (release_ret != ESP_OK) {
         voice_chain_set_state(VOICE_ERROR);
         voice_chain_schedule_release_retry(reason);
@@ -539,9 +567,19 @@ static esp_err_t voice_chain_prepare_for_server_voice_start(void *user_ctx)
 
         ESP_LOGI(TAG, "enter voice exclusive reason=local_wake");
         voice_chain_set_state(VOICE_WAKE_ACK);
-        esp_err_t ret = c5_resource_manager_begin_voice("voice_chain", &s_voice.lease);
+        esp_err_t ret = c5_voice_session_client_acquire(&s_voice.gateway_session);
+        if (ret != ESP_OK) {
+            ESP_LOGI(TAG,
+                     "local wake denied by S3 voice session ret=%s; recording will not start",
+                     esp_err_to_name(ret));
+            voice_chain_set_state(VOICE_LISTENING);
+            return ret;
+        }
+
+        ret = c5_resource_manager_begin_voice("voice_chain", &s_voice.lease);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "voice resource quiesce failed before local wake ack: %s", esp_err_to_name(ret));
+            (void)voice_chain_release_gateway_session("local_resource_acquire_failed");
             local_wake_word_cancel_recording_window();
             voice_chain_set_state(VOICE_LISTENING);
             return ret;
@@ -596,6 +634,14 @@ static esp_err_t voice_chain_prepare_for_server_voice_start(void *user_ctx)
         return ret;
     }
 
+    ret = c5_voice_session_client_transition(&s_voice.gateway_session,
+                                             C5_VOICE_SESSION_STATE_RECORDING);
+    if (ret != ESP_OK) {
+        (void)server_voice_client_cancel_turn();
+        (void)voice_chain_queue_terminal_error(ret, "S3 voice session recording transition failed");
+        return ret;
+    }
+
     voice_chain_set_state(VOICE_RECORDING);
     ESP_LOGI(TAG, "server voice recording window accepted");
     return ESP_OK;
@@ -629,9 +675,16 @@ static esp_err_t voice_chain_server_voice_finish(void *user_ctx)
     if (!c5_resource_manager_lease_is_current(s_voice.lease.generation)) {
         return ESP_ERR_INVALID_STATE;
     }
+    esp_err_t ret = c5_voice_session_client_transition(
+        &s_voice.gateway_session,
+        C5_VOICE_SESSION_STATE_WAITING_SERVER);
+    if (ret != ESP_OK) {
+        (void)voice_chain_queue_terminal_error(ret, "S3 voice session renewal failed");
+        return ret;
+    }
     voice_chain_set_state(VOICE_WAITING_RESPONSE);
     (void)c5_resource_manager_note_phase(s_voice.lease, "waiting_response");
-    esp_err_t ret = mic_adc_test_pause();
+    ret = mic_adc_test_pause();
     if (ret == ESP_OK) {
         const voice_chain_item_t item = {
             .type = VOICE_CHAIN_EVENT_RECORDING_FINISHED,
@@ -670,6 +723,7 @@ static void voice_chain_cleanup_start_failure(void)
     mic_adc_test_set_voice_stream_ops(NULL);
     local_wake_word_cancel_recording_window();
     (void)server_voice_client_cancel_turn();
+    (void)voice_chain_release_gateway_session("voice_chain_start_failure");
     if (s_voice.event_queue != NULL) {
         vQueueDelete(s_voice.event_queue);
         s_voice.event_queue = NULL;
@@ -734,7 +788,14 @@ static void voice_chain_handle_local_wake(void)
         return;
     }
 
-    esp_err_t ret = voice_chain_quiesce_mic_for_speaker("wake_ack");
+    esp_err_t ret = c5_voice_session_client_renew(&s_voice.gateway_session);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "S3 voice session expired before wake acknowledgement: %s", esp_err_to_name(ret));
+        voice_chain_abort_round("voice_session_renew_before_wake_failed");
+        return;
+    }
+
+    ret = voice_chain_quiesce_mic_for_speaker("wake_ack");
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Mic quiesce before local wake ack failed: %s", esp_err_to_name(ret));
         voice_chain_abort_round("local_wake_mic_pause_fail");
@@ -961,6 +1022,13 @@ esp_err_t voice_chain_start(void)
     voice_chain_log_start_stage("c5_resource_manager_init", "after", ret);
     if (ret != ESP_OK) {
         voice_chain_log_start_failure("c5_resource_manager_init", ret);
+        return ret;
+    }
+    voice_chain_log_start_stage("c5_voice_session_client_init", "before", ESP_ERR_NOT_FINISHED);
+    ret = c5_voice_session_client_init();
+    voice_chain_log_start_stage("c5_voice_session_client_init", "after", ret);
+    if (ret != ESP_OK) {
+        voice_chain_log_start_failure("c5_voice_session_client_init", ret);
         return ret;
     }
     server_voice_client_config_t server_config = {

@@ -71,6 +71,18 @@ radar_spatial_config_t radar_spatial_default_config(void)
         .motion_exit_frames = RADAR_CONFIG_MOTION_EXIT_FRAMES,
         .target_jump_max_mm = RADAR_CONFIG_TARGET_JUMP_MAX_MM,
     };
+    config.person_continuity = (radar_person_continuity_config_t){
+        .still_hold_ms = RADAR_CONFIG_PERSON_STILL_HOLD_MS,
+        .dormant_timeout_ms = RADAR_CONFIG_PERSON_DORMANT_TIMEOUT_MS,
+        .reacquire_gate_mm = RADAR_CONFIG_PERSON_REACQUIRE_GATE_MM,
+        .same_zone_bonus_mm = RADAR_CONFIG_PERSON_SAME_ZONE_BONUS_MM,
+        .adjacent_zone_allow = RADAR_CONFIG_PERSON_ADJACENT_ZONE_ALLOW != 0,
+        .new_confirm_frames = RADAR_CONFIG_PERSON_NEW_CONFIRM_FRAMES,
+        .new_near_dormant_confirm_frames =
+            RADAR_CONFIG_PERSON_NEW_NEAR_DORMANT_CONFIRM_FRAMES,
+        .velocity_decay_start_ms = RADAR_CONFIG_PERSON_VELOCITY_DECAY_START_MS,
+        .velocity_decay_ms = RADAR_CONFIG_PERSON_VELOCITY_DECAY_MS,
+    };
     return config;
 }
 
@@ -79,12 +91,24 @@ static void refresh_snapshot(radar_spatial_state_t *state, uint64_t now_ms)
     radar_spatial_snapshot_t *snapshot = &state->snapshot;
     snapshot->captured_at_ms = now_ms;
     snapshot->frame_age_ms = age_ms(snapshot->latest_frame_ms, now_ms);
-    snapshot->active_track_count = radar_target_tracker_active_count(&state->tracker);
     radar_target_tracker_copy(&state->tracker, snapshot->tracks, RADAR_TRACKER_MAX_TRACKS);
     memset(snapshot->current_targets, 0, sizeof(snapshot->current_targets));
-    snapshot->active_track_count = radar_target_tracker_copy_active(&state->tracker,
-                                                                      snapshot->current_targets,
-                                                                      RADAR_TRACKER_MAX_TRACKS);
+    snapshot->visible_track_count = radar_target_tracker_copy_active(&state->tracker,
+                                                                       snapshot->current_targets,
+                                                                       RADAR_TRACKER_MAX_TRACKS);
+    /* Existing consumers use active_track_count for current visible tracks.
+     * Keep that compatibility alias, but do not use it as a person count. */
+    snapshot->active_track_count = snapshot->visible_track_count;
+    snapshot->confirmed_active_track_count =
+        radar_target_tracker_confirmed_count(&state->tracker);
+    radar_person_continuity_get_counts(&state->person_continuity,
+                                       &snapshot->visible_person_count,
+                                       &snapshot->retained_person_count,
+                                       &snapshot->business_person_count,
+                                       &snapshot->count_state);
+    radar_person_continuity_copy_persons(&state->person_continuity,
+                                         snapshot->persons,
+                                         RADAR_PERSON_CONTINUITY_MAX_PERSONS);
     snapshot->diagnostics.tracker = state->tracker.diagnostics;
     snapshot->diagnostics.tracker.active_track_count = snapshot->active_track_count;
     snapshot->diagnostics.tracker.stale_track_count =
@@ -98,6 +122,24 @@ static void refresh_snapshot(radar_spatial_state_t *state, uint64_t now_ms)
             snapshot->occupancy_confidence = track->confidence;
         }
     }
+}
+
+static bool has_unresolved_observation(const radar_spatial_state_t *state)
+{
+    if (state == NULL) {
+        return false;
+    }
+    if (state->snapshot.accepted_target_count > 0U &&
+        radar_target_tracker_visible_count(&state->tracker) == 0U) {
+        return true;
+    }
+    for (size_t i = 0U; i < RADAR_TRACKER_MAX_TRACKS; ++i) {
+        const radar_track_snapshot_t *track = &state->tracker.tracks[i];
+        if (track->active && track->lifecycle == RADAR_TRACK_TENTATIVE) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool raw_target_is_domain_valid(const radar_target_t *target)
@@ -172,15 +214,14 @@ static void update_motion_hysteresis(radar_spatial_state_t *state)
 
 static void update_semantics(radar_spatial_state_t *state, uint64_t now_ms)
 {
+    (void)now_ms;
     radar_spatial_snapshot_t *snapshot = &state->snapshot;
     if (snapshot->sensor_state != RADAR_SENSOR_VALID) {
         snapshot->occupancy_state = RADAR_OCCUPANCY_UNKNOWN;
         snapshot->motion_state = RADAR_MOTION_UNKNOWN;
         return;
     }
-    const uint8_t visible = radar_target_tracker_visible_count(&state->tracker);
-    const uint8_t confirmed = radar_target_tracker_confirmed_count(&state->tracker);
-    if (visible > 0U) {
+    if (snapshot->count_state == RADAR_PERSON_COUNT_OBSERVED) {
         bool still = false;
         for (size_t i = 0U; i < RADAR_TRACKER_MAX_TRACKS; ++i) {
             const radar_track_snapshot_t *track = &state->tracker.tracks[i];
@@ -192,23 +233,20 @@ static void update_semantics(radar_spatial_state_t *state, uint64_t now_ms)
         snapshot->occupancy_state = RADAR_OCCUPANCY_PRESENT;
         snapshot->motion_state = state->motion_confirmed ? RADAR_MOTION_MOVING :
                                  (still ? RADAR_MOTION_STILL_CANDIDATE : RADAR_MOTION_NONE);
-    } else if (confirmed > 0U) {
+    } else if (snapshot->count_state == RADAR_PERSON_COUNT_ESTIMATED) {
         snapshot->occupancy_state = RADAR_OCCUPANCY_HOLD;
         snapshot->motion_state = RADAR_MOTION_NONE;
         snapshot->occupancy_confidence = 0U;
-        for (size_t i = 0U; i < RADAR_TRACKER_MAX_TRACKS; ++i) {
-            const radar_track_snapshot_t *track = &state->tracker.tracks[i];
-            if (!track->active || now_ms < track->last_seen_ms) continue;
-            const uint64_t missing_ms = now_ms - track->last_seen_ms;
-            uint32_t loss = (uint32_t)((missing_ms / 1000U) *
-                state->config.thresholds.hold_confidence_loss_per_s);
-            if (missing_ms >= state->config.thresholds.hold_decay_ms) {
-                loss = track->confidence;
+        for (size_t i = 0U; i < RADAR_PERSON_CONTINUITY_MAX_PERSONS; ++i) {
+            const radar_person_snapshot_t *person = &snapshot->persons[i];
+            if (person->state == RADAR_PERSON_STILL_HOLD ||
+                person->state == RADAR_PERSON_DORMANT) {
+                if (person->quality > snapshot->occupancy_confidence) {
+                    snapshot->occupancy_confidence = person->quality;
+                }
             }
-            const uint32_t confidence = loss >= track->confidence ? 0U : track->confidence - loss;
-            if (confidence > snapshot->occupancy_confidence) snapshot->occupancy_confidence = confidence;
         }
-    } else if (radar_target_tracker_active_count(&state->tracker) == 0U) {
+    } else if (snapshot->count_state == RADAR_PERSON_COUNT_VACANT_INFERRED) {
         snapshot->occupancy_state = RADAR_OCCUPANCY_VACANT_INFERRED;
         snapshot->motion_state = RADAR_MOTION_NONE;
     } else {
@@ -226,10 +264,21 @@ void radar_spatial_state_init(radar_spatial_state_t *state,
     state->config = config != NULL ? *config : radar_spatial_default_config();
     radar_zone_map_init(&state->zone_map, &state->config.installation);
     radar_target_tracker_init(&state->tracker, &state->config.thresholds);
+    radar_person_continuity_init(&state->person_continuity,
+                                 &state->config.person_continuity,
+                                 UINT8_MAX);
     state->snapshot.captured_at_ms = now_ms;
     state->snapshot.sensor_state = RADAR_SENSOR_OFFLINE;
     state->snapshot.occupancy_state = RADAR_OCCUPANCY_UNKNOWN;
     state->snapshot.motion_state = RADAR_MOTION_UNKNOWN;
+    state->snapshot.count_state = RADAR_PERSON_COUNT_UNKNOWN;
+}
+
+void radar_spatial_state_set_source(radar_spatial_state_t *state, uint8_t source_id)
+{
+    if (state != NULL) {
+        radar_person_continuity_set_source(&state->person_continuity, source_id);
+    }
 }
 
 void radar_spatial_state_on_frame(radar_spatial_state_t *state,
@@ -274,6 +323,12 @@ void radar_spatial_state_on_frame(radar_spatial_state_t *state,
     record_stale_history(state);
     update_motion_hysteresis(state);
     state->snapshot.sensor_state = uart_recovered ? RADAR_SENSOR_VALID : RADAR_SENSOR_STALE;
+    radar_person_continuity_update(&state->person_continuity,
+                                   state->tracker.tracks,
+                                   RADAR_TRACKER_MAX_TRACKS,
+                                   state->snapshot.sensor_state == RADAR_SENSOR_VALID,
+                                   has_unresolved_observation(state),
+                                   now_ms);
     refresh_snapshot(state, now_ms);
     update_semantics(state, now_ms);
 }
@@ -300,6 +355,12 @@ void radar_spatial_state_poll(radar_spatial_state_t *state,
     } else {
         state->snapshot.sensor_state = RADAR_SENSOR_VALID;
     }
+    radar_person_continuity_update(&state->person_continuity,
+                                   state->tracker.tracks,
+                                   RADAR_TRACKER_MAX_TRACKS,
+                                   state->snapshot.sensor_state == RADAR_SENSOR_VALID,
+                                   has_unresolved_observation(state),
+                                   now_ms);
     refresh_snapshot(state, now_ms);
     update_semantics(state, now_ms);
 }

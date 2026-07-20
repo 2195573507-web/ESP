@@ -54,7 +54,18 @@ typedef enum {
     NETWORK_WORKER_SERVER_JSON_GATEWAY_STATE,
     NETWORK_WORKER_SERVER_JSON_SYSTEM_LOG,
     NETWORK_WORKER_SERVER_JSON_ALARM,
+    NETWORK_WORKER_SERVER_JSON_ENVIRONMENT_ALARM,
+    NETWORK_WORKER_SERVER_JSON_HOME_AI_EVENTS,
+    NETWORK_WORKER_SERVER_JSON_HOME_AI_VIRTUAL_STATE,
+    NETWORK_WORKER_SERVER_JSON_HOME_AI_DEPLOYMENT,
+    NETWORK_WORKER_SERVER_JSON_HOME_AI_HISTORY,
+    NETWORK_WORKER_SERVER_JSON_COUNT,
 } network_worker_server_json_type_t;
+
+typedef void (*network_worker_environment_alarm_completion_fn)(uint64_t event_seq,
+                                                                esp_err_t result,
+                                                                int http_status,
+                                                                void *context);
 
 typedef struct {
     uint32_t snapshot_skip_count;
@@ -102,11 +113,31 @@ esp_err_t network_worker_submit_server_json(network_worker_server_json_type_t ty
                                             char *json_body,
                                             const char *source);
 
+esp_err_t network_worker_submit_home_ai_events(char *json_body, const char *source);
+esp_err_t network_worker_submit_home_ai_virtual_state(char *json_body, const char *source);
+esp_err_t network_worker_submit_home_ai_deployment(char *json_body, const char *source);
+esp_err_t network_worker_submit_home_ai_history(char *json_body, const char *source);
+
 /** @brief Per-peer variant used by sensor paths for consumer-side lifecycle gating. */
 esp_err_t network_worker_submit_peer_server_json(network_worker_server_json_type_t type,
                                                  char *json_body,
                                                  const char *device_id,
                                                  const char *source);
+
+/**
+ * @brief Submit one environment alarm and receive its terminal HTTP outcome.
+ *
+ * Ownership: successful enqueue transfers @p json_body to network_worker.
+ * A link transition may retain the high-priority work until it can run; the
+ * completion callback is invoked only after an actual attempt or a terminal
+ * local drop. Existing telemetry/alarm queue behavior is unchanged.
+ */
+esp_err_t network_worker_submit_environment_alarm_json(
+    char *json_body,
+    uint64_t event_seq,
+    network_worker_environment_alarm_completion_fn completion,
+    void *completion_context,
+    const char *source);
 
 /**
  * @brief 提交一段已写入 BME cache 的 Server ingest JSON。
@@ -144,6 +175,10 @@ esp_err_t network_worker_enqueue_command_ack(const char *command_id, const char 
 
 /** @brief 请求 smart-home pending/ack 轮询；当前无真实执行器时仍走失败 ACK 语义。 */
 esp_err_t network_worker_enqueue_smart_home_poll(void);
+/** @brief 请求现有 command worker 拉取并校验一次 Home AI rule package。 */
+esp_err_t network_worker_enqueue_home_ai_rule_sync(void);
+/** @brief Check the lightweight Server rule-version notification. */
+esp_err_t network_worker_enqueue_home_ai_rule_notification(void);
 
 #ifdef __cplusplus
 }

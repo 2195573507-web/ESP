@@ -1,0 +1,126 @@
+# Home AI Agent v2.0 实施发现
+
+- 工作区包含大量用户既有雷达、Debug Tool、Server 修改和已删除 build artifacts；必须只增量工作，不能清理或恢复。
+- Phase 0-2 已完成；Phase 3/4/6 已有核心模块但尚未完成运行时、规则同步、完整语音仲裁和 Server/Web 后续阶段。
+- S3 已验证基线：IRAM 100%，DIRAM 约 88.6%；后续必须复用现有任务并避免新增大栈或常驻 DRAM 缓冲。
+- 当前 Home AI host tests 已覆盖 voice session、room state、rule engine、virtual device、history store；最近新增 reporter/replay/client/aggregator 尚需 fresh S3 build 验证。
+- C51/C52 共享协议头当前一致；跨端新增字段继续要求同步。
+- 当前 fresh S3 build 已通过：独立 `home_ai` 分区为 2 MB，应用镜像 `0x123860`，最小 OTA app 分区剩余 84%；构建输出未出现 warning/error。
+- 当前 `home_ai_event_reporter_init()` 未在 orchestrator 调用，scheduler 仅更新 room state；规则引擎尚未进入实时决策链。
+- `sensor_aggregator_get_home_ai_environment_snapshot()` 返回 C5 最近 BME 快照并带 `last_sensor_ms`，runtime 必须按独立新鲜度判断，不能复用 radar 时间。
+- `smart_home_gateway` 仍对所有 Server pending 命令返回“无真实设备”失败 ACK；light/air_conditioner/fan 需要保留该失败路径并增加 virtual 执行分支。
+- Server `GET /api/home-ai/v1/rules/package` 当前返回完整普通 package；S3 需要固定 16 KB 缓冲并验证 transport envelope 的 payload SHA-256 后再应用。
+- 不干预另一个目录中用户正在运行的 flash/monitor 进程。
+- v2.0 Phase 6 要求同时覆盖：启动加载、Server 通知、15 分钟检查、partial activation、rollback、24h 强保证、72h 尽力和断网补传；当前历史模块新增策略尚缺对应 host coverage。
+- `home_ai_history_flush()` 当前补丁在 `pending` 声明前调用 `choose_storage_slot_locked(pending...)`，会导致下一次 S3/host 编译失败；该问题来自未验证的最新修改，不代表已通过的 Phase 5 构建。
+- 上述历史编译错误已修复；Flash 满载时 24h 内记录不允许覆盖，24h 后仅允许已上传记录或严格更低优先级记录受控淘汰，72h prune 只删除已上传记录。
+- S3 启动目前只加载 active rule 文件，未先加载 previous，因此重启后内存 rollback store 为空；Phase 6 必须按 previous -> active 顺序恢复两代规则。
+- Server 发布当前只有 Web SSE 广播，没有面向 S3 的轻量版本通知；需新增已鉴权 notification 查询并由现有 network worker 检查，15 分钟完整拉取仍保留兜底。
+- v2.0 的实际 Phase 顺序为：Phase 6 规则同步/历史，Phase 7 Server Web/控制面，Phase 8 Intent/Tool/Plan/Action-Speech，Phase 9 天气/新闻，Phase 10 Feedback/Memory/Habit/自动发布；后续验收和状态必须按该编号归档。
+- 动态提示音必须端到端保持请求文本语义：原 `wake_prompt_cache_play()` 只适用于固定唤醒确认，不可继续作为任意 `speaker.play_audio` 的实现；新路径必须使用固定长度文本/URL 缓冲、复用现有播放资源仲裁，并保持 C51/C52 镜像。
+- 端到端源码确认：C5 `wake_prompt_cache_play()` 要求 `local_wake_word_is_ack_active()`；S3 当前 `/local/v1/audio/wake-prompt` 只有单文件缓存；Server `/api/voice/prompt` 只读取全局 `wake_prompt_text`。因此新增 `prompt_text` 查询和 `wake_prompt_cache_play_text()`，旧接口/唤醒 ACK 路径不变。
+- 现有 Web 为无框架 `public/index.html`、`public/app.js`、`public/pages/s3.js`；S3 页已有 30 秒稳定轮询、主题和移动布局，但没有 Home AI API 消费。适合新增独立 `public/pages/home-ai.js`，由 S3 页挂载，避免重写首页和现有 C5 页面。
+- Server 已具备 Web 所需的 rooms、rules/current/publish/rollback、deployments、events、virtual-devices、overrides、feedback、memory-candidates、habits、rule-candidates/probation、tools/settings API；Web 可直接并行读取这些既有接口，无需新建第二套聚合服务。
+- 跟踪文件曾把 Phase 8-10 标题排错；唯一依据原文明确为 Phase 8 分层提示词/复杂命令、Phase 9 天气/新闻、Phase 10 Feedback/Memory/Habit/自动发布，已纠正执行状态映射。
+- Phase 7 配置链路缺口已确认：Server `/api/home-ai/v1/config` 只返回 rooms，S3 已定义 route 常量但 `server_client`/runtime 未调用；Server overrides 也只落 SQLite。采用单一 checksum 配置快照（固定 3 rooms、最多 12 个未过期 overrides），由现有 notification/full-sync worker 拉取，并在 runtime sync lock 内完成原子切换，不新增 task。
+- Server override `expires_at_ms` 是 Unix epoch，而 S3 override manager 使用 uptime；当前快照同时发送 `server_time_ms`，S3 由两者计算 TTL 并转成本地 deadline，禁止直接混用两种时钟。
+- 浏览器真实交互发现房间表单默认 `presence_confirm_ms=1.5s` 与 HTML number 默认整数 step 冲突，导致 submit 事件被原生校验静默拦截；需显式允许 0.1 秒步进。
+- Phase 7 浏览器验收使用临时 SQLite/45127、Node Playwright 与本机 Edge：桌面和 390x844 移动端完成房间保存、规则加载、虚拟控制待 ACK、memory 创建和 config checksum 检查；无 console/page/request 错误及页面横向溢出。
+- Phase 8 审计：已有 `agentOrchestrator`/`toolRegistry` 支持固定步骤内并行和基础超时，但复杂命令结果需显式顶层 `steps`/`speech_policy`，控制命令需持久化 `decision_id` 以便 S3 ACK 回写，天气/新闻需从实际工具结果生成最终摘要；不能把控制 JSON 直接送 TTS。
+- Phase 8 ACK 竞态根因：初始 decision 已存在但 `action_json` 尚为空时，S3 可完成命令并回 ACK；直接查找 command_id 会返回未匹配并丢失。采用 `home_ai_agent_acks` 持久暂存，最终 decision upsert 后按 decision_id 回放并删除，返回对象与 SQLite 状态同步为实际 ACK 结果。
+- Phase 9 天气上下文采用 Server-owned snapshot 而非 S3 直连：weather tool 成功写入 `weather_context` 的观测/过期时间，config transport 每次按当前时间重新计算 `available`；S3 只接受 server epoch 转换后的有限 TTL，避免旧缓存继续触发天气规则。
+- 场景简报必须显式提供 presence、data_valid、voice 状态和 scene；客厅没有 C5 时结果保留为 `web_only`，不借用卧室终端；同一 scene/room/content 30 分钟内由 `home_ai_briefing_runs` 去重。
+- Phase 10 初版 Web 会随请求提交 conflict/replay/safety gate 证明，不能满足代码门禁；现已移除该信任边界，Server 仅使用已落库 habit evidence、规则结构和 Home AI room-state 历史计算门禁。
+- S3 的 `feedback`、`decision`、`suppressed_action` 补传事件必须幂等进入学习/试运行链；事件 ID 与 override feedback ID 去重，重复 replay 不会重复提高或降低置信度。
+- 旧版配置快照可能没有 `weather_context`；S3 现将缺字段解释为 weather unavailable，仍拒绝字段存在但类型/时间非法的快照，保持天气规则 fail-closed 且兼容 Phase 7 快照。
+- 最终 map 发现 Phase 10 完整镜像的 DIRAM 曾达到 336,415/341,760（98.44%，只余 5,345 bytes）；将规则 store/runtime、override 和 virtual device 固定表迁移到一次性 PSRAM 后降为 305,215（89.31%，余 36,545），IRAM 保持 16,384/16,384 不变。
+- 目标 ABI 核算的 Home AI 显式常驻 PSRAM 为 177,769 bytes：history 70,912、rule engine 62,000、runtime 38,785、override 2,976、virtual device 3,096；其中本次迁移增加 31,208。cJSON/HTTP 临时峰值未包含，需实机验收。
+- 最终三端 fresh build 均通过且构建日志精确 warning/error 扫描为空；C51/C52 核心 Home AI/voice/prompt 源文件哈希一致，C5/S3 common protocol 宏一致，S3 的 7 个 Server route 均匹配 Server handler。
+- 最终 host 回归覆盖 C51/C52/S3 radar、S3 radar continuity/spatial/ingest、BME690 environment alarm 和 Home AI；Server smoke/schema/control-plane 与全量 JS syntax 全部通过。
+- 完成标记后的源码复核证明最终结论过早：`home_ai_runtime.c` 三处使用指针 `sizeof` 清零固定数组，环境刷新可能保留其他房间旧值。
+- `home_ai_voice_session.c` 仍动态创建 mutex，不满足 S3 新模块静态/固定容量资源约束。
+- Server/Web 的 `voice_terminal_device_id` 已进入配置快照，但 S3 room config 未保存/解析，voice router 仍写死两个 C5 终端，运行时重绑定没有生效。
+- 紧急路由先前缺口判断有误：v2.0 明确规定“一边 unknown、一边有人时两边播报”，当前允许 occupied/unknown、排除 vacant 的实现与组合矩阵一致；需补齐组合测试，但不得改成 occupied-only。
+- playback inflight 仅按到期时间占槽，未保存 generation/待 ACK 数；command ACK 也未按 generation 释放，旧 ACK 可错误影响新请求。
+- weather 字段缺失应兼容为 unavailable，但字段存在且类型非法必须 fail-closed；当前 unavailable 快路径会绕过部分非法字段校验。
+- Phase 0 真实代码面：C51/C52 的 Home AI 目录仅有镜像的 `c5_voice_session_client`；播放命令仍由既有 `system_server_client`、`wake_prompt_cache` 和 audio resource 链执行，未把 AI/规则下沉到 C5。
+- S3 Home AI 当前包含 room state、rule engine、override、virtual device、voice session/router、history、event reporter、runtime 九组模块，并由既有 orchestrator/scheduler/command router 路径消费；没有独立新 task 或第二网络栈。
+- Server 增量集中在 `src/homeAi/`、`homeAiService`、`homeAiRoutes` 和 DB migration；Web 增量为 `public/pages/home-ai.js`/CSS 并挂到现有 S3 页，没有替换首页或 SSE 主链。
+- 客厅 emergency 当前按 C51/C52 的 `occupied|unknown` 选目标，恰好实现 v2.0 的全部七种组合；当前测试只覆盖少数组合，最终应补组合矩阵证明。
+- `parse_config_rooms()` 只把 sensing source 映射为内部三槽并复制 room/阈值/静音时段；`home_ai_room_state_config_t` 没有 voice terminal 字段，voice router 仍按槽返回固定 C51/C52 ID，故语音终端运行时重绑定未实现。
+- `home_ai_voice_session_manager_init()` 使用 `xSemaphoreCreateMutex()`；应改为 `StaticSemaphore_t` 和静态 mutex，避免 Home AI 常驻资源的动态碎片。
+- runtime 的 PSRAM 数组没有单元测试，初始化和环境刷新分别存在指针 `sizeof` 清零；应抽出固定容量清零或直接使用 `count * sizeof(*ptr)`，并新增可执行回归覆盖。
+- `home_ai_room_state_update()` 在 `entries == NULL && count > 0` 时会解引用空指针；公共入口应 fail-closed 返回，补 host test。
+- 当前 weather parser 在 `available=false` 时提前返回，导致存在但类型非法的 `observed_at_ms`/`expires_at_ms` 被忽略；需区分“字段缺失兼容 unavailable”和“字段存在但非法拒绝”。
+- Server room schema 将 `sensing_sources` 限定为三个既有稳定物理 source，这是现有注册/雷达槽边界；房间可运行时重绑，但设备身份重命名并未实现。为避免重写身份链，当前应保留物理 source ID，只同步修复 room/voice-terminal 绑定。
+- `voice_terminal_device_id` 当前在 Server 仅做截断，没有设备 ID pattern、已知 C5 终端或跨房间唯一性校验；S3 parser 不消费。双方需采用同一 47 字节上限和 `[a-z0-9_.-]` 规则，并允许客厅空终端。
+- normal voice route 即使配置房间没有终端也会先占 inflight slot，最后返回 `command_queue_rejected`；配置驱动后应在占槽前得到真实终端集合，空集合返回 `suppressed_no_terminal`。
+- C5 `system_server_client` 从命令解析 `playback_generation` 并在执行后原样回 ACK；S3 `command_router_ack()` 会转发 Server/记录事件，但不与命令 params 的预期 generation 比较，也不通知 voice router。
+- voice router inflight 目前只有 `used/expires_at_ms`，两终端 emergency 也只占一个槽；应固定保存 `generation/pending_ack_count`，由每个 command_id 的首次、匹配 ACK 递减，旧/未知/重复 generation 不得释放当前槽。
+- ACK 通知会从 local HTTP command ACK task 与 runtime tick 并发访问 voice router；新增生命周期状态必须使用静态同步原语或同等临界区，不能引入动态 mutex。
+- rule engine 目前只按 DSL 条件匹配，没有全局阻断“unknown 房间的非安全灯 `turn_off`”；v2.0 要求 unknown 不得作为无人关灯，需新增可解释 suppressed 状态并保留安全规则例外。
+- v2.0 第 5.4 的错误 generation 拒绝属于 voice-session lease；不能据此要求所有既有通用 `speaker.play_audio` 都必须有 generation。Home AI playback 通过命令 params 的非零 generation 做专用校验，保持旧播放协议兼容。
+- C5 `voice_domain/voice_chain.c` 在 acquire 后、监听前和播放前续租 S3 session，并用本地 resource/mic generation 丢弃旧异步事件；现有链路无需重写，静态 mutex 修复限定在 S3 session manager。
+- 规则同步复核已纠正旧记录：`home_ai_runtime.c::apply_loaded_payload()` 当前确实先加载 previous 再 active，且 scheduler 已有 60 秒通知检查、15 分钟完整同步兜底；这两项不再列为缺口。
+- Home AI 历史复用现有 replay worker：固定批量 flush、link stable 后上传、2xx 后按 sequence 标记 uploaded；Server `INSERT OR IGNORE(event_id)` 使重放幂等。
+- `home_ai_event_reporter_tick()` 当前只在容量百分比/80% warning 边沿上报；`dropped_unpersisted`、`dropped_overwrite`、`storage_errors`、`protected_rejections` 变化不一定触发，可能形成静默丢数。应加入固定 60 秒限频的计数变化触发并携带全部计数。
+- `writeRoomConfig()` 当前只替换 `home_ai_rooms` 并广播；已发布 rule package 的 rooms/rule room_id 不迁移、不暂停、不标记重绑。改名后 S3 会安全地不匹配旧规则，但 Server/Web 仍误显示已发布，违反 v2.0 3.2。
+- S3 成功配置快照只保存在 RAM，重启离线会回到编译期默认 room/terminal；应在现有 `home_ai` SPIFFS 分区持久化已校验 payload，启动只恢复 rooms/terminal，避免延长过期 weather/override TTL。
+- 规则同步的“相同版本跳过”当前额外要求 `active_rule_count > 0`，空规则包会每次重复应用；应按非零 package version 比较，不以规则数量判断版本有效性。
+- 实际 S3 使用 `partitions.csv` 的 32 MiB 布局，独立 `home_ai` SPIFFS 为 2 MiB；history 固定 2048 x 768 bytes，仍给两代 rule/config/meta 留有余量。启动顺序允许 runtime 在 scheduler/network 前从该分区恢复配置。
+- `smart_home_gateway.c::ack_virtual_command()` 在执行前创建用户覆盖；执行失败仍会留下覆盖。其 ACK `result.verified` 还把 Server HTTP 成功误当作虚拟状态写入成功。应先执行，再对 applied/noop 建覆盖，并将 verified 取自 `execution.state.verified`，另行保留上报结果。
+- 本轮 Phase 0 重新确认：唯一依据文件为 `docs/Home_AI_Agent_Repositioned_Development_Plan_v2.0.md`（1823 行）；当前顶层仓库含 ESPC51、ESPC52、ESPS3、ESP-server 与 Web 增量，另有嵌套 Debug/Server Git 根，所有构建产物删除均属于既有 dirty 状态，不可清理。
+- 真实模块清单保持三端边界：C5 Home AI 仅有 `c5_voice_session_client`；S3 Home AI 为 room/rule/override/virtual/history/reporter/runtime/voice 七类固定容量模块；Server/Web 增量位于 `src/homeAi`、`homeAiRoutes`、`homeAiService`、`public/pages/home-ai.js` 与 `home-ai.css`，未替换既有首页/SSE/网络链。
+- 当前待修复源码缺口仍以 13 项为准：runtime 清零、静态 voice mutex、terminal 绑定消费、playback generation ACK/inflight、weather fail-closed、room NULL、防 unknown 关灯、配置快照持久化、空规则版本跳过、Server room-rule migration、virtual override/verified、offline drop 可观测性；紧急 occupied/unknown 路由语义本身正确。
+- Phase 0 影响矩阵（源码/构建基线）：
+  - C5：`ESPC51/ESPC52/components/Middlewares/home_ai/c5_voice_session_client.*` 仅封装会话事件；实际 register/heartbeat/status/command ACK 在 `command_domain/system_command/system_server_client.c`，唤醒/录音/播放仍由既有 `voice_domain`、`wake_prompt_cache` 和 audio resource manager 负责，符合 C5 边界。
+  - S3：`gateway_orchestrator.c` 初始化 Home AI 固定容量模块；`s3_scheduler.c` 每 60 秒检查通知、每 15 分钟兜底同步并调用 runtime；`network_worker.c` 承载 Home AI HTTP 工作项；`network_replay_worker.c` 承载离线补传；没有新增 Home AI task、网络栈或命令队列。
+  - Server/Web：`src/routes/homeAiRoutes.js` 沿用既有鉴权/SQLite helper，`server.js` 增量挂载，`public/pages/home-ai.js` 由现有 `s3.js` 挂载；首页、SSE 和既有路由未替换。当前仅有手动 `POST /api/logs/v1/cleanup`，未有 v2.0 所需自动 retention/aggregation scheduler；原始语音经内存 PCM 流处理，未找到 raw audio 落盘路径。
+  - 存储/资源：`ESPS3/partitions.csv` 解析为 32 MiB flash、两 OTA app 各 7 MiB、`home_ai` SPIFFS 2 MiB；fresh S3 app `0x12d250`、DIRAM `305215/341760`、IRAM `16384/16384`；fresh C51/C52 app 均 `0x1ace80`，C51 HP SRAM `188754/320928`；构建日志 warning/error 扫描为空。
+  - 基线测试：S3 Home AI host tests、Server smoke/schema/control-plane tests、三端 fresh build、`git diff --check` 均通过；未执行 flash、串口 monitor 或生产服务。
+- Phase 5 精确门禁：普通播报必须在占用 inflight 前解析房间的 `voice_terminal_device_id`；客厅 emergency 只选择 presence 为 occupied 或 unknown 且实际绑定非空的终端；每次请求只占一个固定槽，但槽必须记录 generation 和成功入队终端数，只有每个 command ID 的首次匹配 ACK 才能递减，部分入队失败按实际成功数等待。
+- Phase 5 ACK 兼容策略已固化：command entry 从 params 保存非零期望 generation；无期望 generation 的旧命令走 `accepted_legacy`，Home AI 播放只接受首次精确匹配 ACK；unknown/duplicate/stale/missing/mismatch 仍生成 Server ACK 上报，但不改变命令状态或 voice-router 槽。
+- Phase 6 当前有效缺口收敛为：`home_ai_runtime` 对 PSRAM 指针数组使用 `sizeof(pointer)` 清零；weather 缺字段应兼容 unavailable 但字段存在非法必须拒绝；已校验 rooms/terminal 尚未离线持久化；空规则包同版本仍重复应用；event reporter 未在 drop/storage/protected 计数变化时按 60 秒限频上报。两代规则恢复、通知/15 分钟同步、partial/rollback、24h/72h 保留和 replay worker 已存在，需回归而非重写。
+- ESP-IDF 5.5.4 SPIFFS 不支持覆盖式 rename：目标存在返回 conflicting name，VFS 映射为 `EIO`。room-config 快照提交必须沿用现有 rules 文件策略（temp 写完并关闭、移除旧目标、rename），再依靠 magic/version/CRC 在启动时 fail-closed。
+- Phase 8 续接复核：`PROMPT_PROFILES` 当前仅由列表 API 返回元数据，`requestVoiceTurnLlm()` 仍只调用通用文本提示；没有按 conversation/intent/tool/plan/final_speech 构造独立系统提示词，也没有严格 JSON 模型输出入口。
+- `/api/voice/turn` 的 ASR 文本当前直接进入通用 LLM 和 TTS，未调用 `homeAi/agentOrchestrator`。因此已存在的 control intent、Tool Registry、S3 command ACK 和 final speech 无法从真实语音主链触发，必须以可回退的增量分类层接入，普通对话保持原链路。
+- `agentOrchestrator.buildPlan()` 已有最多 4 步、步骤内最多 4 动作和 Tool Registry 3 并发限制，但 step 只保存 `continue_on_failure`，没有 v2.0 要求的简单前置条件或前一步成功门控。
+- Phase 10 续接复核：probation 只有事件/反馈驱动评估和公共手动 evaluate API；到期后没有新事件时不会自主从 RUNNING 收口。公共 evaluate 当前还读取客户端 `metrics`/`force`，不能作为自动激活或回滚的信任来源。
+- probation 回滚当前只携带 reason，`rollbackRulePackage()` 默认取当前包的上一版本；若试运行包后已有其他新包发布，会误回滚无关版本。自动回滚必须校验当前活动版本等于 run.package_version，并显式恢复该试运行包发布前的绑定版本。
+- `get_news` 对不存在、非 URL 或非 HTTPS endpoint 应统一返回明确 `NEWS_NOT_CONFIGURED`；当前 `new URL()` 的 TypeError 会被 Tool Registry 包装成泛化 `TOOL_EXECUTION_FAILED`。
+- Phase 8 离线语音边界已固定为 `/local/v1/voice/offline-command` 的受信任短文本 token：S3 仅识别 12 类内置词表并使用既有固定容量模块执行；当前不存在 PCM 到 token 的本地识别器，host parser/build 结果不能作为真实离线 ASR 硬件验收。
+- Phase 9 已验证并修复新闻 endpoint 错误边界：`new URL()` 失败和非 HTTPS 均在 Tool Registry 转换为 `NEWS_NOT_CONFIGURED`，不会再泄漏为泛化执行失败；weather 仍只接受新鲜结果，失败会清空可用标记，天气依赖规则继续 fail-closed。
+- Phase 10 自主收口不依赖新事件：`homeAiProbationJobs` 启动即扫描、之后每 5 分钟执行，同一进程内保持单飞，每批上限 100；到期 RUNNING 记录因此可自主激活、暂停或回滚。
+- probation 自动回滚必须同时满足“当前活动包仍等于 run.package_version”和“恢复目标是该包发布前版本”；试运行后又发布新版本时 fail-closed，不会回滚无关规则包。
+- 公共 candidate/probation evaluate API 已去除客户端 `metrics`、`force`、`gates` 的信任边界；Server 只使用 SQLite 中的真实反馈、触发、执行、冲突、覆盖与传感器可靠性证据评估。
+- Memory 候选首次确认时，若 Web/API 未明确指定 `automation_allowed`，Server 默认写入 false；不会因确认了一条记忆而隐式授权自动控制。
+- Phase 10 相对 Phase 7 没有增加 S3 DIRAM/IRAM 或 C51/C52 HP SRAM；S3 Flash code/data 共增加 5,280 bytes，C51/C52 app 镜像各增加 272 bytes。真实音频 DMA、HTTP/TLS/cJSON 瞬时堆和长时运行仍需实机验收。
+- 最终门禁复跑证实：Server 六组测试、S3 Home AI host 测试、三端 Phase 10 build 日志扫描均通过；没有 flash、串口 monitor 或生产服务操作。
+- 真实 `ESP-server/db/database.db` 被 `*.db` ignore，无 Git diff；所有 Server 测试使用隔离临时 SQLite，因此不将静态测试误报为生产数据库验收。
+- 唯一依据文档保留原有 Markdown 强制换行尾空格；本轮新增的跟踪、测试和实施报告文件均无尾空格。
+- v2.0 6.17 明确要求紧急提醒具备 `DETECTED -> ACTIVE_UNACKNOWLEDGED -> ACKNOWLEDGED -> ESCALATED -> RECOVERING -> RESOLVED` 生命周期，同一事件复用 `event_id`，未确认在 1/3/5 分钟重复、确认后降频、恶化重新升级、恢复播报也需要 ACK。当前 `home_ai_voice_router` 只为每次请求生成新 event ID、单次抢占和 generation ACK，未实现上述协调状态机，属于当前阶段必须修复的软件缺口。
+- v2.0 6.15 的语音会话状态包含 RECORDING/WAITING_SERVER/PLAYING/ENDING/PREEMPTED；当前 manager enum 有前三者但生产路径只创建 LOCKED、清回 IDLE 或 PREEMPTED，没有受 generation 保护的状态转换入口，属于协议/运行时接线缺口。
+- v2.0 6.14 的当前范围是“S3 只处理有限命令”，并明确不处理本地 LLM/开放语义；文档未要求本轮在 C5 新增 PCM 到 token 的离线 ASR。现有受信任文本入口和严格 parser 可满足软件控制面，但不能宣称真实离线语音已验收，PCM 到 token 生产者继续列为硬件/后续集成验收。
+- `temporary_awake` 已有固定房间策略和过期清理，但目前只被离线命令测试调用，尚未由主动唤醒/会话 acquire 生产路径触发；需在不改变现有 C5 采集职责的前提下接入 S3 会话入口。
+- `scene_state` 与 `sleep_confirmed` 在房间模型中存在但未见生产更新者。按 6.18 只能补明确可判定的 quiet/temporary-awake 行为；不能凭现有雷达数据猜测睡眠或起床高置信度，不制造无证据场景状态。
+- 三端 `esp111_protocol_common.h` 已同步预留 `voice_action="state"` 和 `emergency_preempt`，但当前 C5 client 只发送 acquire/renew/release，S3 local handler 也只消费这三种动作。语音阶段接线应复用既有 `state` 动作，新增固定状态字符串字段并在 C51/C52/S3 同步，不另建路由。
+- 现有 Server `/api/emergency/events` 只有 POST 创建和 GET 查询，`emergency_events` 表也没有用户确认更新入口；Web 只能展示。6.17 的用户确认降频需要新增幂等 acknowledge 控制 API，并通过现有 Home AI gateway 配置/通知链同步到 S3，不能把终端播放 ACK 当成用户确认。
+- 环境告警 reporter 是 alarm engine 事件队列的唯一深拷贝/ACK owner。Home AI 紧急协调器应在 reporter 深拷贝事件时接收只读副本，绝不能自行 `ack` 或竞争消费 engine FIFO。
+- 现有规则 notification 已比较 `known_config_checksum`，配置变化可在原 60 秒检查中触发完整 config/rule sync。因此用户紧急确认可作为 config 快照中的最多 8 个固定 acknowledgement 条目下发，不新增网络 task/route 轮询。
+- `home_ai_events.event_id` 是主键，而当前 emergency 状态多次使用同一 event ID 会被 `INSERT OR IGNORE` 丢掉后续生命周期。Server ingest 对 `event_type=emergency` 必须改为按 `occurred_at_ms` 单调更新同一行；其他事件继续幂等 insert-only。
+- 播放 ACK 和 emergency 生命周期应通过 voice router 的已保存 inflight event ID/generation 关联，不能信任 C5 ACK body 中可回显的 event ID。两终端同 generation 时，只有固定 pending ACK 计数归零才算该轮播报完成。
+- 为避免 environment reporter 反向依赖 Home AI，采用单一固定 observer callback：reporter 在成功深拷贝 engine 事件后通知协调器，仍由 reporter 独占 engine FIFO ACK。协调器无 task，由现有 runtime tick 每轮最多派发 2 条紧急播报。
+- Phase 11 已完成上述缺口：C5/S3 `voice_action=state` 生产接线、主动唤醒 10 分钟 `TEMPORARY_AWAKE`、8 槽紧急协调器、用户确认配置同步、同 event ID 单调状态更新和恢复播放 ACK 均有 host/API 回归。
+- 目标 ELF DWARF 证实 `home_ai_emergency_slot_t` 为 168 bytes，8 个活动槽固定占用 1,344 bytes PSRAM；最终显式常驻 PSRAM 预算为 179,113 bytes。
+- Phase 11 Web 验收发现确认已落库但刷新仍显示“需确认”；修复为事件读取时派生顶层 `user_acknowledged`，Web 立即显示“已确认”，不改写 S3 上报的环境状态。桌面和 390x844 移动端复验通过。
+- 最终 S3 镜像 `0x1306b0`，DIRAM 307,399/341,760（余 34,361），IRAM 16,384/16,384；C51/C52 镜像均 `0x1ad2b0`，HP SRAM 均 188,762/320,928。三端构建日志 warning/error/fatal/FAILED 扫描为空。
+- Phase 14 独立 fresh build 证据目录为 `/tmp/espcomplete-home-ai-final-s3`、`/tmp/espcomplete-home-ai-final-audit-c51`、`/tmp/espcomplete-home-ai-final-audit-c52`；对应 `idf.py size` 输出分别记录 S3 DIRAM/IRAM 和 C5 HP SRAM 的最终占用，构建、环境、size 日志均无告警或失败标记。
+- Phase 14 host/API 门禁复跑：Server `npm test` 六组、99 个 JavaScript 语法检查、Home AI 12 个 host target（history 以 basic/restart/prune/protected/priority 五模式执行）、environment alarm、C51/C52/S3 radar、smart-home gateway、Debug parser 全部 PASS。
+- `test_home_ai_voice_router.c` 的紧急矩阵现在覆盖 C51/C52 occupied、vacant、unknown 的 9 种组合；unknown 与 occupied 均按 v2.0 规则播报，vacant 不产生误播报，客厅无目标时保持会话占用。
+- 跨端静态证据：C51/C52 `system_server_client.c` SHA-256 为 `498434c41bca98bae8920ff6d492048d65cc3f8a568721e2b811d9acb23ee117`；两端协议头 SHA-256 为 `6f8d0568d21f6ee3fcbc7cd071c2920a189dacf0520f502c60ed06c2429a523e`；S3 头仅保留共享宏并增加 gateway Server-only routes。
+- Phase 14 结论：软件实现、跨端协议、固定容量资源、host/API/build 门禁均已收口；未执行硬件、生产网络、生产 Server 或真实数据库操作，硬件验收边界保持不变。
+- Phase 15 重新核验发现并修复：`LINK_STABLE` 边沿现在排入一次 Home AI full sync；SoftAP 断线在资源释放成功后调用可信 owner 释放，普通 session release 仍保留 generation 校验；新增 host 契约覆盖两条接线。
+- Phase 15 Server TTS 策略：动态 `home_ai_text_<sha256>` 只驻留进程内，默认 TTL 15 分钟、最多 16 项、最多 8 MiB、单项最多 2 MiB，超限不缓存；静态 wake prompt 是单一可配置唤醒资产，继续走既有兼容磁盘路径。动态响应使用 `private, no-store`，避免代理长期留存。
+- Phase 15 原始音频策略：voice route 从 raw parser 到所有退出路径显式 `Buffer.fill(0)`；测试验证清零 helper，smoke/voice pipeline 仍通过。源码没有 raw PCM 数据库或文件写入路径；真实进程/内存和上游服务行为仍需硬件/生产隔离验收。
+- Phase 15 最终资源与门禁：S3 binary `0x130790`（size DIRAM `307399/341760`、IRAM `16384/16384`），C51/C52 binary 均 `0x1ad2b0`（HP SRAM `188762/320928`）；101 个 JS syntax、Server npm test、Home AI/雷达/alarm/gateway/parser host tests、Edge desktop/mobile 和 `git diff --check` 全部 PASS。
+- Phase 15 仍不可由静态证据替代的项目：SoftAP/STA 与两个 C5 实机注册、真实录音/播放/DMA、雷达/BME/语音并发峰值、Flash 掉电/磨损/72h、真实天气/新闻、生产 Server/数据库和本地 PCM 到 token 的离线识别。

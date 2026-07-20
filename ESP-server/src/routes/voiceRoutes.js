@@ -32,12 +32,14 @@ const {
 } = require("../voice/mockTurn");
 const {
     DEFAULT_PROMPT_KEY,
+    promptKeyForText,
     readPromptCache,
     safePromptKey,
     sendPromptCachePcm,
     writePromptCache
 } = require("../voice/promptCache");
 const {
+    deriveVoicePromptConfigForText,
     promptConfigMatches,
     readVoicePromptConfig,
     updateVoicePromptConfig
@@ -68,6 +70,12 @@ const VOICE_WAKE_PROMPT_TEXT = "我在，你说";
 
 function formatOptionalDeviceLog(deviceId) {
     return deviceId ? ` device_id=${maskLogValue(deviceId)}` : "";
+}
+
+function clearRawVoiceBody(req) {
+    if (Buffer.isBuffer(req?.body)) {
+        req.body.fill(0);
+    }
 }
 
 async function logVoiceTurnRecord(dbRun, record, logger = console) {
@@ -133,6 +141,7 @@ function createVoiceBodyParserErrorHandler(options) {
                 totalMs: 0,
                 reason: "body_parser"
             }, logger);
+            clearRawVoiceBody(req);
             return sendVoiceError(res, status, code, err?.message || "Invalid PCM request body");
         }
 
@@ -257,9 +266,29 @@ function createVoiceRouter(options) {
             }
         }
 
-        const promptKey = safePromptKey(req.query.prompt_key || DEFAULT_PROMPT_KEY);
+        const hasPromptText = Object.prototype.hasOwnProperty.call(req.query, "prompt_text");
+        let requestedPromptText = null;
+        if (hasPromptText) {
+            requestedPromptText = typeof req.query.prompt_text === "string"
+                ? req.query.prompt_text.trim()
+                : "";
+            if (!requestedPromptText ||
+                Buffer.byteLength(requestedPromptText, "utf8") > 95 ||
+                /[\u0000-\u001f\u007f]/u.test(requestedPromptText)) {
+                return sendVoiceError(res,
+                                       400,
+                                       "VOICE_PROMPT_TEXT_INVALID",
+                                       "prompt_text must be printable UTF-8 text up to 95 bytes");
+            }
+        }
+
+        const promptKey = requestedPromptText !== null
+            ? promptKeyForText(requestedPromptText)
+            : safePromptKey(req.query.prompt_key || DEFAULT_PROMPT_KEY);
         const forceRefresh = req.query.refresh === "1" || req.query.force_refresh === "1";
-        const promptConfig = readVoicePromptConfig();
+        const promptConfig = requestedPromptText !== null
+            ? deriveVoicePromptConfigForText(requestedPromptText)
+            : readVoicePromptConfig();
         const hit = readPromptCache(promptKey);
         if (hit && !forceRefresh && promptConfigMatches(hit.meta, promptConfig)) {
             const elapsedMs = Date.now() - startedAt;
@@ -414,6 +443,8 @@ function createVoiceRouter(options) {
                 reason: "request_validation"
             }, logger);
 
+            clearRawVoiceBody(req);
+
             return sendVoiceError(
                 res,
                 validationError.status,
@@ -448,6 +479,7 @@ function createVoiceRouter(options) {
                 activeLimit: config.maxConcurrent,
                 reason: "config_validation"
             }, logger);
+            clearRawVoiceBody(req);
             return sendVoiceError(res, configError.status, configError.code, configError.message);
         }
 
@@ -472,6 +504,7 @@ function createVoiceRouter(options) {
                 reason: "concurrency"
             }, logger);
 
+            clearRawVoiceBody(req);
             return sendVoiceError(res, acquireError.status, acquireError.code, acquireError.message);
         }
 
@@ -526,7 +559,7 @@ function createVoiceRouter(options) {
                     controller.signal,
                     metrics,
                     logger,
-                    { dbAll }
+                    { dbRun, dbAll, traceId: requestId }
                 );
                 activeTtsStream = result.ttsStream;
                 const streamed = await sendVoiceTurnPcmStream(res, activeTtsStream.stream, controller.signal);
@@ -555,7 +588,7 @@ function createVoiceRouter(options) {
                     controller.signal,
                     metrics,
                     logger,
-                    { dbAll }
+                    { dbRun, dbAll, traceId: requestId }
                 );
             }
 
@@ -654,6 +687,7 @@ function createVoiceRouter(options) {
             res.off("close", abortOnClientClose);
             res.off("error", abortOnClientClose);
             releaseVoiceTurn(deviceId);
+            clearRawVoiceBody(req);
         }
     }
 
@@ -668,6 +702,7 @@ function createVoiceRouter(options) {
 
 module.exports = {
     VOICE_WAKE_PROMPT_TEXT,
+    clearRawVoiceBody,
     createVoiceBodyParserErrorHandler,
     createVoiceRouter,
     logVoiceTurnRecord

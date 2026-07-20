@@ -50,6 +50,16 @@ const {
     ensureVoiceTurnsTable
 } = require("./src/db/voiceTurns");
 const {
+    ensureHomeAiTables
+} = require("./src/db/homeAi");
+const {
+    createHomeAiDataScheduler,
+    ensureHomeAiDataTables
+} = require("./src/jobs/homeAiDataJobs");
+const {
+    createHomeAiProbationScheduler
+} = require("./src/jobs/homeAiProbationJobs");
+const {
     createCommandRouter
 } = require("./src/routes/commandRoutes");
 const {
@@ -80,6 +90,9 @@ const {
     createSensorRouter
 } = require("./src/routes/sensorRoutes");
 const {
+    createHomeAiRouter
+} = require("./src/routes/homeAiRoutes");
+const {
     createStructuredLlmRouter
 } = require("./src/routes/structuredLlmRoutes");
 const {
@@ -105,6 +118,18 @@ const { dbRun, dbAll } = createDbHelpers(db);
 const persistenceWorker = createPersistenceWorker({
     dbRun,
     logger: console
+});
+const homeAiDataScheduler = createHomeAiDataScheduler({
+    dbRun,
+    dbAll,
+    logger: console,
+    run_immediately: false
+});
+const homeAiProbationScheduler = createHomeAiProbationScheduler({
+    dbRun,
+    dbAll,
+    logger: console,
+    run_immediately: true
 });
 
 app.use((req, res, next) => {
@@ -173,6 +198,7 @@ app.use(createAgentStateRouter({ dbRun, dbAll }));
 app.use(createUserDataRouter({ dbRun, dbAll }));
 app.use(createRecordRouter({ db }));
 app.use(createSensorRouter({ db, dbRun, dbAll }));
+app.use(createHomeAiRouter({ dbRun, dbAll }));
 
 // Health/debug API
 app.use("/api/time", createTimeSyncRouter({ dbRun, dbAll }));
@@ -258,6 +284,8 @@ async function shutdown(signal) {
     shuttingDown = true;
     console.log(`[server] shutting down signal=${signal}`);
     await closeHttpServer();
+    await homeAiProbationScheduler.stop();
+    await homeAiDataScheduler.stop();
     await persistenceWorker.stop({
         drain: true
     });
@@ -276,6 +304,8 @@ async function startServer() {
     await ensureCsiMotionTables(dbRun, dbAll);
     await ensureEventLogTables(dbRun, dbAll);
     await ensureVoiceTurnsTable(dbRun, dbAll);
+    await ensureHomeAiTables(dbRun, dbAll);
+    await ensureHomeAiDataTables(dbRun);
     await ensureCommandTables(dbRun, dbAll);
     await ensureSmartHomeTables(dbRun, dbAll);
     await ensureMemoryTables(dbRun, dbAll);
@@ -296,6 +326,7 @@ async function startServer() {
                 "csi_motion_events",
                 "event_logs",
                 "voice_turns",
+                "home_ai",
                 "commands",
                 "smart_home",
                 "memory",
@@ -307,6 +338,8 @@ async function startServer() {
         server_recv_ms: Date.now()
     });
     persistenceWorker.start();
+    homeAiDataScheduler.start();
+    homeAiProbationScheduler.start();
 
     httpServer = app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);

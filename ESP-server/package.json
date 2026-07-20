@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node scripts/smoke-regression.js",
+    "test": "node scripts/smoke-regression.js && node test/home-ai-schema.test.js && node test/home-ai-control-plane.test.js && node test/home-ai-data-jobs.test.js && node test/home-ai-probation-jobs.test.js && node test/home-ai-voice-agent.test.js && node test/home-ai-prompt-cache.test.js && node test/voice/raw-audio-lifecycle.test.js",
     "test:smoke": "node scripts/smoke-regression.js",
     "test:device-status": "node scripts/test-device-status-chain.js"
   },

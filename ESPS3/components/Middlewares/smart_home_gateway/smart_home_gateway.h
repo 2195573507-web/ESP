@@ -5,8 +5,8 @@
  * @file smart_home_gateway.h
  * @brief S3 智能家居 pending/ack 网关。
  *
- * 当前固件没有真实智能家居执行器。本模块只从 Server 领取 pending 命令，并按
- * failed ACK 回传，避免把 mock 状态伪装成真实设备执行成功。
+ * 当前固件没有真实智能家居执行器。本模块从 Server 领取 pending 命令，交给
+ * Home AI 固定容量虚拟执行器，并明确以 virtual/verified 字段回传本地状态事实。
  */
 
 #include "esp_err.h"

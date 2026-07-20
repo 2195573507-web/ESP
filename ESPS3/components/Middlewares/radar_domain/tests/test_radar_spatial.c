@@ -133,6 +133,7 @@ static void test_spatial_semantics(void)
     radar_spatial_config_t config = radar_spatial_default_config();
     config.thresholds.track_timeout_ms = 1000U;
     config.thresholds.motion_displacement_mm = 2000U;
+    config.thresholds.sensor_stale_ms = 10000U;
     radar_spatial_state_t state;
     radar_spatial_state_init(&state, &config, 0U);
     radar_spatial_snapshot_t snapshot;
@@ -175,7 +176,12 @@ static void test_spatial_semantics(void)
     assert(snapshot.occupancy_confidence < 100U);
     radar_spatial_state_poll(&state, RADAR_UART_RECOVERY_VALID, 4401U);
     radar_spatial_state_get_snapshot(&state, &snapshot);
+    assert(snapshot.occupancy_state == RADAR_OCCUPANCY_HOLD);
+    assert(snapshot.count_state == RADAR_PERSON_COUNT_ESTIMATED);
+    radar_spatial_state_poll(&state, RADAR_UART_RECOVERY_VALID, 5601U);
+    radar_spatial_state_get_snapshot(&state, &snapshot);
     assert(snapshot.occupancy_state == RADAR_OCCUPANCY_VACANT_INFERRED);
+    assert(snapshot.count_state == RADAR_PERSON_COUNT_VACANT_INFERRED);
 
     radar_spatial_state_poll(&state, RADAR_UART_RECOVERY_VALID, 100U);
     radar_spatial_state_get_snapshot(&state, &snapshot);
@@ -255,6 +261,18 @@ static void test_single_person_five_minute_stability(void)
     assert(snapshot.history_target_count == 1U);
     assert(snapshot.history_targets[0].track_id == 1U);
     assert(snapshot.diagnostics.tracker.stale_track_count == 1U);
+
+    radar_frame_t restored = frame(3001U,
+                                   300901U,
+                                   (int16_t)snapshot.history_targets[0].filtered_x_mm,
+                                   (int16_t)snapshot.history_targets[0].filtered_y_mm,
+                                   12);
+    radar_spatial_state_on_frame(&state, &restored, true, 300901U);
+    radar_spatial_state_get_snapshot(&state, &snapshot);
+    assert(snapshot.history_target_count == 1U);
+    assert(snapshot.visible_person_count == 1U);
+    assert(snapshot.business_person_count == 1U);
+    assert(snapshot.count_state == RADAR_PERSON_COUNT_OBSERVED);
 
     radar_spatial_state_poll(&state, RADAR_UART_RECOVERY_VALID, 303001U);
     radar_spatial_state_get_snapshot(&state, &snapshot);
@@ -358,6 +376,66 @@ static void test_occlusion_and_velocity_outlier_policy(void)
     assert(tracker.diagnostics.velocity_outliers >= 3U);
 }
 
+static void test_person_continuity_snapshot_counts(void)
+{
+    radar_spatial_config_t config = radar_spatial_default_config();
+    config.thresholds.track_timeout_ms = 700U;
+    config.thresholds.sensor_stale_ms = 10000U;
+    radar_spatial_state_t state;
+    radar_spatial_snapshot_t snapshot;
+    radar_spatial_state_init(&state, &config, 0U);
+
+    for (uint32_t sequence = 1U; sequence <= 4U; ++sequence) {
+        radar_frame_t current = frame(sequence,
+                                      (uint64_t)sequence * 100U,
+                                      (int16_t)(sequence * 50U),
+                                      1000,
+                                      10);
+        radar_spatial_state_on_frame(&state, &current, true, current.received_at_ms);
+        radar_spatial_state_poll(&state, RADAR_UART_RECOVERY_VALID, current.received_at_ms);
+        radar_spatial_state_get_snapshot(&state, &snapshot);
+        assert(snapshot.business_person_count <= 1U);
+        if (sequence == 2U) {
+            assert(snapshot.business_person_count == 0U);
+            assert(snapshot.count_state == RADAR_PERSON_COUNT_UNKNOWN);
+        }
+    }
+    assert(snapshot.visible_person_count == 1U);
+    assert(snapshot.business_person_count == 1U);
+    assert(snapshot.count_state == RADAR_PERSON_COUNT_OBSERVED);
+    const uint32_t original_person_id = snapshot.persons[0].person_id;
+    assert(original_person_id != 0U);
+
+    radar_spatial_state_on_frame(&state,
+                                 &(radar_frame_t){.frame_seq = 5U,
+                                                  .received_at_ms = 500U,
+                                                  .target_count = 0U},
+                                 true,
+                                 500U);
+    radar_spatial_state_poll(&state, RADAR_UART_RECOVERY_VALID, 1500U);
+    radar_spatial_state_get_snapshot(&state, &snapshot);
+    assert(snapshot.visible_person_count == 0U);
+    assert(snapshot.retained_person_count == 1U);
+    assert(snapshot.business_person_count == 1U);
+    assert(snapshot.count_state == RADAR_PERSON_COUNT_ESTIMATED);
+
+    radar_frame_t reappeared = frame(6U, 1600U, 300, 1000, 10);
+    radar_spatial_state_on_frame(&state, &reappeared, true, 1600U);
+    reappeared = frame(7U, 1700U, 350, 1000, 10);
+    radar_spatial_state_on_frame(&state, &reappeared, true, 1700U);
+    radar_spatial_state_get_snapshot(&state, &snapshot);
+    assert(snapshot.visible_person_count == 1U);
+    assert(snapshot.business_person_count == 1U);
+    assert(snapshot.persons[0].person_id == original_person_id);
+    assert(snapshot.persons[0].attached_track_id != 1U);
+
+    radar_spatial_state_poll(&state, RADAR_UART_RECOVERY_VALID, 12000U);
+    radar_spatial_state_get_snapshot(&state, &snapshot);
+    assert(snapshot.count_state == RADAR_PERSON_COUNT_UNKNOWN);
+    assert(snapshot.occupancy_state == RADAR_OCCUPANCY_UNKNOWN);
+    puts("PASS: spatial snapshot separates one person from changing motion tracks");
+}
+
 int main(void)
 {
     test_transform_and_zone_map();
@@ -367,6 +445,7 @@ int main(void)
     test_uart_recovery();
     test_adaptive_rate_state_machine();
     test_occlusion_and_velocity_outlier_policy();
+    test_person_continuity_snapshot_counts();
     puts("radar spatial/recovery host tests: PASS");
     return 0;
 }

@@ -24,9 +24,13 @@
 #include "device_protocol_metadata.h"
 #include "esp111_protocol_common.h"
 #include "screen_service.h"
+#include "server_voice_client.h"
 #include "server_comm_config.h"
 #include "server_comm_http.h"
+#include "speaker_player.h"
 #include "terminal_config.h"
+#include "voice_chain.h"
+#include "wake_prompt_cache.h"
 
 static const char *TAG = "system_server_client";
 
@@ -56,6 +60,9 @@ typedef struct {
     int code;
     int seq;
     int ttl_ms;
+    uint32_t playback_generation;
+    bool emergency;
+    char emergency_event_id[64];
 } system_server_command_t;
 
 typedef struct {
@@ -67,6 +74,7 @@ typedef struct {
     char endpoint[SYSTEM_COMMAND_ENDPOINT_BUFFER_SIZE];
     char escaped_error_code[SYSTEM_COMMAND_ESCAPED_SMALL_BUFFER_SIZE];
     char escaped_error_message[SYSTEM_COMMAND_ESCAPED_TEXT_BUFFER_SIZE];
+    char escaped_emergency_event_id[SYSTEM_COMMAND_ESCAPED_SMALL_BUFFER_SIZE];
 } system_server_client_scratch_t;
 
 static bool s_capabilities_registered;
@@ -494,6 +502,23 @@ static esp_err_t system_server_parse_first_command(const char *json,
                                      "text",
                                      command->text,
                                      sizeof(command->text));
+        (void)system_json_get_string(scratch->payload,
+                                     ESP111_PROTOCOL_LOCAL_JSON_EMERGENCY_EVENT_ID,
+                                     command->emergency_event_id,
+                                     sizeof(command->emergency_event_id));
+        int playback_generation = 0;
+        if (system_json_get_int(scratch->payload,
+                                ESP111_PROTOCOL_LOCAL_JSON_PLAYBACK_GENERATION,
+                                &playback_generation) &&
+            playback_generation > 0) {
+            command->playback_generation = (uint32_t)playback_generation;
+        }
+        int emergency = 0;
+        if (system_json_get_int(scratch->payload,
+                                ESP111_PROTOCOL_LOCAL_JSON_EMERGENCY,
+                                &emergency)) {
+            command->emergency = emergency != 0;
+        }
         (void)system_json_get_int(scratch->payload, "ttl_ms", &command->ttl_ms);
     }
     (void)system_json_get_int(scratch->object, "seq", &command->seq);
@@ -505,6 +530,12 @@ static esp_err_t system_server_parse_first_command(const char *json,
         break;
     case ESP111_PROTOCOL_LOCAL_COMMAND_SHOW_TEXT:
         strlcpy(command->name, "lcd.show_text", sizeof(command->name));
+        break;
+    case ESP111_PROTOCOL_LOCAL_COMMAND_PLAY_AUDIO:
+        strlcpy(command->name, "speaker.play_audio", sizeof(command->name));
+        break;
+    case ESP111_PROTOCOL_LOCAL_COMMAND_STOP_AUDIO:
+        strlcpy(command->name, "speaker.stop_audio", sizeof(command->name));
         break;
     default:
         snprintf(command->name,
@@ -632,6 +663,10 @@ static esp_err_t system_server_client_post_ack(system_server_client_scratch_t *s
         system_json_escape_string(completed ? "" : (error_message != NULL ? error_message : "command failed"),
                                   scratch->escaped_error_message,
                                   sizeof(scratch->escaped_error_message));
+    const bool emergency_event_complete =
+        system_json_escape_string(scratch->command.emergency_event_id,
+                                  scratch->escaped_emergency_event_id,
+                                  sizeof(scratch->escaped_emergency_event_id));
     if (!error_code_complete || !error_message_complete) {
         ESP_LOGW(TAG,
                  "command ack error text truncated command_id=%s code_complete=%d message_complete=%d",
@@ -650,6 +685,9 @@ static esp_err_t system_server_client_post_ack(system_server_client_scratch_t *s
                             "\"" ESP111_PROTOCOL_LOCAL_JSON_COMMAND_ID "\":\"%s\","
                             "\"" ESP111_PROTOCOL_LOCAL_JSON_OK "\":%u,"
                             "\"" ESP111_PROTOCOL_LOCAL_JSON_ERROR "\":%u,"
+                            "\"" ESP111_PROTOCOL_LOCAL_JSON_PLAYBACK_GENERATION "\":%lu,"
+                            "\"" ESP111_PROTOCOL_LOCAL_JSON_EMERGENCY_EVENT_ID "\":\"%s\","
+                            "\"" ESP111_PROTOCOL_LOCAL_JSON_EMERGENCY "\":%u,"
                             "\"" ESP111_PROTOCOL_LOCAL_JSON_UPTIME_MS "\":%s,"
                             "\"" ESP111_PROTOCOL_LOCAL_JSON_SEQ "\":%s}",
                             ESP111_PROTOCOL_LOCAL_SCHEMA_VERSION,
@@ -659,6 +697,9 @@ static esp_err_t system_server_client_post_ack(system_server_client_scratch_t *s
                             completed ? 1U : 0U,
                             completed ? ESP111_PROTOCOL_LOCAL_ERROR_NONE :
                                         system_server_client_error_to_local_code(error_code),
+                            (unsigned long)scratch->command.playback_generation,
+                            emergency_event_complete ? scratch->escaped_emergency_event_id : "",
+                            scratch->command.emergency ? 1U : 0U,
                             metadata.esp_uptime_ms,
                             metadata.request_seq);
     if (json_len < 0 || json_len >= (int)sizeof(scratch->json_body)) {
@@ -738,6 +779,59 @@ static esp_err_t system_server_client_execute_command(system_server_client_scrat
                                              true,
                                              NULL,
                                              NULL);
+    }
+
+    if (strcmp(command->name, "speaker.play_audio") == 0) {
+        if (command->text[0] == '\0') {
+            return system_server_client_post_ack(scratch,
+                                                command->command_id,
+                                                command->seq,
+                                                false,
+                                                ESP111_PROTOCOL_ERROR_INVALID_COMMAND_PAYLOAD,
+                                                "play_audio payload.text is required");
+        }
+        if (command->emergency) {
+            (void)server_voice_client_request_abort("home_ai_emergency_preempt");
+            (void)audio_player_stream_abort();
+        } else {
+            const voice_chain_state_t state = voice_chain_get_state();
+            if (state != VOICE_IDLE && state != VOICE_LISTENING) {
+                return system_server_client_post_ack(scratch,
+                                                    command->command_id,
+                                                    command->seq,
+                                                    false,
+                                                    ESP111_PROTOCOL_ERROR_VOICE_SESSION_BUSY,
+                                                    "voice session is active");
+            }
+        }
+        esp_err_t ret = wake_prompt_cache_play_text(command->text);
+        ESP_LOGI(TAG,
+                 "audio command applied id=%s emergency=%d generation=%lu ret=%s",
+                 command->command_id,
+                 command->emergency ? 1 : 0,
+                 (unsigned long)command->playback_generation,
+                 esp_err_to_name(ret));
+        return system_server_client_post_ack(scratch,
+                                             command->command_id,
+                                             command->seq,
+                                             ret == ESP_OK,
+                                             ret == ESP_OK ? NULL : ESP111_PROTOCOL_ERROR_COMMAND_FAILED,
+                                             ret == ESP_OK ? NULL : esp_err_to_name(ret));
+    }
+
+    if (strcmp(command->name, "speaker.stop_audio") == 0) {
+        (void)server_voice_client_request_abort("home_ai_offline_stop");
+        const esp_err_t ret = audio_player_stream_abort();
+        ESP_LOGI(TAG,
+                 "audio stop command applied id=%s ret=%s",
+                 command->command_id,
+                 esp_err_to_name(ret));
+        return system_server_client_post_ack(scratch,
+                                             command->command_id,
+                                             command->seq,
+                                             ret == ESP_OK,
+                                             ret == ESP_OK ? NULL : ESP111_PROTOCOL_ERROR_COMMAND_FAILED,
+                                             ret == ESP_OK ? NULL : esp_err_to_name(ret));
     }
 
     ESP_LOGW(TAG, "unsupported command from gateway id=%s name=%s", command->command_id, command->name);

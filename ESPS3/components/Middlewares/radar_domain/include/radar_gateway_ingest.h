@@ -72,6 +72,7 @@ typedef struct {
     radar_occupancy_state_t occupancy;
     radar_motion_state_t motion;
     uint64_t updated_at_ms;
+    radar_count_summary_t count_summary;
     uint8_t target_count;
     radar_gateway_target_output_t targets[LD2450_MAX_TARGETS];
     uint8_t zone_count;

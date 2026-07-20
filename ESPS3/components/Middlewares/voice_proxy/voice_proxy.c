@@ -18,6 +18,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -267,12 +268,23 @@ esp_err_t voice_proxy_init(void)
         s_voice_lock = NULL;
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreate(voice_proxy_worker_task,
-                    "voice_proxy",
-                    VOICE_PROXY_WORKER_STACK,
-                    NULL,
-                    VOICE_PROXY_WORKER_PRIORITY,
-                    &s_voice_worker) != pdPASS) {
+    BaseType_t created = xTaskCreateWithCaps(voice_proxy_worker_task,
+                                             "voice_proxy",
+                                             VOICE_PROXY_WORKER_STACK,
+                                             NULL,
+                                             VOICE_PROXY_WORKER_PRIORITY,
+                                             &s_voice_worker,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (created != pdPASS) {
+        ESP_LOGW(TAG, "PSRAM task stack allocation failed; falling back to internal RAM");
+        created = xTaskCreate(voice_proxy_worker_task,
+                              "voice_proxy",
+                              VOICE_PROXY_WORKER_STACK,
+                              NULL,
+                              VOICE_PROXY_WORKER_PRIORITY,
+                              &s_voice_worker);
+    }
+    if (created != pdPASS) {
         vQueueDelete(s_voice_queue);
         s_voice_queue = NULL;
         vSemaphoreDelete(s_voice_lock);

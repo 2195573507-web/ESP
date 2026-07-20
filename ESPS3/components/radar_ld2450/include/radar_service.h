@@ -28,6 +28,7 @@ typedef struct {
 
 esp_err_t radar_service_init(const radar_presence_config_t *config);
 esp_err_t radar_service_start(void);
+esp_err_t radar_service_stop(void);
 bool radar_service_is_started(void);
 /* UART RX owns capture; the adaptive processing task owns bounded parser consumption. */
 size_t radar_service_process_pending(uint64_t processed_at_ms);

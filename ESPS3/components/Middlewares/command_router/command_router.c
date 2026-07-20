@@ -10,16 +10,22 @@
 #include "command_router.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "cJSON.h"
 #include "child_registry.h"
+#include "command_ack_policy.h"
 #include "esp111_protocol_common.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "gateway_config.h"
+#include "home_ai_event_reporter.h"
+#include "home_ai_emergency_coordinator.h"
+#include "home_ai_voice_router.h"
 #include "network_worker.h"
 #include "offline_policy.h"
 #include "protocol_adapter.h"
@@ -46,17 +52,59 @@ typedef struct {
     command_state_t state;
     uint32_t seq;
     uint32_t ttl_ms;
+    uint32_t expected_playback_generation;
     int64_t created_ms;
     int64_t dispatched_ms;
 } command_entry_t;
 
-static command_entry_t s_queue[GATEWAY_CONFIG_COMMAND_QUEUE_SIZE];
+static command_entry_t *s_queue;
 static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_poll_lock;
 static uint32_t s_command_seq;
-static child_registry_entry_t s_poll_entries[GATEWAY_CONFIG_MAX_CHILDREN];
-static char s_poll_server_body[SERVER_CLIENT_SMALL_BODY_BYTES];
-static bool s_peer_active[GATEWAY_CONFIG_MAX_CHILDREN];
+static child_registry_entry_t *s_poll_entries;
+static char *s_poll_server_body;
+static bool *s_peer_active;
+
+static void free_storage(void)
+{
+    heap_caps_free(s_queue);
+    heap_caps_free(s_poll_entries);
+    heap_caps_free(s_poll_server_body);
+    heap_caps_free(s_peer_active);
+    s_queue = NULL;
+    s_poll_entries = NULL;
+    s_poll_server_body = NULL;
+    s_peer_active = NULL;
+}
+
+static void *allocate_storage(size_t count, size_t size)
+{
+    void *storage = heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (storage == NULL) {
+        storage = heap_caps_calloc(count, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return storage;
+}
+
+static esp_err_t ensure_storage(void)
+{
+    if (s_queue != NULL && s_poll_entries != NULL && s_poll_server_body != NULL &&
+        s_peer_active != NULL) {
+        return ESP_OK;
+    }
+    free_storage();
+    s_queue = allocate_storage(GATEWAY_CONFIG_COMMAND_QUEUE_SIZE, sizeof(*s_queue));
+    s_poll_entries = allocate_storage(GATEWAY_CONFIG_MAX_CHILDREN, sizeof(*s_poll_entries));
+    s_poll_server_body = allocate_storage(SERVER_CLIENT_SMALL_BODY_BYTES,
+                                          sizeof(*s_poll_server_body));
+    s_peer_active = allocate_storage(GATEWAY_CONFIG_MAX_CHILDREN, sizeof(*s_peer_active));
+    if (s_queue == NULL || s_poll_entries == NULL || s_poll_server_body == NULL ||
+        s_peer_active == NULL) {
+        free_storage();
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
 
 static int64_t now_ms(void)
 {
@@ -86,7 +134,8 @@ static size_t peer_index(const char *device_id)
 static bool peer_active_locked(const char *device_id)
 {
     const size_t index = peer_index(device_id);
-    return index < GATEWAY_CONFIG_MAX_CHILDREN && s_peer_active[index];
+    return s_peer_active != NULL && index < GATEWAY_CONFIG_MAX_CHILDREN &&
+           s_peer_active[index];
 }
 
 static bool command_poll_cancelled(void *ctx)
@@ -98,6 +147,7 @@ static bool command_poll_cancelled(void *ctx)
 
 static command_entry_t *find_locked(const char *command_id)
 {
+    if (s_queue == NULL || command_id == NULL) return NULL;
     for (size_t i = 0; i < GATEWAY_CONFIG_COMMAND_QUEUE_SIZE; i++) {
         if (s_queue[i].state != COMMAND_STATE_EMPTY &&
             strcmp(s_queue[i].command_id, command_id) == 0) {
@@ -109,6 +159,7 @@ static command_entry_t *find_locked(const char *command_id)
 
 static command_entry_t *allocate_locked(void)
 {
+    if (s_queue == NULL) return NULL;
     for (size_t i = 0; i < GATEWAY_CONFIG_COMMAND_QUEUE_SIZE; i++) {
         if (s_queue[i].state == COMMAND_STATE_EMPTY ||
             s_queue[i].state == COMMAND_STATE_ACKED ||
@@ -117,6 +168,33 @@ static command_entry_t *allocate_locked(void)
         }
     }
     return NULL;
+}
+
+static bool cjson_positive_u32(const cJSON *item, uint32_t *out_value)
+{
+    if (!cJSON_IsNumber(item) || out_value == NULL || item->valuedouble < 1.0 ||
+        item->valuedouble > (double)UINT32_MAX) {
+        return false;
+    }
+    const uint32_t value = (uint32_t)item->valuedouble;
+    if (item->valuedouble != (double)value) return false;
+    *out_value = value;
+    return true;
+}
+
+static uint32_t playback_generation_from_params(const char *params_json)
+{
+    if (params_json == NULL || params_json[0] == '\0') return 0U;
+    uint32_t generation = 0U;
+    cJSON *root = cJSON_Parse(params_json);
+    if (root != NULL) {
+        cJSON *item = cJSON_GetObjectItemCaseSensitive(
+            root,
+            ESP111_PROTOCOL_LOCAL_JSON_PLAYBACK_GENERATION);
+        (void)cjson_positive_u32(item, &generation);
+        cJSON_Delete(root);
+    }
+    return generation;
 }
 
 static esp_err_t enqueue_locked(const char *command_id,
@@ -152,6 +230,7 @@ static esp_err_t enqueue_locked(const char *command_id,
     strlcpy(entry->params_json, params, sizeof(entry->params_json));
     strlcpy(entry->source, source != NULL ? source : "local", sizeof(entry->source));
     entry->ttl_ms = ttl_ms > 0 ? ttl_ms : 30000U;
+    entry->expected_playback_generation = playback_generation_from_params(params);
     entry->state = COMMAND_STATE_QUEUED;
     entry->created_ms = now_ms();
     return ESP_OK;
@@ -195,6 +274,9 @@ static unsigned int map_local_command_code(const char *command_type)
     }
     if (strcmp(command_type, "config.set") == 0) {
         return ESP111_PROTOCOL_LOCAL_COMMAND_CONFIG_SET;
+    }
+    if (strcmp(command_type, "speaker.stop_audio") == 0) {
+        return ESP111_PROTOCOL_LOCAL_COMMAND_STOP_AUDIO;
     }
     return ESP111_PROTOCOL_LOCAL_COMMAND_UNSUPPORTED;
 }
@@ -299,20 +381,31 @@ esp_err_t command_router_init(void)
         return ESP_OK;
     }
 
+    esp_err_t storage_ret = ensure_storage();
+    if (storage_ret != ESP_OK) {
+        return storage_ret;
+    }
+
     if (s_lock == NULL) {
         s_lock = xSemaphoreCreateMutex();
         if (s_lock == NULL) {
+            free_storage();
             return ESP_ERR_NO_MEM;
         }
     }
     if (s_poll_lock == NULL) {
         s_poll_lock = xSemaphoreCreateMutex();
         if (s_poll_lock == NULL) {
+            vSemaphoreDelete(s_lock);
+            s_lock = NULL;
+            free_storage();
             return ESP_ERR_NO_MEM;
         }
     }
-    memset(s_queue, 0, sizeof(s_queue));
-    memset(s_peer_active, 0, sizeof(s_peer_active));
+    memset(s_queue, 0, sizeof(*s_queue) * GATEWAY_CONFIG_COMMAND_QUEUE_SIZE);
+    memset(s_poll_entries, 0, sizeof(*s_poll_entries) * GATEWAY_CONFIG_MAX_CHILDREN);
+    memset(s_poll_server_body, 0, SERVER_CLIENT_SMALL_BODY_BYTES);
+    memset(s_peer_active, 0, sizeof(*s_peer_active) * GATEWAY_CONFIG_MAX_CHILDREN);
     s_command_seq = 0;
     ESP_LOGI(TAG, "local command queue initialized size=%u",
              (unsigned int)GATEWAY_CONFIG_COMMAND_QUEUE_SIZE);
@@ -386,6 +479,9 @@ esp_err_t command_router_enqueue(const char *target_device_id,
                                  const char *params_json,
                                  const char *source)
 {
+    if (s_lock == NULL || s_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!child_registry_is_allowed(target_device_id) || command_type == NULL ||
         command_type[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
@@ -415,7 +511,7 @@ static void command_router_poll_server_pending_for_device(const char *device_id)
     esp_err_t server_ret = server_client_get_pending_commands_cancellable(
         device_id,
         s_poll_server_body,
-        sizeof(s_poll_server_body),
+        SERVER_CLIENT_SMALL_BODY_BYTES,
         &server_status,
         command_poll_cancelled,
         (void *)device_id);
@@ -445,7 +541,7 @@ static void command_router_poll_server_pending_for_device(const char *device_id)
 
 void command_router_poll_server_pending(void)
 {
-    if (s_poll_lock == NULL) {
+    if (s_poll_lock == NULL || s_poll_entries == NULL || s_poll_server_body == NULL) {
         return;
     }
 
@@ -466,6 +562,9 @@ void command_router_poll_server_pending(void)
 
 esp_err_t command_router_build_pending_json(const char *device_id, char *out, size_t out_size)
 {
+    if (s_lock == NULL || s_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!child_registry_is_allowed(device_id) || out == NULL || out_size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -532,41 +631,21 @@ esp_err_t command_router_ack(const char *command_id, const char *ack_body)
     if (command_id == NULL || command_id[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_lock == NULL || s_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     char ack_device_id[CHILD_REGISTRY_DEVICE_ID_LEN] = {0};
     unsigned int command_code = ESP111_PROTOCOL_LOCAL_COMMAND_UNSUPPORTED;
-    bool found = false;
-
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    command_entry_t *entry = find_locked(command_id);
-    if (entry != NULL) {
-        entry->state = COMMAND_STATE_ACKED;
-        strlcpy(ack_device_id, entry->target_device_id, sizeof(ack_device_id));
-        command_code = map_local_command_code(entry->command_type);
-        found = true;
-    }
-    xSemaphoreGive(s_lock);
-
-    if (!found) {
-        ESP_LOGW(TAG, "ack for unknown local command id=%s", command_id);
-    }
-
-    char server_ack[512];
     const char *ack_status = "failed";
     const char *error_code = ESP111_PROTOCOL_ERROR_ACK_FAILED;
     const char *message = "local command ack failed";
+    uint32_t received_playback_generation = 0U;
+    bool received_generation_present = false;
+    bool playback_emergency = false;
+    char playback_event_id[64] = {0};
     cJSON *root = ack_body != NULL ? cJSON_Parse(ack_body) : NULL;
     if (root != NULL) {
-        if (ack_device_id[0] == '\0') {
-            cJSON *local_id = cJSON_GetObjectItemCaseSensitive(root, ESP111_PROTOCOL_LOCAL_JSON_ID);
-            if (cJSON_IsNumber(local_id)) {
-                const char *mapped_device_id =
-                    protocol_adapter_local_device_id_to_device_id((uint8_t)local_id->valueint);
-                if (mapped_device_id != NULL) {
-                    strlcpy(ack_device_id, mapped_device_id, sizeof(ack_device_id));
-                }
-            }
-        }
         cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
         cJSON *local_status = cJSON_GetObjectItemCaseSensitive(root, "status");
         if ((cJSON_IsBool(ok) && cJSON_IsTrue(ok)) ||
@@ -591,17 +670,108 @@ esp_err_t command_router_ack(const char *command_id, const char *ack_body)
                 message = msg->valuestring;
             }
         }
+        cJSON *generation = cJSON_GetObjectItemCaseSensitive(
+            root,
+            ESP111_PROTOCOL_LOCAL_JSON_PLAYBACK_GENERATION);
+        cJSON *event_id = cJSON_GetObjectItemCaseSensitive(
+            root,
+            ESP111_PROTOCOL_LOCAL_JSON_EMERGENCY_EVENT_ID);
+        cJSON *emergency = cJSON_GetObjectItemCaseSensitive(
+            root,
+            ESP111_PROTOCOL_LOCAL_JSON_EMERGENCY);
+        received_generation_present =
+            cjson_positive_u32(generation, &received_playback_generation);
+        if (cJSON_IsString(event_id) && event_id->valuestring != NULL) {
+            strlcpy(playback_event_id, event_id->valuestring, sizeof(playback_event_id));
+        }
+        playback_emergency = cJSON_IsTrue(emergency) ||
+                             (cJSON_IsNumber(emergency) && emergency->valueint != 0);
     }
 
+    bool found = false;
+    bool local_ack_accepted = false;
+    home_ai_voice_ack_result_t voice_ack = {0};
+    uint32_t expected_playback_generation = 0U;
+    command_ack_policy_result_t ack_policy = COMMAND_ACK_POLICY_REJECT_UNKNOWN;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    command_entry_t *entry = find_locked(command_id);
+    if (entry != NULL) {
+        found = true;
+        strlcpy(ack_device_id, entry->target_device_id, sizeof(ack_device_id));
+        command_code = map_local_command_code(entry->command_type);
+        expected_playback_generation = entry->expected_playback_generation;
+        const bool active = entry->state == COMMAND_STATE_QUEUED ||
+                            entry->state == COMMAND_STATE_DISPATCHED;
+        ack_policy = command_ack_policy_evaluate(true,
+                                                 active,
+                                                 entry->state == COMMAND_STATE_ACKED,
+                                                 expected_playback_generation,
+                                                 received_generation_present,
+                                                 received_playback_generation);
+        local_ack_accepted = command_ack_policy_accepts(ack_policy);
+        if (local_ack_accepted) {
+            entry->state = COMMAND_STATE_ACKED;
+        }
+    }
+    xSemaphoreGive(s_lock);
+
+    if (ack_device_id[0] == '\0' && root != NULL) {
+        cJSON *local_id = cJSON_GetObjectItemCaseSensitive(root, ESP111_PROTOCOL_LOCAL_JSON_ID);
+        if (cJSON_IsNumber(local_id)) {
+            const char *mapped_device_id =
+                protocol_adapter_local_device_id_to_device_id((uint8_t)local_id->valueint);
+            if (mapped_device_id != NULL) {
+                strlcpy(ack_device_id, mapped_device_id, sizeof(ack_device_id));
+            }
+        }
+    }
+
+    if (ack_policy == COMMAND_ACK_POLICY_REJECT_GENERATION_MISSING ||
+        ack_policy == COMMAND_ACK_POLICY_REJECT_GENERATION_MISMATCH) {
+        ack_status = "failed";
+        error_code = ESP111_PROTOCOL_ERROR_ACK_FAILED;
+        message = command_ack_policy_result_name(ack_policy);
+    }
+    if (!found) {
+        ESP_LOGW(TAG, "ack for unknown local command id=%s", command_id);
+    } else if (!local_ack_accepted) {
+        ESP_LOGW(TAG,
+                 "ack rejected id=%s policy=%s expected_generation=%lu received_generation=%lu",
+                 command_id,
+                 command_ack_policy_result_name(ack_policy),
+                 (unsigned long)expected_playback_generation,
+                 (unsigned long)received_playback_generation);
+    }
+
+    if (ack_policy == COMMAND_ACK_POLICY_ACCEPT_PLAYBACK) {
+        if (home_ai_voice_router_acknowledge_ex(expected_playback_generation, &voice_ack) &&
+            voice_ack.completed && voice_ack.emergency) {
+            (void)home_ai_emergency_coordinator_playback_completed(
+                voice_ack.emergency_event_id,
+                expected_playback_generation,
+                strcmp(ack_status, "completed") == 0,
+                (uint64_t)(esp_timer_get_time() / 1000));
+        }
+    }
+
+    char server_ack[512];
     int written = snprintf(server_ack,
                            sizeof(server_ack),
                            "{\"status\":\"%s\",\"error_code\":\"%s\",\"error_message\":\"%s\","
-                           "\"result\":{\"applied\":%s,\"gateway_id\":\"%s\"}}",
+                           "\"result\":{\"applied\":%s,\"gateway_id\":\"%s\","
+                           "\"playback_generation\":%lu,\"expected_playback_generation\":%lu,"
+                           "\"emergency_event_id\":\"%s\",\"ack_guard\":\"%s\","
+                           "\"local_ack_accepted\":%s}}",
                            ack_status,
                            error_code,
                            message,
                            strcmp(ack_status, "completed") == 0 ? "true" : "false",
-                           gateway_config_get()->gateway_id);
+                           gateway_config_get()->gateway_id,
+                           (unsigned long)received_playback_generation,
+                           (unsigned long)expected_playback_generation,
+                           playback_event_id,
+                           command_ack_policy_result_name(ack_policy),
+                           local_ack_accepted ? "true" : "false");
     if (root != NULL) {
         cJSON_Delete(root);
     }
@@ -620,9 +790,24 @@ esp_err_t command_router_ack(const char *command_id, const char *ack_body)
                                              command_code,
                                              strcmp(ack_status, "completed") == 0);
     }
-    ESP_LOGI(TAG, "command ack id=%s local_known=%d queued=%d",
+    if (expected_playback_generation != 0U || received_generation_present) {
+        const uint32_t event_generation = received_generation_present ?
+                                                  received_playback_generation :
+                                                  expected_playback_generation;
+        home_ai_event_reporter_record_playback_ack(
+            voice_ack.emergency_event_id[0] != '\0' ? voice_ack.emergency_event_id :
+                (playback_event_id[0] != '\0' ? playback_event_id : command_id),
+            "",
+            event_generation,
+            playback_emergency,
+            strcmp(ack_status, "completed") == 0,
+            (uint64_t)(esp_timer_get_time() / 1000));
+    }
+    ESP_LOGI(TAG, "command ack id=%s local_known=%d local_accepted=%d policy=%s queued=%d",
              command_id,
              found ? 1 : 0,
+             local_ack_accepted ? 1 : 0,
+             command_ack_policy_result_name(ack_policy),
              ret == ESP_OK ? 1 : 0);
     return ESP_OK;
 }

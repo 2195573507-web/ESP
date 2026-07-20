@@ -15,8 +15,10 @@
 #include "gateway_orchestrator.h"
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 static const char *TAG = "S3_ENTRY";
@@ -26,7 +28,11 @@ static void gateway_startup_task(void *arg)
 {
     (void)arg;
 
-    app_stack_monitor_log(TAG, "gateway_startup_task", "entry");
+    app_stack_monitor_report(TAG,
+                             "gateway_startup_task",
+                             APP_STARTUP_TASK_STACK,
+                             "entry");
+    app_startup_memory_check(TAG, "gateway_startup_task", "entry");
     /*
      * S3 启动主链路从这里交给 gateway_orchestrator：
      * 先初始化 registry/router/adapter/proxy 等本地状态，再启动 SoftAP，最后开放
@@ -34,10 +40,15 @@ static void gateway_startup_task(void *arg)
      * S3<->Server 的完整协议由 server_client 负责。
      */
     gateway_orchestrator_start();
+    app_startup_memory_check(TAG, "gateway_startup_task", "orchestrator_returned");
+    app_stack_monitor_report(TAG,
+                             "gateway_startup_task",
+                             APP_STARTUP_TASK_STACK,
+                             "orchestrator_returned");
     app_stack_monitor_log(TAG, "gateway_startup_task", "orchestrator_returned");
 
     s_gateway_task = NULL;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 /**
@@ -47,20 +58,24 @@ static void gateway_startup_task(void *arg)
  * 调用时机：芯片启动、系统组件初始化完成后进入。
  * 输入参数：无。
  * 返回值：无；创建 gateway_startup 任务后返回给 ESP-IDF。
- * 失败处理：任务创建失败时通过 ESP_ERROR_CHECK(ESP_ERR_NO_MEM) 进入 ESP-IDF 错误处理；
+ * 失败处理：任务创建失败时记录资源不足并返回，避免独立模块启动失败触发整机重启；
  * 后续 SoftAP/HTTP/Server 转发失败由 gateway_orchestrator 或各模块记录。
  */
 void app_main(void)
 {
     app_debug_apply_log_levels();
+    app_startup_memory_check(TAG, "app_main", "entry");
     app_stack_monitor_log(TAG, "app_main", "entry");
 
-    BaseType_t created = xTaskCreate(gateway_startup_task,
-                                     "gateway_startup",
-                                     APP_STARTUP_TASK_STACK,
-                                     NULL,
-                                     APP_STARTUP_TASK_PRIORITY,
-                                     &s_gateway_task);
+    BaseType_t created = xTaskCreateWithCaps(gateway_startup_task,
+                                             "gateway_startup",
+                                             APP_STARTUP_TASK_STACK,
+                                             NULL,
+                                             APP_STARTUP_TASK_PRIORITY,
+                                             &s_gateway_task,
+                                             /* Flash/NVS paths may execute with the cache disabled. */
+                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    app_startup_memory_check(TAG, "app_main", "after_gateway_task_create");
     app_stack_monitor_log(TAG, "app_main", "after_gateway_task_create");
     if (created != pdPASS) {
         s_gateway_task = NULL;
@@ -68,8 +83,12 @@ void app_main(void)
                  "create gateway startup task failed stack=%u priority=%u",
                  (unsigned int)APP_STARTUP_TASK_STACK,
                  (unsigned int)APP_STARTUP_TASK_PRIORITY);
-        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+        ESP_LOGE(TAG,
+                 "gateway startup disabled ret=%s; independent services were not started",
+                 esp_err_to_name(ESP_ERR_NO_MEM));
+        return;
     }
 
+    app_startup_memory_check(TAG, "app_main", "return");
     app_stack_monitor_log(TAG, "app_main", "return");
 }

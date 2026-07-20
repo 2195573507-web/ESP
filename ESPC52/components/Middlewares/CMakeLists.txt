@@ -28,6 +28,9 @@ set(speaker_srcs
 set(voice_srcs
             voice_domain/voice_chain.c)
 
+set(home_ai_srcs
+            home_ai/c5_voice_session_client.c)
+
 set(runtime_srcs
             runtime/app_runtime.c
             runtime/c5_backpressure_controller.c
@@ -72,6 +75,7 @@ set(srcs
             ${screen_srcs}
             ${speaker_srcs}
             ${voice_srcs}
+            ${home_ai_srcs}
             ${runtime_srcs}
             ${memory_srcs}
             ${device_protocol_srcs}
@@ -91,6 +95,7 @@ set(priv_include_dirs
             display_placeholder
             speaker
             voice_domain
+            home_ai
             runtime
             memory
             device_protocol

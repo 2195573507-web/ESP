@@ -402,6 +402,8 @@ esp_err_t resource_manager_init(void)
     if (s_operation_lock == NULL) {
         s_operation_lock = xSemaphoreCreateMutex();
         if (s_operation_lock == NULL) {
+            vSemaphoreDelete(s_lock);
+            s_lock = NULL;
             return ESP_ERR_NO_MEM;
         }
     }

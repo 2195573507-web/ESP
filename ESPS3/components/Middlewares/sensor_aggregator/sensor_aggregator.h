@@ -27,6 +27,15 @@ typedef struct {
     const char *error_code;
 } sensor_aggregator_result_t;
 
+typedef struct {
+    bool valid;
+    char device_id[64];
+    int64_t sampled_at_ms;
+    double temperature_c;
+    double humidity_percent;
+    double air_quality_score;
+} sensor_aggregator_home_ai_environment_t;
+
 /** @brief 初始化 sensor/status 聚合器；gateway_orchestrator_start() 调用，当前无状态。 */
 void sensor_aggregator_init(void);
 /** @brief 暂停指定 C5 的实时 sensor 上云和 cache replay；幂等且保留 latest/history/cache。 */
@@ -76,6 +85,9 @@ void sensor_aggregator_record_command_ack(const char *device_id,
                                           const char *command_id,
                                           unsigned int command_code,
                                           bool completed);
+size_t sensor_aggregator_get_home_ai_environment_snapshot(
+    sensor_aggregator_home_ai_environment_t *out,
+    size_t capacity);
 
 #ifdef __cplusplus
 }

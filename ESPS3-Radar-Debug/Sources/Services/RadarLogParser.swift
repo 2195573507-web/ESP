@@ -72,7 +72,9 @@ struct RadarLogParser {
         let isSourceScopedDiagnostic = isRadarRx ||
             trimmed.range(of: "parser[", options: [.caseInsensitive]) != nil ||
             trimmed.range(of: "recovery[", options: [.caseInsensitive]) != nil ||
-            trimmed.range(of: "local track=", options: [.caseInsensitive]) != nil
+            trimmed.range(of: "local track=", options: [.caseInsensitive]) != nil ||
+            trimmed.range(of: "RADAR_COUNTS", options: [.caseInsensitive]) != nil ||
+            trimmed.range(of: "PERSON_", options: [.caseInsensitive]) != nil
         let source: RadarSource
         let sourceReason: String
         if identity.source != .unknown {
@@ -256,7 +258,17 @@ struct RadarLogParser {
         let online = booleanValue(in: text, keys: ["online", "radar_online"]) ?? booleanValue(sensor)
         let connectionType = RadarSource.fieldValue(in: text, keys: ["connection_type", "link_type", "transport"])
         let sequence = integerValue(in: text, keys: ["frame_seq", "sequence", "seq"])
-        let targetCount = integerValue(in: text, keys: ["tracks", "target_count", "targets"]).flatMap(Int.init)
+        let rawTargetCount = integerValue(in: text, keys: ["raw_target_count"]).flatMap(Int.init)
+        let acceptedTargetCount = integerValue(in: text, keys: ["accepted_target_count"]).flatMap(Int.init)
+        let visibleTrackCount = integerValue(in: text, keys: ["visible_track_count"]).flatMap(Int.init)
+        let confirmedActiveTrackCount = integerValue(in: text, keys: ["confirmed_active_track_count"]).flatMap(Int.init)
+        let historyTargetCount = integerValue(in: text, keys: ["history_target_count"]).flatMap(Int.init)
+        let visiblePersonCount = integerValue(in: text, keys: ["visible_person_count"]).flatMap(Int.init)
+        let retainedPersonCount = integerValue(in: text, keys: ["retained_person_count"]).flatMap(Int.init)
+        let businessPersonCount = integerValue(in: text, keys: ["business_person_count"]).flatMap(Int.init)
+        let countState = RadarSource.fieldValue(in: text, keys: ["count_state"])
+        let targetCount = visibleTrackCount ??
+            integerValue(in: text, keys: ["tracks", "target_count", "targets"]).flatMap(Int.init)
         let occupancy = RadarSource.fieldValue(in: text, keys: ["occupancy"])
         let presence = RadarSource.fieldValue(in: text, keys: ["presence", "presence_state"])
             .flatMap(RadarPresenceState.init(rawValue:)) ?? occupancy.flatMap(RadarPresenceState.init(rawValue:))
@@ -285,6 +297,15 @@ struct RadarLogParser {
                                connectionType: connectionType,
                                sequence: sequence,
                                targetCount: targetCount,
+                               rawTargetCount: rawTargetCount,
+                               acceptedTargetCount: acceptedTargetCount,
+                               visibleTrackCount: visibleTrackCount,
+                               confirmedActiveTrackCount: confirmedActiveTrackCount,
+                               historyTargetCount: historyTargetCount,
+                               visiblePersonCount: visiblePersonCount,
+                               retainedPersonCount: retainedPersonCount,
+                               businessPersonCount: businessPersonCount,
+                               countState: countState,
                                presenceState: presence,
                                motionState: motion,
                                spatialState: spatial,
@@ -303,7 +324,8 @@ struct RadarLogParser {
                                rxBytes: rxBytes,
                                timeout: timeout,
                                fifoOverflow: fifoOverflow,
-                               isValidFrame: targetCount != nil)
+                               isValidFrame: targetCount != nil &&
+                                   text.range(of: "RADAR_COUNTS", options: [.caseInsensitive]) == nil)
     }
 
     private func recoveryState(in text: String) -> String? {

@@ -29,6 +29,7 @@ const SMART_HOME_COMMAND_COLUMNS = [
     { name: "params_json", type: "TEXT NOT NULL DEFAULT '{}'", addType: "TEXT" },
     { name: "source", type: "TEXT" },
     { name: "requested_by", type: "TEXT" },
+    { name: "decision_id", type: "TEXT" },
     { name: "status", type: "TEXT NOT NULL DEFAULT 'queued'", addType: "TEXT" },
     { name: "result_json", type: "TEXT" },
     { name: "error_message", type: "TEXT" },
@@ -94,4 +95,3 @@ async function ensureSmartHomeTables(dbRun, dbAll) {
 module.exports = {
     ensureSmartHomeTables
 };
-

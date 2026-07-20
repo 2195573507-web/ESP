@@ -55,17 +55,17 @@ struct DashboardView: View {
     private var overview: some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("系统检测目标总数").font(.caption).foregroundStyle(.secondary)
-                Text("\(store.roomSources.reduce(0) { $0 + store.state(for: $1).targetCount })")
+                Text("业务人数总计").font(.caption).foregroundStyle(.secondary)
+                Text("\(store.roomSources.reduce(0) { $0 + store.state(for: $1).businessPersonCount })")
                     .font(.title2.monospacedDigit())
-                Text("三个独立房间目标数之和，不代表同一空间人数").font(.caption2).foregroundStyle(.secondary)
+                Text("各来源独立；UNKNOWN 时数字不作确定人数解释").font(.caption2).foregroundStyle(.secondary)
             }
             .frame(minWidth: 230, alignment: .leading)
             ForEach(store.roomSources) { source in
                 let state = store.state(for: source)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(source.displayName).font(.caption).lineLimit(1)
-                    Text("\(state.targetCount) 个 · \(state.presenceState.rawValue)").font(.caption.monospacedDigit())
+                    Text("\(state.businessPersonCount) 人 · \(state.countState)").font(.caption.monospacedDigit())
                     Text(ageText(state)).font(.caption2).foregroundStyle(freshnessColor(state))
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -173,20 +173,29 @@ private struct RadarPanelView: View {
                 }
             }
             RadarCanvas(source: source,
-                        targets: state.filteredTargets,
+                        targets: state.visibleTracks,
                         trackHistory: state.trackHistory,
                         coordinateConfig: config.coordinateConfig,
                         zoneConfig: config.zoneConfig)
                 .frame(minHeight: 300)
             HStack {
-                LabeledContent("当前目标", value: "\(state.targetCount)")
+                LabeledContent("Raw targets", value: "\(state.rawTargetCount)")
                 Spacer()
-                LabeledContent("Presence", value: state.presenceState.rawValue)
+                LabeledContent("Visible tracks", value: "\(state.visibleTrackCount)")
                 Spacer()
-                LabeledContent("占用", value: state.occupancyState)
+                LabeledContent("Retained persons", value: "\(state.retainedPersonCount)")
             }
+            HStack {
+                LabeledContent("Business persons", value: "\(state.businessPersonCount)")
+                Spacer()
+                LabeledContent("Count state", value: state.countState)
+                Spacer()
+                LabeledContent("History tracks", value: "\(state.historyTargetCount)")
+            }
+            .font(.caption.monospacedDigit())
             targetTable
             Grid(horizontalSpacing: 8, verticalSpacing: 5) {
+                GridRow { metric("Occupancy", state.occupancyState); metric("Motion", state.motionState) }
                 GridRow { metric("解析错误", state.parseErrorCount); metric("序列拒绝", state.sequenceRejectCount) }
                 GridRow { metric("身份不符", state.identityMismatchCount); metric("丢帧", state.droppedFrameCount) }
                 GridRow { metric("Stale", state.staleFrameCount); metric("帧率", String(format: "%.1f Hz", state.frameRate)) }
@@ -210,10 +219,10 @@ private struct RadarPanelView: View {
     private var targetTable: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("独立目标详情").font(.caption.weight(.semibold))
-            if state.filteredTargets.isEmpty {
-                Text("尚未收到该房间目标").font(.caption).foregroundStyle(.secondary)
+            if state.visibleTracks.isEmpty {
+                Text("当前没有可见 confirmed track；历史路径不计入当前人员").font(.caption).foregroundStyle(.secondary)
             } else {
-                ForEach(state.filteredTargets) { target in
+                ForEach(state.visibleTracks) { target in
                     HStack(spacing: 8) {
                         Text("T\(target.trackID)").font(.caption.monospacedDigit()).frame(width: 32, alignment: .leading)
                         Text(String(format: "X=%.1fm  Y=%.1fm", Double(target.xMillimeters) / 1_000, Double(target.yMillimeters) / 1_000))

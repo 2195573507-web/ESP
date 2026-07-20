@@ -25,6 +25,7 @@
 
 static const char *TAG = "radar_local";
 static TaskHandle_t s_task;
+static bool s_task_with_caps;
 static radar_local_adapter_diagnostics_t s_diagnostics;
 static portMUX_TYPE s_diagnostics_lock = portMUX_INITIALIZER_UNLOCKED;
 static radar_spatial_state_t s_spatial_state;
@@ -69,8 +70,8 @@ static void registry_snapshot_from_spatial(const radar_spatial_snapshot_t *spati
     snapshot->uart_online = spatial->sensor_state != RADAR_SENSOR_OFFLINE;
     snapshot->frame_fresh = spatial->sensor_state == RADAR_SENSOR_VALID;
     snapshot->last_valid_frame_ms = spatial->latest_frame_ms;
-    snapshot->current_target_count = spatial->active_track_count;
-    for (size_t i = 0U; i < spatial->active_track_count; ++i) {
+    snapshot->current_target_count = spatial->visible_track_count;
+    for (size_t i = 0U; i < spatial->visible_track_count; ++i) {
         const radar_track_snapshot_t *target = &spatial->current_targets[i];
         snapshot->targets[i] = (radar_target_t){
             .valid = true,
@@ -107,6 +108,25 @@ static void registry_snapshot_from_spatial(const radar_spatial_snapshot_t *spati
     }
 }
 
+static radar_count_summary_t count_summary_from_spatial(const radar_spatial_snapshot_t *spatial)
+{
+    radar_count_summary_t summary = {0};
+    if (spatial == NULL) {
+        summary.count_state = RADAR_PERSON_COUNT_UNKNOWN;
+        return summary;
+    }
+    summary.raw_target_count = spatial->raw_target_count;
+    summary.accepted_target_count = spatial->accepted_target_count;
+    summary.visible_track_count = spatial->visible_track_count;
+    summary.confirmed_active_track_count = spatial->confirmed_active_track_count;
+    summary.history_target_count = spatial->history_target_count;
+    summary.visible_person_count = spatial->visible_person_count;
+    summary.retained_person_count = spatial->retained_person_count;
+    summary.business_person_count = spatial->business_person_count;
+    summary.count_state = spatial->count_state;
+    return summary;
+}
+
 static void adapter_task(void *arg)
 {
     radar_local_task_workspace_t *workspace = (radar_local_task_workspace_t *)arg;
@@ -117,7 +137,14 @@ static void adapter_task(void *arg)
 
     if (workspace == NULL) {
         ESP_LOGE(TAG, "radar_local workspace unavailable");
-        vTaskDelete(NULL);
+        const bool task_with_caps = s_task_with_caps;
+        s_task = NULL;
+        s_task_with_caps = false;
+        if (task_with_caps) {
+            vTaskDeleteWithCaps(NULL);
+        } else {
+            vTaskDelete(NULL);
+        }
         return;
     }
 
@@ -180,7 +207,10 @@ static void adapter_task(void *arg)
                 .uart_read_driver_error = workspace->service_diagnostics.uart.read_driver_error,
             };
             bool state_changed = false;
+            const radar_count_summary_t count_summary =
+                count_summary_from_spatial(&workspace->spatial_snapshot);
             if (radar_registry_update_local(&workspace->registry_snapshot,
+                                            &count_summary,
                                             &workspace->registry_diagnostics,
                                             current_ms, &state_changed)) {
                 portENTER_CRITICAL(&s_diagnostics_lock);
@@ -203,6 +233,22 @@ static void adapter_task(void *arg)
     }
 }
 
+static void rollback_partial_start(bool stop_radar_service, bool stop_log_manager)
+{
+    if (stop_radar_service) {
+        const esp_err_t stop_ret = radar_service_stop();
+        if (stop_ret != ESP_OK) {
+            ESP_LOGW(TAG, "radar service rollback failed ret=%s", esp_err_to_name(stop_ret));
+        }
+    }
+    if (stop_log_manager) {
+        const esp_err_t stop_ret = radar_log_manager_stop();
+        if (stop_ret != ESP_OK) {
+            ESP_LOGW(TAG, "radar log rollback failed ret=%s", esp_err_to_name(stop_ret));
+        }
+    }
+}
+
 esp_err_t radar_local_adapter_start(void)
 {
     if (s_task != NULL) {
@@ -218,13 +264,20 @@ esp_err_t radar_local_adapter_start(void)
     }
 
     radar_spatial_state_init(&s_spatial_state, NULL, now_ms());
+    radar_spatial_state_set_source(&s_spatial_state, RADAR_SOURCE_S3_LOCAL);
     radar_rate_manager_init(&s_rate_manager, now_ms());
+    const bool log_manager_was_started = radar_log_manager_is_started();
     ret = radar_log_manager_start();
     if (ret != ESP_OK) {
         return ret;
     }
+    const bool log_manager_started_here =
+        !log_manager_was_started && radar_log_manager_is_started();
 
+    const bool radar_service_was_started = radar_service_is_started();
     esp_err_t uart_start_result = radar_service_start();
+    const bool radar_service_started_here =
+        !radar_service_was_started && radar_service_is_started();
     portENTER_CRITICAL(&s_diagnostics_lock);
     s_diagnostics.uart_start_result = uart_start_result;
     portEXIT_CRITICAL(&s_diagnostics_lock);
@@ -245,10 +298,13 @@ esp_err_t radar_local_adapter_start(void)
                                             sizeof(*s_task_workspace),
                                             MALLOC_CAP_8BIT);
         if (s_task_workspace == NULL) {
+            rollback_partial_start(radar_service_started_here,
+                                   log_manager_started_here);
             return ESP_ERR_NO_MEM;
         }
     }
 
+    s_task_with_caps = true;
     BaseType_t created = xTaskCreateWithCaps(adapter_task,
                                              "radar_local",
                                              RADAR_CONFIG_LOCAL_ADAPTER_TASK_STACK,
@@ -258,6 +314,7 @@ esp_err_t radar_local_adapter_start(void)
                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         ESP_LOGW(TAG, "PSRAM task stack allocation failed; falling back to internal RAM");
+        s_task_with_caps = false;
         created = xTaskCreate(adapter_task,
                               "radar_local",
                               RADAR_CONFIG_LOCAL_ADAPTER_TASK_STACK,
@@ -267,8 +324,11 @@ esp_err_t radar_local_adapter_start(void)
     }
     if (created != pdPASS) {
         s_task = NULL;
+        s_task_with_caps = false;
         heap_caps_free(s_task_workspace);
         s_task_workspace = NULL;
+        rollback_partial_start(radar_service_started_here,
+                               log_manager_started_here);
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "S3_LOCAL registry adapter task started poll_ms=%u",
@@ -310,6 +370,7 @@ bool radar_local_adapter_get_readonly_snapshot(radar_readonly_snapshot_t *out)
         out->sensor_state = RADAR_SENSOR_OFFLINE;
         out->occupancy_state = RADAR_OCCUPANCY_UNKNOWN;
         out->motion_state = RADAR_MOTION_UNKNOWN;
+        out->count_summary.count_state = RADAR_PERSON_COUNT_UNKNOWN;
         return false;
     }
 
@@ -320,7 +381,8 @@ bool radar_local_adapter_get_readonly_snapshot(radar_readonly_snapshot_t *out)
     out->sensor_state = spatial.sensor_state;
     out->occupancy_state = spatial.occupancy_state;
     out->motion_state = spatial.motion_state;
-    for (size_t i = 0U; i < spatial.active_track_count; ++i) {
+    out->count_summary = count_summary_from_spatial(&spatial);
+    for (size_t i = 0U; i < spatial.visible_track_count; ++i) {
         const radar_track_snapshot_t *track = &spatial.current_targets[i];
         out->tracks[out->track_count++] = (radar_readonly_track_t){
             .track_id = track->track_id,

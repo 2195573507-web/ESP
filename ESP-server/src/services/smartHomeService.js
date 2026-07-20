@@ -104,6 +104,7 @@ function mapCommandRow(row) {
         params: normalizeObject(parseJson(row.params_json, {})),
         source: row.source || "",
         requested_by: row.requested_by || "",
+        decision_id: row.decision_id || "",
         status,
         result: parseJson(row.result_json, null),
         error_message: row.error_message || "",
@@ -268,6 +269,7 @@ async function createSmartHomeCommand(dbRun, body = {}) {
         params,
         source: trimText(body.source, 80) || "dashboard",
         requested_by: trimText(body.requested_by, 128),
+        decision_id: trimText(body.decision_id, 160),
         status: "queued",
         created_at_ms: nowMs,
         updated_at_ms: nowMs
@@ -275,8 +277,8 @@ async function createSmartHomeCommand(dbRun, body = {}) {
 
     await dbRun(
         `INSERT INTO smart_home_commands
-        (command_id,target_id,gateway_id,room_id,room_name,action,params_json,source,requested_by,status,created_at_ms,updated_at_ms)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+        (command_id,target_id,gateway_id,room_id,room_name,action,params_json,source,requested_by,decision_id,status,created_at_ms,updated_at_ms)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
             command.command_id,
             command.target_id,
@@ -287,6 +289,7 @@ async function createSmartHomeCommand(dbRun, body = {}) {
             jsonText(command.params),
             command.source,
             command.requested_by,
+            command.decision_id,
             command.status,
             command.created_at_ms,
             command.updated_at_ms
@@ -306,6 +309,7 @@ async function createSmartHomeCommand(dbRun, body = {}) {
         source: command.source,
         server_recv_ms: nowMs
     });
+
     broadcastEvent("command_created", command);
 
     return {
@@ -469,6 +473,15 @@ async function ackSmartHomeCommand(dbRun, dbAll, commandId, body = {}) {
         source: "smart_home_ack",
         server_recv_ms: nowMs
     });
+
+    if (command.decision_id) {
+        try {
+            const { handleSmartHomeAck } = require("../homeAi/agentOrchestrator");
+            await handleSmartHomeAck({ dbRun, dbAll }, command);
+        } catch (_) {
+            // The command ACK remains authoritative even if decision bookkeeping is unavailable.
+        }
+    }
 
     return {
         ok: true,

@@ -21,6 +21,7 @@ extern "C" {
 #endif
 
 #define SERVER_CLIENT_SMALL_BODY_BYTES 2048U
+#define SERVER_CLIENT_HOME_AI_PACKAGE_RESPONSE_BYTES 16384U
 
 typedef esp_err_t (*server_client_data_cb_t)(const uint8_t *data, size_t len, void *user_ctx);
 typedef void (*server_client_voice_meta_cb_t)(int64_t content_length, void *user_ctx);
@@ -98,6 +99,40 @@ esp_err_t server_client_ack_smart_home_command(const char *command_id,
                                                char *response_body,
                                                size_t response_body_size,
                                                int *http_status);
+/** @brief Fetch the checksum-verified Home AI rule package envelope. */
+esp_err_t server_client_get_home_ai_rule_package(char *response_body,
+                                                 size_t response_body_size,
+                                                 int *http_status);
+/** @brief Fetch the checksum-verified room/override configuration snapshot. */
+esp_err_t server_client_get_home_ai_config(char *response_body,
+                                           size_t response_body_size,
+                                           int *http_status);
+/** @brief Check lightweight rule/config notifications without downloading either payload. */
+esp_err_t server_client_get_home_ai_rule_notification(uint32_t known_version,
+                                                      const char *known_config_checksum,
+                                                      char *response_body,
+                                                      size_t response_body_size,
+                                                      int *http_status);
+/** @brief Upload Home AI decision/state events through the existing telemetry channel. */
+esp_err_t server_client_post_home_ai_events(const char *json_body,
+                                            char *response_body,
+                                            size_t response_body_size,
+                                            int *http_status);
+/** @brief Upload virtual device state through the existing telemetry channel. */
+esp_err_t server_client_post_home_ai_virtual_device_state(const char *json_body,
+                                                          char *response_body,
+                                                          size_t response_body_size,
+                                                          int *http_status);
+/** @brief Report the actual S3 rule deployment/partial activation result. */
+esp_err_t server_client_post_home_ai_rule_deployment(const char *json_body,
+                                                     char *response_body,
+                                                     size_t response_body_size,
+                                                     int *http_status);
+/** @brief Replay bounded offline Home AI history batches. */
+esp_err_t server_client_post_home_ai_history_replay(const char *json_body,
+                                                    char *response_body,
+                                                    size_t response_body_size,
+                                                    int *http_status);
 /** @brief 从 Server 拉取完整 device_id 的待执行命令；command_router 调用。 */
 esp_err_t server_client_get_pending_commands(const char *device_id,
                                              char *response_body,

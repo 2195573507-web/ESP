@@ -16,6 +16,7 @@
 #include "bme_cache_manager.h"
 #include "cJSON.h"
 #include "child_registry.h"
+#include "environment_alarm_adapter.h"
 #include "esp111_protocol_common.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -52,6 +53,7 @@ typedef struct {
     int64_t timestamp_ms;
     int64_t last_seen_ms;
     int64_t last_uptime_ms;
+    int64_t last_sensor_ms;
     bool wifi_connected;
     bool voice_ready;
     bool command_ready;
@@ -400,6 +402,7 @@ static void update_device_from_envelope_locked(const protocol_adapter_envelope_t
     if (protocol_adapter_message_kind(envelope->message_type) == PROTOCOL_ADAPTER_MESSAGE_SENSOR_BME690 &&
         envelope->payload != NULL) {
         device->has_sensor = true;
+        device->last_sensor_ms = timestamp_ms;
         device->temperature = json_number(envelope->payload, "temperature_c", device->temperature);
         device->humidity = json_number(envelope->payload, "humidity_percent", device->humidity);
         device->pressure = json_number(envelope->payload, "pressure_hpa", device->pressure);
@@ -890,6 +893,17 @@ esp_err_t sensor_aggregator_handle_envelope(const protocol_adapter_envelope_t *e
                  esp_err_to_name(ret));
     }
 
+    if (kind == PROTOCOL_ADAPTER_MESSAGE_SENSOR_BME690) {
+        const esp_err_t alarm_ret = environment_alarm_adapter_ingest(envelope);
+        if (alarm_ret != ESP_OK && alarm_ret != ESP_ERR_NO_MEM &&
+            alarm_ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG,
+                     "environment alarm adapter deferred device_id=%s ret=%s",
+                     envelope->device_id,
+                     esp_err_to_name(alarm_ret));
+        }
+    }
+
     sensor_aggregator_upload_snapshot();
     return ESP_OK;
 }
@@ -1181,4 +1195,27 @@ void sensor_aggregator_record_command_ack(const char *device_id,
                                            command_id);
     }
     sensor_aggregator_upload_snapshot();
+}
+
+size_t sensor_aggregator_get_home_ai_environment_snapshot(
+    sensor_aggregator_home_ai_environment_t *out,
+    size_t capacity)
+{
+    if (out == NULL || capacity == 0U || s_lock == NULL) return 0U;
+    size_t copied = 0U;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (size_t index = 0U; index < GATEWAY_CONFIG_MAX_CHILDREN && copied < capacity; ++index) {
+        const sensor_aggregator_device_t *device = &s_devices[index];
+        if (!device->seeded || !device->has_sensor) continue;
+        sensor_aggregator_home_ai_environment_t *target = &out[copied++];
+        memset(target, 0, sizeof(*target));
+        target->valid = true;
+        strlcpy(target->device_id, device->device_id, sizeof(target->device_id));
+        target->sampled_at_ms = device->last_sensor_ms;
+        target->temperature_c = device->temperature;
+        target->humidity_percent = device->humidity;
+        target->air_quality_score = (double)device->air_quality_score;
+    }
+    xSemaphoreGive(s_lock);
+    return copied;
 }

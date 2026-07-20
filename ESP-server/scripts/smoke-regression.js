@@ -1102,22 +1102,16 @@ async function run() {
 
         result = await request(baseUrl, "GET", "/api/device/v1/status?device_id=C51");
         assert.equal(result.response.status, 200);
-        assert.equal(result.body.status.device_id, "sensair_shuttle_01");
+        assert.equal(result.body.status, null);
         result = await request(baseUrl, "GET", "/api/device/v1/modules/status?device_id=C51");
         assert.equal(result.response.status, 200);
-        assert.equal(result.body.modules[0].device_id, "sensair_shuttle_01");
+        assert.deepEqual(result.body.modules, []);
         result = await request(baseUrl, "GET", "/api/device/v1/sensors/latest?device_id=C51");
         assert.equal(result.response.status, 200);
         assert.equal(result.body.sensor.device_id, "sensair_shuttle_01");
         result = await request(baseUrl, "GET", "/api/dashboard/v1/sensors/latest?device_id=C51");
         assert.equal(result.response.status, 200);
         assert.equal(result.body.data.device_id, "sensair_shuttle_01");
-        result = await request(baseUrl, "GET", "/api/dashboard/v1/device/status?device_id=C51");
-        assert.equal(result.response.status, 200);
-        assert.equal(result.body.data.device_id, "sensair_shuttle_01");
-        result = await request(baseUrl, "GET", "/api/dashboard/v1/modules/status?device_id=C51");
-        assert.equal(result.response.status, 200);
-        assert.ok(result.body.data.modules.every(module => module.device_id === "sensair_shuttle_01"));
 
         result = await request(baseUrl, "GET", "/api/commands/whitelist");
         assert.equal(result.response.status, 200);
@@ -2630,7 +2624,7 @@ async function run() {
         assert.equal(result.body.devices[0].state.text, "归一化显示");
         assert.equal(result.body.devices[0].state.ttl_ms, 6000);
 
-        const bmeDeviceId = "esp32-c5-whole-001";
+        const bmeDeviceId = "sensair_shuttle_02";
         const validEspTimeMs = Date.now() - 120;
         const bmeEnvelope = {
             schema_version: 1,
@@ -2732,7 +2726,7 @@ async function run() {
         assert.equal(result.response.status, 201);
         assert.equal(result.body.ok, true);
         assert.equal(result.body.data.upload_delay_ms, null);
-        assert.equal(result.body.data.air_quality.air_quality_source, "server_fallback");
+        assert.equal(result.body.data.air_quality.air_quality_source, "unavailable");
 
         result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
             ...bmeEnvelope,
@@ -3731,6 +3725,30 @@ async function run() {
         }).toString()}`);
         assert.equal(result.response.status, 200);
         assert.equal(result.response.headers.get("x-prompt-cache"), "hit");
+
+        const customPromptText = "卧室自动化已执行";
+        const customPromptPath = `/api/voice/prompt?${new URLSearchParams({
+            prompt_text: customPromptText,
+            device_id: deviceId
+        }).toString()}`;
+        result = await request(baseUrl, "GET", customPromptPath);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.response.headers.get("x-prompt-cache"), "miss");
+        assert.match(result.response.headers.get("x-prompt-key"), /^home_ai_text_[a-f0-9]{32}$/);
+        assert.notEqual(result.response.headers.get("x-voice-config-hash"), updatedPromptHash);
+        assert.equal(result.body.length, 32000);
+
+        result = await request(baseUrl, "GET", customPromptPath);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.response.headers.get("x-prompt-cache"), "hit");
+        assert.equal(result.body.length, 32000);
+
+        result = await request(baseUrl, "GET", `/api/voice/prompt?${new URLSearchParams({
+            prompt_text: "x".repeat(96),
+            device_id: deviceId
+        }).toString()}`);
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.code, "VOICE_PROMPT_TEXT_INVALID");
 
         const staleDbPath = path.join(tempDir, "nested", "stale-smoke.sqlite");
         const stalePort = String(Number(port) + 1000);

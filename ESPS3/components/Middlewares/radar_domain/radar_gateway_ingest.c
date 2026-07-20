@@ -12,6 +12,7 @@
 #include "radar_zone_map.h"
 
 #ifndef RADAR_GATEWAY_HOST_TEST
+#include "esp_heap_caps.h"
 #include "radar_log_manager.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -42,11 +43,13 @@ typedef struct {
     radar_gateway_output_t output;
 } radar_gateway_slot_t;
 
-static radar_gateway_slot_t s_slots[RADAR_GATEWAY_MAX_REMOTE_SOURCES];
+static radar_gateway_slot_t *s_slots;
 static bool s_initialized;
 #ifndef RADAR_GATEWAY_HOST_TEST
 static StaticSemaphore_t s_lock_storage;
 static SemaphoreHandle_t s_lock;
+#else
+static radar_gateway_slot_t s_host_slots[RADAR_GATEWAY_MAX_REMOTE_SOURCES];
 #endif
 
 static bool gateway_lock(void)
@@ -333,12 +336,14 @@ static uint32_t track_id_for_target(const radar_spatial_snapshot_t *snapshot,
     for (size_t i = 0U; i < RADAR_TRACKER_MAX_TRACKS; ++i) {
         const radar_track_snapshot_t *track = &snapshot->tracks[i];
         if (!track->active) continue;
-        const uint32_t distance = target_distance_sq(track->x_mm, track->y_mm,
-                                                     target->x_mm, target->y_mm);
+        const uint32_t distance = target_distance_sq(track->filtered_x_mm,
+                                                     track->filtered_y_mm,
+                                                     target->x_mm,
+                                                     target->y_mm);
         if (distance < best_distance) {
             best_distance = distance;
             track_id = track->track_id;
-            is_visible = track->visible;
+            is_visible = track->visible && track->lifecycle == RADAR_TRACK_CONFIRMED;
         }
     }
     if (visible != NULL) *visible = is_visible;
@@ -389,8 +394,21 @@ static void build_output(radar_gateway_slot_t *slot)
     slot->output.motion = snapshot.motion_state;
     slot->output.updated_at_ms = slot->last_received_ms;
 
-    for (uint8_t i = 0U; slot->last_sample.sample_valid && i < snapshot.accepted_target_count &&
-                           i < LD2450_MAX_TARGETS; ++i) {
+    slot->output.count_summary = (radar_count_summary_t){
+        .raw_target_count = snapshot.raw_target_count,
+        .accepted_target_count = snapshot.accepted_target_count,
+        .visible_track_count = snapshot.visible_track_count,
+        .confirmed_active_track_count = snapshot.confirmed_active_track_count,
+        .history_target_count = snapshot.history_target_count,
+        .visible_person_count = snapshot.visible_person_count,
+        .retained_person_count = snapshot.retained_person_count,
+        .business_person_count = snapshot.business_person_count,
+        .count_state = snapshot.count_state,
+    };
+
+    for (uint8_t i = 0U; slot->last_sample.sample_valid &&
+                           snapshot.sensor_state == RADAR_SENSOR_VALID &&
+                           i < snapshot.accepted_target_count && i < LD2450_MAX_TARGETS; ++i) {
         const radar_spatial_target_t *target = &snapshot.accepted_targets[i];
         bool visible = false;
         uint8_t confidence = 0U;
@@ -424,13 +442,7 @@ static void update_rate_and_publish(radar_gateway_slot_t *slot, uint64_t current
     }
     radar_spatial_snapshot_t snapshot;
     radar_spatial_state_get_snapshot(&slot->spatial, &snapshot);
-    uint8_t retained_track_count = 0U;
-    for (size_t i = 0U; i < RADAR_TRACKER_MAX_TRACKS; ++i) {
-        if (snapshot.tracks[i].active && snapshot.tracks[i].track_id != 0U &&
-            retained_track_count < UINT8_MAX) {
-            ++retained_track_count;
-        }
-    }
+    const uint8_t retained_track_count = snapshot.confirmed_active_track_count;
     (void)radar_rate_manager_update(&slot->rate_manager,
                                     snapshot.accepted_target_count,
                                     snapshot.active_track_count,
@@ -489,6 +501,7 @@ static radar_registry_update_result_t update_registry(radar_gateway_slot_t *slot
     bool state_changed = false;
     return radar_registry_update_remote(slot->source,
                                         &payload,
+                                        &slot->output.count_summary,
                                         slot->session_generation,
                                         slot->last_received_ms,
                                         &state_changed);
@@ -532,6 +545,7 @@ radar_gateway_ingest_result_t radar_gateway_ingest_admit(
         slot->last_sequence = 0U;
         slot->last_received_ms = 0U;
         radar_spatial_state_init(&slot->spatial, NULL, received_at_ms);
+        radar_spatial_state_set_source(&slot->spatial, (uint8_t)slot->source);
         radar_rate_manager_init(&slot->rate_manager, received_at_ms);
     }
     if (slot->has_sample && sample->request_sequence == slot->last_sequence) {
@@ -549,6 +563,7 @@ radar_gateway_ingest_result_t radar_gateway_ingest_admit(
         }
         slot->has_sample = false;
         radar_spatial_state_init(&slot->spatial, NULL, received_at_ms);
+        radar_spatial_state_set_source(&slot->spatial, (uint8_t)slot->source);
         radar_rate_manager_init(&slot->rate_manager, received_at_ms);
     }
 
@@ -649,16 +664,36 @@ esp_err_t radar_gateway_ingest_start(void)
 {
     if (s_initialized) return ESP_OK;
 #ifndef RADAR_GATEWAY_HOST_TEST
+    s_slots = heap_caps_calloc(RADAR_GATEWAY_MAX_REMOTE_SOURCES,
+                               sizeof(*s_slots),
+                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_slots == NULL) {
+        ESP_LOGW(TAG, "PSRAM slot allocation failed; falling back to internal RAM");
+        s_slots = heap_caps_calloc(RADAR_GATEWAY_MAX_REMOTE_SOURCES,
+                                   sizeof(*s_slots),
+                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (s_slots == NULL) return ESP_ERR_NO_MEM;
     s_lock = xSemaphoreCreateMutexStatic(&s_lock_storage);
-    if (s_lock == NULL || !radar_registry_init()) return ESP_ERR_NO_MEM;
+    if (s_lock == NULL || !radar_registry_init()) {
+        if (s_lock != NULL) {
+            vSemaphoreDelete(s_lock);
+            s_lock = NULL;
+        }
+        heap_caps_free(s_slots);
+        s_slots = NULL;
+        return ESP_ERR_NO_MEM;
+    }
 #else
+    s_slots = s_host_slots;
     if (!radar_registry_init()) return ESP_ERR_NO_MEM;
 #endif
-    memset(s_slots, 0, sizeof(s_slots));
+    memset(s_slots, 0, sizeof(*s_slots) * RADAR_GATEWAY_MAX_REMOTE_SOURCES);
     for (size_t i = 0U; i < RADAR_GATEWAY_MAX_REMOTE_SOURCES; ++i) {
         s_slots[i].local_id = (uint8_t)(i + 1U);
         s_slots[i].source = radar_registry_source_for_local_id((uint8_t)(i + 1U));
         radar_spatial_state_init(&s_slots[i].spatial, NULL, now_ms());
+        radar_spatial_state_set_source(&s_slots[i].spatial, (uint8_t)s_slots[i].source);
         radar_rate_manager_init(&s_slots[i].rate_manager, now_ms());
     }
     s_initialized = true;

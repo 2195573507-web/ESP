@@ -1522,6 +1522,130 @@ esp_err_t server_client_ack_smart_home_command(const char *command_id,
                         http_status);
 }
 
+esp_err_t server_client_get_home_ai_rule_package(char *response_body,
+                                                 size_t response_body_size,
+                                                 int *http_status)
+{
+    if (response_body == NULL || response_body_size == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return perform_json(HTTP_METHOD_GET,
+                        ESP111_PROTOCOL_SERVER_ROUTE_HOME_AI_RULE_PACKAGE,
+                        NULL,
+                        response_body,
+                        response_body_size,
+                        http_status);
+}
+
+esp_err_t server_client_get_home_ai_config(char *response_body,
+                                           size_t response_body_size,
+                                           int *http_status)
+{
+    if (response_body == NULL || response_body_size == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return perform_json(HTTP_METHOD_GET,
+                        ESP111_PROTOCOL_SERVER_ROUTE_HOME_AI_CONFIG,
+                        NULL,
+                        response_body,
+                        response_body_size,
+                        http_status);
+}
+
+esp_err_t server_client_get_home_ai_rule_notification(uint32_t known_version,
+                                                      const char *known_config_checksum,
+                                                      char *response_body,
+                                                      size_t response_body_size,
+                                                      int *http_status)
+{
+    if (response_body == NULL || response_body_size == 0U ||
+        known_config_checksum == NULL || strlen(known_config_checksum) > 64U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char endpoint[256];
+    const int written = snprintf(endpoint,
+                                 sizeof(endpoint),
+                                 ESP111_PROTOCOL_SERVER_ROUTE_HOME_AI_RULE_NOTIFICATION
+                                 "?known_version=%lu&known_config_checksum=%s",
+                                 (unsigned long)known_version,
+                                 known_config_checksum);
+    if (written <= 0 || written >= (int)sizeof(endpoint)) return ESP_ERR_INVALID_SIZE;
+    return perform_json(HTTP_METHOD_GET,
+                        endpoint,
+                        NULL,
+                        response_body,
+                        response_body_size,
+                        http_status);
+}
+
+static esp_err_t server_client_post_home_ai_telemetry(const char *endpoint,
+                                                      const char *json_body,
+                                                      char *response_body,
+                                                      size_t response_body_size,
+                                                      int *http_status)
+{
+    if (endpoint == NULL || json_body == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return perform_telemetry_json(HTTP_METHOD_POST,
+                                  endpoint,
+                                  json_body,
+                                  response_body,
+                                  response_body_size,
+                                  http_status);
+}
+
+esp_err_t server_client_post_home_ai_events(const char *json_body,
+                                            char *response_body,
+                                            size_t response_body_size,
+                                            int *http_status)
+{
+    return server_client_post_home_ai_telemetry(ESP111_PROTOCOL_SERVER_ROUTE_HOME_AI_EVENTS,
+                                                json_body,
+                                                response_body,
+                                                response_body_size,
+                                                http_status);
+}
+
+esp_err_t server_client_post_home_ai_virtual_device_state(const char *json_body,
+                                                          char *response_body,
+                                                          size_t response_body_size,
+                                                          int *http_status)
+{
+    return server_client_post_home_ai_telemetry(
+        ESP111_PROTOCOL_SERVER_ROUTE_HOME_AI_VIRTUAL_DEVICE_STATE,
+        json_body,
+        response_body,
+        response_body_size,
+        http_status);
+}
+
+esp_err_t server_client_post_home_ai_rule_deployment(const char *json_body,
+                                                     char *response_body,
+                                                     size_t response_body_size,
+                                                     int *http_status)
+{
+    return server_client_post_home_ai_telemetry(
+        ESP111_PROTOCOL_SERVER_ROUTE_HOME_AI_RULE_DEPLOYMENTS,
+        json_body,
+        response_body,
+        response_body_size,
+        http_status);
+}
+
+esp_err_t server_client_post_home_ai_history_replay(const char *json_body,
+                                                    char *response_body,
+                                                    size_t response_body_size,
+                                                    int *http_status)
+{
+    return server_client_post_home_ai_telemetry(
+        ESP111_PROTOCOL_SERVER_ROUTE_HOME_AI_HISTORY_REPLAY,
+        json_body,
+        response_body,
+        response_body_size,
+        http_status);
+}
+
 esp_err_t server_client_get_pending_commands(const char *device_id,
                                              char *response_body,
                                              size_t response_body_size,

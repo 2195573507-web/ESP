@@ -14,6 +14,7 @@ extern "C" {
 
 esp_err_t network_replay_worker_init(void);
 void network_replay_worker_request_bme_replay(void);
+void network_replay_worker_request_home_ai_replay(void);
 
 #ifdef __cplusplus
 }

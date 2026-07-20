@@ -175,6 +175,15 @@ function updateVoicePromptConfig(patch = {}) {
     return readVoicePromptConfig();
 }
 
+function deriveVoicePromptConfigForText(promptText) {
+    loadPromptConfigFromDisk();
+    const text = String(promptText ?? "").trim();
+    return enrichPromptConfig({
+        ...readVoicePromptConfig(),
+        wake_prompt_text: text
+    });
+}
+
 function promptConfigMatches(cacheMeta, config) {
     return !!cacheMeta &&
         cacheMeta.voice_config_hash === config.voice_config_hash &&
@@ -198,6 +207,7 @@ module.exports = {
     DEFAULT_WAKE_PROMPT_SAMPLE_RATE,
     DEFAULT_WAKE_PROMPT_TEXT,
     computeVoiceConfigHash,
+    deriveVoicePromptConfigForText,
     promptConfigMatches,
     readVoicePromptConfig,
     updateVoicePromptConfig
