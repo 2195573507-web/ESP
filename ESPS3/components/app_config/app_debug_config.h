@@ -127,15 +127,21 @@
  */
 static inline void app_debug_apply_log_levels(void)
 {
-    esp_log_level_set("wifi", ESP_LOG_WARN);
-    esp_log_level_set("wifi_init", ESP_LOG_WARN);
-    esp_log_level_set("phy_init", ESP_LOG_WARN);
-    esp_log_level_set("pp", ESP_LOG_WARN);
-    esp_log_level_set("net80211", ESP_LOG_WARN);
-    esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
-    esp_log_level_set("esp-tls", ESP_LOG_WARN);
-    esp_log_level_set("transport_base", ESP_LOG_WARN);
-    esp_log_level_set("esp_http_client", ESP_LOG_WARN);
+    /* S3 runtime serial output is limited to ingress, BME, and environment alarms. */
+    esp_log_level_set("*", ESP_LOG_NONE);
+    esp_log_level_set("DHCP_TX", ESP_LOG_NONE);
+    esp_log_level_set("WLAN_TX", ESP_LOG_NONE);
+    esp_log_level_set("ARP_OUTPUT", ESP_LOG_NONE);
+    esp_log_level_set("local_http", ESP_LOG_NONE);
+    esp_log_level_set("csi_gateway", ESP_LOG_NONE);
+    esp_log_level_set("resource_manager", ESP_LOG_NONE);
+    esp_log_level_set("server_client", ESP_LOG_NONE);
+    esp_log_level_set("network_worker", ESP_LOG_NONE);
+    esp_log_level_set("child_registry", ESP_LOG_NONE);
+    esp_log_level_set("device_stream_gateway", ESP_LOG_NONE);
+    esp_log_level_set("SENSOR_INGRESS", ESP_LOG_INFO);
+    esp_log_level_set("BME_RX", ESP_LOG_INFO);
+    esp_log_level_set("ENV_ALARM", ESP_LOG_INFO);
 }
 
 #endif // APP_DEBUG_CONFIG_H

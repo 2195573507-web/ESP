@@ -51,6 +51,7 @@ set(priv_include_dirs
 
 set(requires
             app_config
+            environment_alarm_engine
             esp_event
             esp_http_client
             esp_http_server

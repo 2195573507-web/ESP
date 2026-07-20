@@ -16,6 +16,7 @@
 #include <strings.h>
 
 #include "esp111_protocol_common.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "gateway_config.h"
 
@@ -1493,8 +1494,9 @@ static esp_err_t protocol_adapter_add_csi_upload_links(cJSON *links,
                      "%s->unknown",
                      internal_link != NULL && internal_link[0] != '\0' ? internal_link : "-");
             if (strcmp(s_last_csi_server_link_map[i], mapping) != 0) {
-                printf("CSI_SERVER_LINK_MAP internal_link=%s server_link=unknown reason=unknown_link\n",
-                       internal_link != NULL && internal_link[0] != '\0' ? internal_link : "-");
+                ESP_LOGD("protocol_adapter",
+                         "CSI_SERVER_LINK_MAP internal_link=%s server_link=unknown reason=unknown_link",
+                         internal_link != NULL && internal_link[0] != '\0' ? internal_link : "-");
                 strlcpy(s_last_csi_server_link_map[i],
                         mapping,
                         sizeof(s_last_csi_server_link_map[i]));
@@ -1510,9 +1512,10 @@ static esp_err_t protocol_adapter_add_csi_upload_links(cJSON *links,
         char mapping[48];
         snprintf(mapping, sizeof(mapping), "%s->%s", internal_link, server_link);
         if (strcmp(s_last_csi_server_link_map[i], mapping) != 0) {
-            printf("CSI_SERVER_LINK_MAP internal_link=%s server_link=%s\n",
-                   internal_link,
-                   server_link);
+            ESP_LOGD("protocol_adapter",
+                     "CSI_SERVER_LINK_MAP internal_link=%s server_link=%s",
+                     internal_link,
+                     server_link);
             strlcpy(s_last_csi_server_link_map[i],
                     mapping,
                     sizeof(s_last_csi_server_link_map[i]));

@@ -23,6 +23,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -1907,36 +1908,39 @@ esp_err_t s3_scheduler_start(void)
         return ESP_ERR_INVALID_STATE;
     }
     if (s_protocol_worker_task == NULL) {
-        BaseType_t created = xTaskCreate(protocol_worker_task,
-                                         "protocol_worker",
-                                         S3_PROTOCOL_WORKER_TASK_STACK,
-                                         NULL,
-                                         S3_PROTOCOL_WORKER_TASK_PRIORITY,
-                                         &s_protocol_worker_task);
+        BaseType_t created = xTaskCreateWithCaps(protocol_worker_task,
+                                                 "protocol_worker",
+                                                 S3_PROTOCOL_WORKER_TASK_STACK,
+                                                 NULL,
+                                                 S3_PROTOCOL_WORKER_TASK_PRIORITY,
+                                                 &s_protocol_worker_task,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (created != pdPASS) {
             s_protocol_worker_task = NULL;
             return ESP_ERR_NO_MEM;
         }
     }
     if (s_csi_fusion_worker_task == NULL) {
-        BaseType_t created = xTaskCreate(csi_fusion_worker_task,
-                                         "csi_fusion_worker",
-                                         S3_CSI_FUSION_WORKER_TASK_STACK,
-                                         NULL,
-                                         S3_CSI_FUSION_WORKER_TASK_PRIORITY,
-                                         &s_csi_fusion_worker_task);
+        BaseType_t created = xTaskCreateWithCaps(csi_fusion_worker_task,
+                                                 "csi_fusion_worker",
+                                                 S3_CSI_FUSION_WORKER_TASK_STACK,
+                                                 NULL,
+                                                 S3_CSI_FUSION_WORKER_TASK_PRIORITY,
+                                                 &s_csi_fusion_worker_task,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (created != pdPASS) {
             s_csi_fusion_worker_task = NULL;
             return ESP_ERR_NO_MEM;
         }
     }
     if (s_stream_worker_task == NULL) {
-        BaseType_t created = xTaskCreate(stream_worker_task,
-                                         "stream_worker",
-                                         S3_STREAM_WORKER_TASK_STACK,
-                                         NULL,
-                                         S3_STREAM_WORKER_TASK_PRIORITY,
-                                         &s_stream_worker_task);
+        BaseType_t created = xTaskCreateWithCaps(stream_worker_task,
+                                                 "stream_worker",
+                                                 S3_STREAM_WORKER_TASK_STACK,
+                                                 NULL,
+                                                 S3_STREAM_WORKER_TASK_PRIORITY,
+                                                 &s_stream_worker_task,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (created != pdPASS) {
             s_stream_worker_task = NULL;
             return ESP_ERR_NO_MEM;
@@ -1946,12 +1950,13 @@ esp_err_t s3_scheduler_start(void)
         return ESP_OK;
     }
 
-    BaseType_t created = xTaskCreate(s3_scheduler_task,
-                                     "s3_scheduler",
-                                     S3_SCHEDULER_TASK_STACK,
-                                     NULL,
-                                     S3_SCHEDULER_TASK_PRIORITY,
-                                     &s_scheduler_task);
+    BaseType_t created = xTaskCreateWithCaps(s3_scheduler_task,
+                                             "s3_scheduler",
+                                             S3_SCHEDULER_TASK_STACK,
+                                             NULL,
+                                             S3_SCHEDULER_TASK_PRIORITY,
+                                             &s_scheduler_task,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         s_scheduler_task = NULL;
         return ESP_ERR_NO_MEM;

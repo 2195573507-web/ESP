@@ -26,7 +26,8 @@
 static const gateway_wifi_credential_t gateway_wifi_sta_credentials[] = {
     { GATEWAY_CONFIG_STA_SSID, GATEWAY_CONFIG_STA_PASSWORD },
     {"iPhoneWang", "Wlsz060501"},
-    {"Matepad","12345678"}
+    {"Matepad","12345678"},
+    {"hong28133","HJH123456"}
     /* 在这里继续添加可连接 WiFi，例如：
      * { "HomeWiFi", "home-password" },
      * { "OfficeWiFi", "office-password" },

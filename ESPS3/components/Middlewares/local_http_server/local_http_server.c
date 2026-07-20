@@ -38,6 +38,7 @@
 #include "lwip/sockets.h"
 
 static const char *TAG = "local_http";
+static const char *SENSOR_INGRESS_TAG = "SENSOR_INGRESS";
 
 static httpd_handle_t s_server;
 static bool s_server_routes_registered;
@@ -159,7 +160,7 @@ static void log_sensor_ingress(const httpd_req_t *req,
     const bool stats_valid = enqueue != NULL && enqueue->event_bus_stats_valid;
     const char *device_id = protocol_adapter_local_device_id_to_device_id(local_id);
     ESP_LOG_LEVEL_LOCAL(failure ? ESP_LOG_WARN : ESP_LOG_INFO,
-                        TAG,
+                        SENSOR_INGRESS_TAG,
                         "SENSOR_INGRESS uri=%s device_id=%s local_id=%u content_length=%d "
                         "received_length=%u recv_duration_ms=%lld resource_lock_wait_ms=%lu "
                         "event_bus_lock_wait_ms=%lu enqueue_duration_ms=%lu "

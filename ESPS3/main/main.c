@@ -11,7 +11,7 @@
 
 #include "app_debug_config.h"
 #include "app_main_config.h"
-#include "app_stack_monitor.h"
+                            #include "app_stack_monitor.h"
 #include "gateway_orchestrator.h"
 
 #include "esp_err.h"

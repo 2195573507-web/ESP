@@ -17,6 +17,7 @@
 #include "cJSON.h"
 #include "child_registry.h"
 #include "csi_fusion.h"
+#include "environment_alarm_engine.h"
 #include "esp111_protocol_common.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -33,6 +34,8 @@
 #include "voice_proxy.h"
 
 static const char *TAG = "sensor_aggregator";
+static const char *BME_RX_TAG = "BME_RX";
+static const char *ENV_ALARM_TAG = "ENV_ALARM";
 
 #define SENSOR_AGGREGATOR_HISTORY_SIZE 8U
 #define SENSOR_AGGREGATOR_RECENT_SIZE 4U
@@ -138,6 +141,64 @@ static bool bme_realtime_upload_ready(void)
 static int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+static alarm_device_id_t environment_alarm_device_id(const char *device_id)
+{
+    if (device_id == NULL) {
+        return ALARM_DEVICE_INVALID;
+    }
+    if (strcmp(device_id, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C51) == 0) {
+        return ALARM_DEVICE_C51;
+    }
+    if (strcmp(device_id, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C52) == 0) {
+        return ALARM_DEVICE_C52;
+    }
+    return ALARM_DEVICE_INVALID;
+}
+
+static alarm_air_quality_level_t environment_alarm_air_quality_level(const char *level)
+{
+    if (level == NULL) {
+        return ALARM_AIR_QUALITY_UNKNOWN;
+    }
+    if (strcmp(level, "excellent") == 0) {
+        return ALARM_AIR_QUALITY_EXCELLENT;
+    }
+    if (strcmp(level, "good") == 0) {
+        return ALARM_AIR_QUALITY_GOOD;
+    }
+    if (strcmp(level, "moderate") == 0) {
+        return ALARM_AIR_QUALITY_MODERATE;
+    }
+    if (strcmp(level, "poor") == 0) {
+        return ALARM_AIR_QUALITY_POOR;
+    }
+    if (strcmp(level, "bad") == 0) {
+        return ALARM_AIR_QUALITY_BAD;
+    }
+    return ALARM_AIR_QUALITY_UNKNOWN;
+}
+
+static void environment_alarm_check(const char *device_id,
+                                    const alarm_environment_sample_t *sample)
+{
+    if (device_id == NULL || sample == NULL) {
+        return;
+    }
+
+    if (alarm_engine_update(sample, NULL) != ESP_OK) {
+        return;
+    }
+
+    alarm_active_alarm_t active_alarm;
+    if (alarm_engine_get_active(sample->device_id, &active_alarm, 1U) == 0U) {
+        ESP_LOGI(ENV_ALARM_TAG,
+                 "device=%s status=NORMAL temp=%.2f humidity=%.2f alarm=0",
+                 device_id,
+                 (double)sample->temperature,
+                 (double)sample->humidity);
+    }
 }
 
 static size_t peer_index(const char *device_id)
@@ -376,11 +437,15 @@ static void refresh_child_status_events(void)
     }
 }
 
-static void update_device_from_envelope_locked(const protocol_adapter_envelope_t *envelope)
+static bool update_device_from_envelope_locked(const protocol_adapter_envelope_t *envelope,
+                                               alarm_environment_sample_t *alarm_sample)
 {
+    if (alarm_sample != NULL) {
+        memset(alarm_sample, 0, sizeof(*alarm_sample));
+    }
     sensor_aggregator_device_t *device = find_device_locked(envelope->device_id);
     if (device == NULL) {
-        return;
+        return false;
     }
 
     int64_t timestamp_ms = now_ms();
@@ -478,13 +543,48 @@ static void update_device_from_envelope_locked(const protocol_adapter_envelope_t
                 device->algorithm_version,
                 sizeof(history->algorithm_version));
         s_history_cursor = (s_history_cursor + 1U) % SENSOR_AGGREGATOR_HISTORY_SIZE;
-        ESP_LOGI(TAG,
-                 "BME_RX_V2 device=%s score=%d samples=%d",
+        ESP_LOGI(BME_RX_TAG,
+                 "BME_RX device=%s temp=%.2fC humidity=%.2f%% pressure=%.2fhPa "
+                 "gas=%.0fOhm baseline=%.0fOhm ratio=%.3f aq=%d level=%s confidence=%s "
+                 "samples=%d algo=%s",
                  device->device_id,
+                 device->temperature,
+                 device->humidity,
+                 device->pressure,
+                 device->gas_resistance,
+                 device->gas_baseline,
+                 device->gas_ratio,
                  device->air_quality_score,
-                 device->sample_count > 0 ? device->sample_count : 1);
+                 device->air_quality_level,
+                 device->air_quality_confidence,
+                 device->sample_count > 0 ? device->sample_count : 1,
+                 device->algorithm_version);
+
+        const alarm_device_id_t alarm_device = environment_alarm_device_id(device->device_id);
+        if (alarm_sample != NULL && alarm_device != ALARM_DEVICE_INVALID) {
+            *alarm_sample = (alarm_environment_sample_t){
+                .struct_version = ALARM_ENVIRONMENT_SAMPLE_VERSION,
+                .device_id = alarm_device,
+                .ingest_seq = envelope->seq,
+                .timestamp_valid = envelope->timestamp_ms > 0,
+                .timestamp_ms = envelope->timestamp_ms > 0 ?
+                                    (uint64_t)envelope->timestamp_ms : 0U,
+                .temperature = (float)device->temperature,
+                .humidity = (float)device->humidity,
+                .pressure = (float)device->pressure,
+                .gas_resistance = (float)device->gas_resistance,
+                .air_quality_score = (float)device->air_quality_score,
+                .air_quality_level =
+                    environment_alarm_air_quality_level(device->air_quality_level),
+                .gas_ratio = (float)device->gas_ratio,
+                .stability_score = 1.0f,
+                .sensor_state = ALARM_SENSOR_READY,
+            };
+            return true;
+        }
     }
 
+    return false;
 }
 
 static void add_device_json(cJSON *devices,
@@ -770,6 +870,9 @@ void sensor_aggregator_init(void)
         xSemaphoreGive(s_lock);
     }
     ESP_LOGI(TAG, "sensor/status aggregator initialized");
+    if (alarm_engine_init(NULL) == ESP_OK) {
+        ESP_LOGI(ENV_ALARM_TAG, "component initialized");
+    }
 }
 
 esp_err_t sensor_aggregator_suspend_peer(const char *device_id)
@@ -844,10 +947,15 @@ esp_err_t sensor_aggregator_handle_envelope(const protocol_adapter_envelope_t *e
     memset(result, 0, sizeof(*result));
     result->accepted = true;
 
+    alarm_environment_sample_t alarm_sample = {0};
+    bool has_alarm_sample = false;
     if (s_lock != NULL) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
-        update_device_from_envelope_locked(envelope);
+        has_alarm_sample = update_device_from_envelope_locked(envelope, &alarm_sample);
         xSemaphoreGive(s_lock);
+    }
+    if (has_alarm_sample) {
+        environment_alarm_check(envelope->device_id, &alarm_sample);
     }
     report_status_change_if_needed(envelope->device_id);
 
