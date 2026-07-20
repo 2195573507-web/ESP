@@ -14,7 +14,21 @@ APP_BINARY="$APP_MACOS/$APP_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 
 cd "$ROOT_DIR"
-pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+running_app_pids() {
+  ps -axo pid=,comm= | awk -v executable="$APP_BINARY" 'index($0, executable) > 0 { print $1 }'
+}
+
+stop_running_app() {
+  local pids
+  pids="$(running_app_pids)"
+  [ -z "$pids" ] || kill $pids >/dev/null 2>&1 || true
+}
+
+app_is_running() {
+  [ -n "$(running_app_pids)" ]
+}
+
+stop_running_app
 swift build
 BUILD_BINARY="$(swift build --show-bin-path)/$APP_NAME"
 
@@ -43,6 +57,6 @@ case "$MODE" in
   --debug|debug) lldb -- "$APP_BINARY" ;;
   --logs|logs) open_app; /usr/bin/log stream --info --style compact --predicate "process == \"$APP_NAME\"" ;;
   --telemetry|telemetry) open_app; /usr/bin/log stream --info --style compact --predicate "subsystem == \"$BUNDLE_ID\"" ;;
-  --verify|verify) open_app; sleep 1; pgrep -x "$APP_NAME" >/dev/null ;;
+  --verify|verify) open_app; sleep 1; app_is_running ;;
   *) echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2; exit 2 ;;
 esac

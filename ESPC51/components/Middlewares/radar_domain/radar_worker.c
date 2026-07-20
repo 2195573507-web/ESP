@@ -25,6 +25,14 @@
 #endif
 
 #define RADAR_DIAGNOSTIC_WINDOW_MS 1000U
+#define RADAR_LOG_IDENTITY_FORMAT \
+    " source_id=%u source=%s device_id=%s room=%s sequence=%lu"
+#define RADAR_LOG_IDENTITY_ARGS(sequence_value) \
+    (unsigned int)RADAR_BLE_BINDING_LOCAL_ID, \
+    (RADAR_BLE_BINDING_LOCAL_ID == 1 ? "C51" : "C52"), \
+    RADAR_BLE_BINDING_DEVICE_ID, \
+    RADAR_BLE_BINDING_ROOM_ID, \
+    (unsigned long)(sequence_value)
 
 static const char *TAG = "radar_domain";
 static radar_buffer_t s_raw;
@@ -144,7 +152,7 @@ static void radar_runtime_rate_diagnostics_emit_if_due(uint64_t timestamp_ms)
         ESP_LOGI(TAG,
                  "RADAR_LOCAL_PROCESS local_id=%u frame_count=%lu targets=%u target0_id=%u "
                  "x_mm=%d y_mm=%d speed_cm_s=%d distance_mm=%lu confidence=%u "
-                 "interval_ms=%lu hz=%lu.%lu",
+                 "interval_ms=%lu hz=%lu.%lu" RADAR_LOG_IDENTITY_FORMAT,
                  (unsigned int)sample->local_id,
                  (unsigned long)s_rate_diagnostics.filtered_frame_count,
                  (unsigned int)sample->target_count,
@@ -156,13 +164,14 @@ static void radar_runtime_rate_diagnostics_emit_if_due(uint64_t timestamp_ms)
                  target == NULL ? 0U : (unsigned int)target->confidence,
                  (unsigned long)s_rate_diagnostics.last_interval_ms,
                  (unsigned long)(hz_tenths / 10U),
-                 (unsigned long)(hz_tenths % 10U));
+                 (unsigned long)(hz_tenths % 10U),
+                 RADAR_LOG_IDENTITY_ARGS(sample->frame_seq));
         radar_resource_adapter_stats_t resource_stats = {0};
         radar_resource_adapter_get_stats(&resource_stats);
         ESP_LOGI(TAG,
                  "RADAR_LOCAL_SUMMARY local_id=%u frames_last_sec=%lu avg_interval_ms=%lu "
                  "targets=%u queue_depth=%lu drop_count=%lu mode=%s upload_attempts=%lu "
-                 "upload_success=%lu coalesce_count=%lu voice_active=%u",
+                 "upload_success=%lu coalesce_count=%lu voice_active=%u" RADAR_LOG_IDENTITY_FORMAT,
                  (unsigned int)sample->local_id,
                  (unsigned long)s_rate_diagnostics.filtered_frames_in_window,
                  (unsigned long)average_interval_ms,
@@ -173,16 +182,19 @@ static void radar_runtime_rate_diagnostics_emit_if_due(uint64_t timestamp_ms)
                  (unsigned long)resource_stats.radar_upload_attempt_count,
                  (unsigned long)resource_stats.radar_upload_success_count,
                  (unsigned long)resource_stats.radar_upload_coalesce_count,
-                 resource_stats.voice_active ? 1U : 0U);
+                 resource_stats.voice_active ? 1U : 0U,
+                 RADAR_LOG_IDENTITY_ARGS(sample->frame_seq));
     }
     if (notify_count > 0U || valid_frame_count > 0U || invalid_frame_count > 0U) {
         ESP_LOGI(TAG,
                  "RADAR_BLE_RX_SUMMARY local_id=%u notify_count=%lu valid_frame_count=%lu "
-                 "invalid_frame_count=%lu",
+                 "invalid_frame_count=%lu" RADAR_LOG_IDENTITY_FORMAT,
                  (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
                  (unsigned long)notify_count,
                  (unsigned long)valid_frame_count,
-                 (unsigned long)invalid_frame_count);
+                 (unsigned long)invalid_frame_count,
+                 RADAR_LOG_IDENTITY_ARGS(s_rate_diagnostics.has_window_sample
+                     ? s_rate_diagnostics.latest_sample.frame_seq : 0U));
     }
 
     s_rate_diagnostics.window_start_ms = timestamp_ms;
@@ -256,10 +268,11 @@ static void radar_upload_task(void *arg)
         }
 
         ESP_LOGI(TAG,
-                 "RADAR_RESULT_ENCODE local_id=%u targets=%u seq=%lu",
+                 "RADAR_RESULT_ENCODE local_id=%u targets=%u seq=%lu" RADAR_LOG_IDENTITY_FORMAT,
                  (unsigned int)sample.local_id,
                  (unsigned int)sample.target_count,
-                 (unsigned long)request_sequence);
+                 (unsigned long)request_sequence,
+                 RADAR_LOG_IDENTITY_ARGS(request_sequence));
         const int body_len = radar_result_encode_json(&sample,
                                                       (uint32_t)timestamp_ms,
                                                       request_sequence,
@@ -270,16 +283,18 @@ static void radar_upload_task(void *arg)
             continue;
         }
         ESP_LOGI(TAG,
-                 "RADAR_UPLOAD_BEGIN local_id=%u seq=%lu targets=%u payload_size=%u",
+                 "RADAR_UPLOAD_BEGIN local_id=%u seq=%lu targets=%u payload_size=%u" RADAR_LOG_IDENTITY_FORMAT,
                  (unsigned int)sample.local_id,
                  (unsigned long)request_sequence,
                  (unsigned int)sample.target_count,
-                 (unsigned int)body_len);
+                 (unsigned int)body_len,
+                 RADAR_LOG_IDENTITY_ARGS(request_sequence));
         ESP_LOGI(TAG,
-                 "RADAR_RESULT_UPLOAD local_id=%u endpoint=%s payload_size=%u",
+                 "RADAR_RESULT_UPLOAD local_id=%u endpoint=%s payload_size=%u" RADAR_LOG_IDENTITY_FORMAT,
                  (unsigned int)sample.local_id,
                  ESP111_PROTOCOL_ROUTE_RADAR_RESULT,
-                 (unsigned int)body_len);
+                 (unsigned int)body_len,
+                 RADAR_LOG_IDENTITY_ARGS(request_sequence));
         server_comm_http_response_t response = {0};
         const esp_err_t ret = server_comm_http_post_json(ESP111_PROTOCOL_ROUTE_RADAR_RESULT,
                                                           s_json_body,
@@ -289,20 +304,24 @@ static void radar_upload_task(void *arg)
                                                           &response);
         radar_resource_adapter_complete_radar_upload(ret == ESP_OK, now_ms());
         ESP_LOGI(TAG,
-                 "RADAR_UPLOAD_RESULT status=%d retry_count=%u",
+                 "RADAR_UPLOAD_RESULT status=%d retry_count=%u" RADAR_LOG_IDENTITY_FORMAT,
                  response.status_code,
-                 ret == ESP_OK ? 0U : 1U);
+                 ret == ESP_OK ? 0U : 1U,
+                 RADAR_LOG_IDENTITY_ARGS(request_sequence));
         ESP_LOGI(TAG,
-                 "RADAR_RESULT_UPLOAD_DONE status=%s response_code=%d",
+                 "RADAR_RESULT_UPLOAD_DONE status=%s response_code=%d" RADAR_LOG_IDENTITY_FORMAT,
                  esp_err_to_name(ret),
-                 response.status_code);
+                 response.status_code,
+                 RADAR_LOG_IDENTITY_ARGS(request_sequence));
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "RADAR_UPLOAD_OK local_id=%u targets=%u",
+            ESP_LOGI(TAG, "RADAR_UPLOAD_OK local_id=%u targets=%u" RADAR_LOG_IDENTITY_FORMAT,
                      (unsigned int)sample.local_id,
-                     (unsigned int)sample.target_count);
+                     (unsigned int)sample.target_count,
+                     RADAR_LOG_IDENTITY_ARGS(request_sequence));
         } else {
-            ESP_LOGW(TAG, "RADAR_UPLOAD_RETRY ret=%s status=%d latest_only=1",
-                     esp_err_to_name(ret), response.status_code);
+            ESP_LOGW(TAG, "RADAR_UPLOAD_RETRY ret=%s status=%d latest_only=1" RADAR_LOG_IDENTITY_FORMAT,
+                     esp_err_to_name(ret), response.status_code,
+                     RADAR_LOG_IDENTITY_ARGS(request_sequence));
         }
     }
 #else
@@ -316,10 +335,11 @@ static void radar_upload_task(void *arg)
             continue;
         }
         ESP_LOGI(TAG,
-                 "RADAR_RESULT_ENCODE local_id=%u targets=%u seq=%lu",
+                 "RADAR_RESULT_ENCODE local_id=%u targets=%u seq=%lu" RADAR_LOG_IDENTITY_FORMAT,
                  (unsigned int)packet.sample.local_id,
                  (unsigned int)packet.sample.target_count,
-                 (unsigned long)packet.request_sequence);
+                 (unsigned long)packet.request_sequence,
+                 RADAR_LOG_IDENTITY_ARGS(packet.request_sequence));
         const int body_len = radar_result_encode_json(&packet.sample,
                                                       (uint32_t)now_ms(),
                                                       packet.request_sequence,
@@ -327,16 +347,18 @@ static void radar_upload_task(void *arg)
                                                       RADAR_RESULT_JSON_MAX_BYTES);
         if (body_len <= 0) continue;
         ESP_LOGI(TAG,
-                 "RADAR_UPLOAD_BEGIN local_id=%u seq=%lu targets=%u payload_size=%u",
+                 "RADAR_UPLOAD_BEGIN local_id=%u seq=%lu targets=%u payload_size=%u" RADAR_LOG_IDENTITY_FORMAT,
                  (unsigned int)packet.sample.local_id,
                  (unsigned long)packet.request_sequence,
                  (unsigned int)packet.sample.target_count,
-                 (unsigned int)body_len);
+                 (unsigned int)body_len,
+                 RADAR_LOG_IDENTITY_ARGS(packet.request_sequence));
         ESP_LOGI(TAG,
-                 "RADAR_RESULT_UPLOAD local_id=%u endpoint=%s payload_size=%u",
+                 "RADAR_RESULT_UPLOAD local_id=%u endpoint=%s payload_size=%u" RADAR_LOG_IDENTITY_FORMAT,
                  (unsigned int)packet.sample.local_id,
                  ESP111_PROTOCOL_ROUTE_RADAR_RESULT,
-                 (unsigned int)body_len);
+                 (unsigned int)body_len,
+                 RADAR_LOG_IDENTITY_ARGS(packet.request_sequence));
         server_comm_http_response_t response = {0};
         const esp_err_t ret = server_comm_http_post_json(ESP111_PROTOCOL_ROUTE_RADAR_RESULT,
                                                           s_json_body,
@@ -347,23 +369,27 @@ static void radar_upload_task(void *arg)
         const uint8_t retry_count = ret != ESP_OK && packet.attempts < 4U
             ? (uint8_t)(packet.attempts + 1U) : packet.attempts;
         ESP_LOGI(TAG,
-                 "RADAR_UPLOAD_RESULT status=%d retry_count=%u",
+                 "RADAR_UPLOAD_RESULT status=%d retry_count=%u" RADAR_LOG_IDENTITY_FORMAT,
                  response.status_code,
-                 (unsigned int)retry_count);
+                 (unsigned int)retry_count,
+                 RADAR_LOG_IDENTITY_ARGS(packet.request_sequence));
         ESP_LOGI(TAG,
-                 "RADAR_RESULT_UPLOAD_DONE status=%s response_code=%d",
+                 "RADAR_RESULT_UPLOAD_DONE status=%s response_code=%d" RADAR_LOG_IDENTITY_FORMAT,
                  esp_err_to_name(ret),
-                 response.status_code);
+                 response.status_code,
+                 RADAR_LOG_IDENTITY_ARGS(packet.request_sequence));
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "RADAR_UPLOAD_OK local_id=%u targets=%u",
+            ESP_LOGI(TAG, "RADAR_UPLOAD_OK local_id=%u targets=%u" RADAR_LOG_IDENTITY_FORMAT,
                      (unsigned int)packet.sample.local_id,
-                     (unsigned int)packet.sample.target_count);
+                     (unsigned int)packet.sample.target_count,
+                     RADAR_LOG_IDENTITY_ARGS(packet.request_sequence));
         } else if (upload_retriable && packet.attempts < 4U) {
             ++packet.attempts;
             (void)radar_upload_queue_push(&s_upload, &packet);
             vTaskDelay(pdMS_TO_TICKS(250U * packet.attempts));
-            ESP_LOGW(TAG, "RADAR_UPLOAD_RETRY ret=%s status=%d attempt=%u",
-                     esp_err_to_name(ret), response.status_code, (unsigned int)packet.attempts);
+            ESP_LOGW(TAG, "RADAR_UPLOAD_RETRY ret=%s status=%d attempt=%u" RADAR_LOG_IDENTITY_FORMAT,
+                     esp_err_to_name(ret), response.status_code, (unsigned int)packet.attempts,
+                     RADAR_LOG_IDENTITY_ARGS(packet.request_sequence));
         }
     }
 #endif

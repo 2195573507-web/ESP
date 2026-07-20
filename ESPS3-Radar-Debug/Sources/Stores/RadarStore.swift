@@ -7,7 +7,9 @@ final class RadarStore: ObservableObject {
     @Published var selectedDevice = ""
     @Published var selectedBaudRate = 115_200
     @Published private(set) var isParsing = false
-    @Published private(set) var radarStates: [RadarSource: RadarRoomState]
+    @Published private(set) var radarStates: [Int: RadarState]
+    @Published private(set) var radarRoomStates: [RadarSource: RadarRoomState]
+    @Published private(set) var radarHomeState: RadarHomeState
     @Published private(set) var unknownDiagnostics: [UnknownRadarDiagnostic]
     @Published private(set) var receivedBytes = 0
     @Published private(set) var completedRecords = 0
@@ -25,6 +27,8 @@ final class RadarStore: ObservableObject {
         let configuredRooms = RadarRoomConfigurationStore().loadConfigs()
         stateStore = RadarStateStore(configs: configuredRooms)
         radarStates = stateStore.states
+        radarRoomStates = stateStore.roomStates
+        radarHomeState = stateStore.homeState
         unknownDiagnostics = stateStore.unknownDiagnostics
         refreshDevices()
         serialPort.onReceive = { [weak self] bytes in
@@ -40,8 +44,8 @@ final class RadarStore: ObservableObject {
 
     var roomSources: [RadarSource] { RadarSource.roomSources }
 
-    func state(for source: RadarSource) -> RadarRoomState {
-        radarStates[source] ?? RadarRoomState(source: source, config: .default(for: source))
+    func state(for source: RadarSource) -> RadarState {
+        radarStates[Int(source.sourceId)] ?? RadarState(source: source, config: .default(for: source))
     }
 
     func refreshDevices() {
@@ -153,6 +157,10 @@ final class RadarStore: ObservableObject {
 
     private func publishState() {
         radarStates = stateStore.states
+        radarRoomStates = stateStore.roomStates
+        radarHomeState = stateStore.homeState
         unknownDiagnostics = stateStore.unknownDiagnostics
     }
 }
+
+typealias RadarViewModel = RadarStore

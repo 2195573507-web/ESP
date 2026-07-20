@@ -16,6 +16,8 @@ extern "C" {
 #define RADAR_ZONE_MAP_MAX_ZONES 8U
 #define RADAR_TRACKER_MAX_TRACKS LD2450_MAX_TARGETS
 #define RADAR_TRACKER_HISTORY_MAX_TARGETS 8U
+#define RADAR_PERSON_CONTINUITY_MAX_PERSONS LD2450_MAX_TARGETS
+#define RADAR_PERSON_CONTINUITY_MAX_CANDIDATES LD2450_MAX_TARGETS
 
 typedef enum {
     RADAR_SENSOR_OFFLINE = 0,
@@ -43,6 +45,23 @@ typedef enum {
     RADAR_TRACK_CONFIRMED,
     RADAR_TRACK_HOLD,
 } radar_track_lifecycle_t;
+
+/* Motion tracks are intentionally separate from these short-lived business
+ * continuity entities.  A person ID is not a biometric or persistent identity. */
+typedef enum {
+    RADAR_PERSON_EMPTY = 0,
+    RADAR_PERSON_VISIBLE,
+    RADAR_PERSON_STILL_HOLD,
+    RADAR_PERSON_DORMANT,
+    RADAR_PERSON_RELEASED,
+} radar_person_state_t;
+
+typedef enum {
+    RADAR_PERSON_COUNT_OBSERVED = 0,
+    RADAR_PERSON_COUNT_ESTIMATED,
+    RADAR_PERSON_COUNT_VACANT_INFERRED,
+    RADAR_PERSON_COUNT_UNKNOWN,
+} radar_person_count_state_t;
 
 typedef enum {
     RADAR_ZONE_NONE = 0,
@@ -104,8 +123,21 @@ typedef struct {
 } radar_spatial_thresholds_t;
 
 typedef struct {
+    uint32_t still_hold_ms;
+    uint32_t dormant_timeout_ms;
+    uint32_t reacquire_gate_mm;
+    uint32_t same_zone_bonus_mm;
+    bool adjacent_zone_allow;
+    uint32_t new_confirm_frames;
+    uint32_t new_near_dormant_confirm_frames;
+    uint32_t velocity_decay_start_ms;
+    uint32_t velocity_decay_ms;
+} radar_person_continuity_config_t;
+
+typedef struct {
     radar_installation_config_t installation;
     radar_spatial_thresholds_t thresholds;
+    radar_person_continuity_config_t person_continuity;
 } radar_spatial_config_t;
 
 typedef struct {
@@ -157,6 +189,35 @@ typedef struct {
 } radar_track_snapshot_t;
 
 typedef struct {
+    uint32_t person_id;
+    radar_person_state_t state;
+    uint32_t attached_track_id;
+    int32_t last_filtered_x_mm;
+    int32_t last_filtered_y_mm;
+    uint8_t last_zone_id;
+    uint64_t first_seen_ms;
+    uint64_t last_visible_ms;
+    uint64_t last_attached_ms;
+    uint64_t dormant_since_ms;
+    uint32_t quality;
+    int32_t velocity_x_mm_s;
+    int32_t velocity_y_mm_s;
+    uint64_t last_velocity_ms;
+} radar_person_snapshot_t;
+
+typedef struct {
+    uint8_t raw_target_count;
+    uint8_t accepted_target_count;
+    uint8_t visible_track_count;
+    uint8_t confirmed_active_track_count;
+    uint8_t history_target_count;
+    uint8_t visible_person_count;
+    uint8_t retained_person_count;
+    uint8_t source_person_count;
+    radar_person_count_state_t count_state;
+} radar_count_summary_t;
+
+typedef struct {
     uint32_t association_count;
     uint32_t new_track_count;
     uint32_t released_track_count;
@@ -187,8 +248,15 @@ typedef struct {
     uint32_t occupancy_confidence;
     uint8_t raw_target_count;
     uint8_t accepted_target_count;
+    /* Backward-compatible alias for visible_track_count; never a person count. */
     uint8_t active_track_count;
+    uint8_t visible_track_count;
+    uint8_t confirmed_active_track_count;
     uint8_t history_target_count;
+    uint8_t visible_person_count;
+    uint8_t retained_person_count;
+    uint8_t source_person_count;
+    radar_person_count_state_t count_state;
     uint8_t dominant_zone_id;
     radar_target_t raw_targets[LD2450_MAX_TARGETS];
     radar_spatial_target_t accepted_targets[LD2450_MAX_TARGETS];
@@ -197,6 +265,7 @@ typedef struct {
     radar_track_snapshot_t current_targets[RADAR_TRACKER_MAX_TRACKS];
     /* Stale tracks are retained independently for diagnostics and replay only. */
     radar_track_snapshot_t history_targets[RADAR_TRACKER_HISTORY_MAX_TARGETS];
+    radar_person_snapshot_t persons[RADAR_PERSON_CONTINUITY_MAX_PERSONS];
     radar_spatial_diagnostics_t diagnostics;
 } radar_spatial_snapshot_t;
 
@@ -222,6 +291,7 @@ typedef struct {
     radar_sensor_state_t sensor_state;
     radar_occupancy_state_t occupancy_state;
     radar_motion_state_t motion_state;
+    radar_count_summary_t count_summary;
     uint8_t track_count;
     radar_readonly_track_t tracks[RADAR_TRACKER_MAX_TRACKS];
 } radar_readonly_snapshot_t;

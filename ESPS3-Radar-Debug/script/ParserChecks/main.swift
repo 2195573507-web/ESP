@@ -15,6 +15,10 @@ enum ParserChecks {
 
     static func main() async {
         testSourceRecognition()
+        testExplicitIdentityConflictIsolation()
+        testCompactTrackUsesResolvedSource()
+        testThreeSourceWindowsAndHistoryIsolation()
+        testSourceContextLogContract()
         testUnknownIsolation()
         testInterleavedFixture()
         testOfflineAndRecoveryPreserveLastValidFrame()
@@ -25,6 +29,9 @@ enum ParserChecks {
         testCurrentS3LocalTrackCompatibility()
         testVisibleZeroKeepsLastAcceptedPosition()
         testAcceptedAndRawSlotCompatibility()
+        testPersonContinuityCountsAndHistoryIsolation()
+        testHomeStateDoesNotOverwriteSources()
+        testLegacyTracksDoNotImplyPersons()
         testLocalHealthPreservesLastTarget()
         testRelativeLogTimestampUsesReceiveTime()
         testReplayRestart()
@@ -48,6 +55,86 @@ enum ParserChecks {
         expect(RadarSource.identify(in: "device_id=sensair_s3_gateway_01").source == .s3Local, "S3 device id maps")
         expect(RadarSource.identify(in: "device_id=sensair_shuttle_01").source == .c51, "C51 device id maps")
         expect(RadarSource.identify(in: "local_id=sensair_shuttle_02").source == .c52, "C52 local id maps")
+    }
+
+    static func testExplicitIdentityConflictIsolation() {
+        var parser = RadarLogParser()
+        var store = RadarStateStore()
+        let events = parser.consumeLine("source=C51 device_id=sensair_shuttle_02 track=x:120 y:50")
+        events.forEach { store.apply($0, nowMilliseconds: 1_000) }
+        expect(events.allSatisfy { $0.source == .unknown }, "conflicting source and device id stay UNKNOWN")
+        expect(store.unknownDiagnostics.count == 1 && RadarSource.roomSources.allSatisfy {
+            store.states[$0]?.filteredTargets.isEmpty == true
+        }, "conflicting identity cannot update a room")
+    }
+
+    static func testCompactTrackUsesResolvedSource() {
+        var parser = RadarLogParser()
+        var store = RadarStateStore()
+        parser.consumeLine("source=C52 device_id=sensair_shuttle_02 track=x:120 y:50").forEach {
+            store.apply($0, nowMilliseconds: 1_000)
+        }
+        expect(store.states[.c52]?.filteredTargets.first?.source == .c52,
+               "compact C52 track stays in the C52 state")
+        expect(store.states[.s3Local]?.filteredTargets.isEmpty == true,
+               "compact C52 track cannot enter S3_LOCAL")
+    }
+
+    static func testThreeSourceWindowsAndHistoryIsolation() {
+        var parser = RadarLogParser()
+        var store = RadarStateStore()
+        let fixtures = [
+            "source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local track=1 x:100 y:100",
+            "source=C51 device_id=sensair_shuttle_01 room=living_room track=1 x:200 y:200",
+            "source=C52 device_id=sensair_shuttle_02 room=bedroom track=1 x:300 y:300",
+            "source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local track=1 x:110 y:100",
+            "source=C51 device_id=sensair_shuttle_01 room=living_room track=1 x:210 y:200"
+        ]
+        for (index, line) in fixtures.enumerated() {
+            parser.consumeLine(line).forEach { store.apply($0, nowMilliseconds: Int64(1_000 + index)) }
+        }
+        expect(store.states[.s3Local]?.filteredTargets.first?.xMillimeters == 110 &&
+               store.states[.c51]?.filteredTargets.first?.xMillimeters == 210 &&
+               store.states[.c52]?.filteredTargets.first?.xMillimeters == 300,
+               "three source windows retain distinct target coordinates")
+        expect(store.states[.s3Local]?.deviceId == "sensair_s3_gateway_01" &&
+               store.states[.c51]?.deviceId == "sensair_shuttle_01" &&
+               store.states[.c52]?.deviceId == "sensair_shuttle_02",
+               "three source windows retain fixed device identities")
+        expect(store.states[.s3Local]?.roomId == "s3_local" &&
+               store.states[.c51]?.roomId == "living_room" &&
+               store.states[.c52]?.roomId == "bedroom",
+               "three source windows retain fixed rooms")
+        expect(store.states[.s3Local]?.trackHistory[1]?.count == 2 &&
+               store.states[.c51]?.trackHistory[1]?.count == 2 &&
+               store.states[.c52]?.trackHistory[1]?.count == 1,
+               "history trails are isolated by source")
+    }
+
+    static func testSourceContextLogContract() {
+        var parser = RadarLogParser()
+        var store = RadarStateStore()
+        let lines = [
+            "RADAR_TRACK_UPDATE_COMPAT local track=1 visible=1 raw_x=100 raw_y=100 filtered_x=100 filtered_y=100 distance=141 angle=45 speed=0 direction=0 confidence=80 seen=2 missed=0 source_id=0 source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local sequence=10",
+            "RADAR_TRACK_UPDATE_COMPAT local track=1 visible=1 raw_x=200 raw_y=200 filtered_x=200 filtered_y=200 distance=282 angle=45 speed=0 direction=0 confidence=80 seen=2 missed=0 source_id=1 source=C51 device_id=sensair_shuttle_01 room=living_room sequence=10",
+            "RADAR_TRACK_UPDATE_COMPAT local track=1 visible=1 raw_x=300 raw_y=300 filtered_x=300 filtered_y=300 distance=424 angle=45 speed=0 direction=0 confidence=80 seen=2 missed=0 source_id=2 source=C52 device_id=sensair_shuttle_02 room=bedroom sequence=10",
+            "RADAR_PERSON_UPDATE event=counts source_id=2 source=C52 device_id=sensair_shuttle_02 room=bedroom sequence=10 visible_person_count=1 retained_person_count=0 source_person_count=1 count_state=OBSERVED",
+            "RADAR_SOURCE_STATE event=offline source_id=2 source=C52 device_id=sensair_shuttle_02 room=bedroom sequence=10 online=0"
+        ]
+        for (index, line) in lines.enumerated() {
+            parser.consumeLine(line).forEach { store.apply($0, nowMilliseconds: Int64(5_000 + index)) }
+        }
+        expect(store.states.keys.contains(0) && store.states.keys.contains(1) && store.states.keys.contains(2),
+               "state store is keyed by integer source IDs")
+        expect(store.states[0]?.filteredTargets.first?.xMillimeters == 100 &&
+               store.states[1]?.filteredTargets.first?.xMillimeters == 200 &&
+               store.states[2]?.filteredTargets.first?.xMillimeters == 300,
+               "new source-context logs keep T001 isolated by source")
+        expect(store.states[2]?.personCount == 1 && store.states[0]?.personCount == 0 &&
+               store.states[1]?.personCount == 0,
+               "person count updates only the owning source state")
+        expect(store.states[2]?.online == false && store.states[1]?.online == true,
+               "offline heartbeat cannot change another source state")
     }
 
     static func testUnknownIsolation() {
@@ -102,8 +189,8 @@ enum ParserChecks {
         var parser = RadarLogParser()
         var store = RadarStateStore()
         _ = parser.consumeLine("source=C52 sensor=online")
-        let events = parser.consumeLine("radar_raw_rx bytes=48 timeout=2 fifo_overflow=3")
-        expect(events.allSatisfy { $0.source == .c52 }, "RADAR_RX resolves to the most recent source")
+        let events = parser.consumeLine("source=C52 device_id=sensair_shuttle_02 room=bedroom radar_raw_rx bytes=48 timeout=2 fifo_overflow=3")
+        expect(events.allSatisfy { $0.source == .c52 }, "RADAR_RX uses its explicit source")
         events.forEach { store.apply($0, nowMilliseconds: 1_000) }
         expect(store.states[.c52]?.uartHealth.rxBytes == 48 && store.states[.c52]?.uartHealth.timeout == 2 && store.states[.c52]?.uartHealth.fifoOverflow == 3, "RADAR_RX updates only C52 UART health")
         expect(store.states[.s3Local]?.uartHealth.rxBytes == 0 && store.states[.c51]?.uartHealth.rxBytes == 0, "RADAR_RX does not leak across sources")
@@ -208,6 +295,52 @@ enum ParserChecks {
         parser.consumeLine("local raw slot=0 x=20 y=30 speed=8").forEach { store.apply($0, nowMilliseconds: 2_000) }
         let target = store.states[.s3Local]?.filteredTargets.first
         expect(target?.xMillimeters == -1_074 && target?.yMillimeters == 5_017 && target?.isVisible == false, "accepted position survives a raw-slot diagnostic")
+    }
+
+    static func testPersonContinuityCountsAndHistoryIsolation() {
+        var parser = RadarLogParser()
+        var store = RadarStateStore()
+        parser.consumeLine("source=S3_LOCAL RADAR_COUNTS: raw_target_count=3 accepted_target_count=2 visible_track_count=1 confirmed_active_track_count=2 history_target_count=4 visible_person_count=1 retained_person_count=1 source_person_count=2 count_state=ESTIMATED").forEach {
+            store.apply($0, nowMilliseconds: 1_000)
+        }
+        parser.consumeLine("source=S3_LOCAL local track=8 visible=0 raw_x=100 raw_y=100 filtered_x=100 filtered_y=100 distance=141 angle=45 speed=0 confidence=70").forEach {
+            store.apply($0, nowMilliseconds: 1_001)
+        }
+        let state = store.states[.s3Local]
+        expect(state?.rawTargetCount == 3 && state?.acceptedTargetCount == 2, "raw and accepted target counts remain distinct")
+        expect(state?.visibleTrackCount == 1 && state?.confirmedActiveTrackCount == 2, "visible and confirmed-active track counts remain distinct")
+        expect(state?.visiblePersonCount == 1 && state?.retainedPersonCount == 1 && state?.sourcePersonCount == 2 && state?.countState == "ESTIMATED", "retained and business person counts parse independently")
+        expect(state?.visibleTracks.isEmpty == true && state?.historyTargetCount == 4, "history track count and hidden track are excluded from current visible tracks")
+    }
+
+    static func testHomeStateDoesNotOverwriteSources() {
+        var parser = RadarLogParser()
+        var store = RadarStateStore()
+        let sourceLines = [
+            "RADAR_SOURCE_STATE source_id=0 source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local source_person_count=1 count_state=OBSERVED online=1",
+            "RADAR_SOURCE_STATE source_id=2 source=C52 device_id=sensair_shuttle_02 room=bedroom source_person_count=1 count_state=OBSERVED online=1"
+        ]
+        for line in sourceLines { parser.consumeLine(line).forEach { store.apply($0, nowMilliseconds: 1_000) } }
+        parser.consumeLine("RADAR_HOME_STATE occupied_room_count=2 occupied_rooms=[S3_LOCAL:s3_local|C52:bedroom] home_person_count=2 timestamp_ms=1000").forEach {
+            store.apply($0, nowMilliseconds: 1_001)
+        }
+        expect(store.states[.s3Local]?.sourcePersonCount == 1 && store.states[.c52]?.sourcePersonCount == 1,
+               "HOME does not overwrite S3 or C52 source state")
+        expect(store.homeState.occupiedRoomCount == 2 && store.homeState.homePersonCount == 2,
+               "HOME reports two occupied rooms and two people")
+        expect(store.homeState.occupiedRooms.map(\.source) == [.s3Local, .c52],
+               "HOME rooms preserve S3:s3_local and C52:bedroom")
+    }
+
+    static func testLegacyTracksDoNotImplyPersons() {
+        var store = RadarStateStore()
+        store.apply(event(source: .s3Local, trackID: 1, sequence: 1), nowMilliseconds: 1_000)
+        store.apply(event(source: .s3Local, trackID: 2, sequence: 2), nowMilliseconds: 1_100)
+        let state = store.states[.s3Local]
+        expect(state?.visibleTrackCount == 2, "legacy track-only logs still expose visible tracks")
+        expect(state?.visiblePersonCount == 0 && state?.retainedPersonCount == 0 &&
+            state?.sourcePersonCount == 0 && state?.countState == "UNKNOWN",
+            "legacy tracks do not imply observed or retained persons")
     }
 
     static func testLocalHealthPreservesLastTarget() {

@@ -25,30 +25,11 @@ typedef struct {
 static radar_registry_slot_t s_slots[RADAR_SOURCE_COUNT];
 static bool s_initialized;
 static uint32_t s_unattributed_parse_errors;
-static radar_home_presence_t s_home_presence;
 
 #ifndef RADAR_DOMAIN_HOST_TEST
 static StaticSemaphore_t s_lock_storage;
 static SemaphoreHandle_t s_lock;
 #endif
-
-static const char *const s_source_names[RADAR_SOURCE_COUNT] = {
-    "S3_LOCAL",
-    "C51",
-    "C52",
-};
-
-static const char *const s_device_ids[RADAR_SOURCE_COUNT] = {
-    "sensair_s3_gateway_01",
-    "sensair_shuttle_01",
-    "sensair_shuttle_02",
-};
-
-static const char *const s_room_ids[RADAR_SOURCE_COUNT] = {
-    "s3_local",
-    "living_room",
-    "bedroom",
-};
 
 static bool source_valid(radar_source_id_t source)
 {
@@ -84,58 +65,39 @@ static void copy_text(char *out, size_t out_size, const char *value)
     out[length] = '\0';
 }
 
-static const char *presence_state_name(radar_presence_state_t state)
-{
-    switch (state) {
-    case RADAR_STATE_MOTION: return "moving";
-    case RADAR_STATE_PRESENT: return "present";
-    case RADAR_STATE_HOLD: return "hold";
-    case RADAR_STATE_VACANT_INFERRED: return "vacant";
-    case RADAR_STATE_UNKNOWN:
-    default: return "unknown";
-    }
-}
-
 static bool state_occupies_room(radar_presence_state_t state)
 {
     return state == RADAR_STATE_MOTION || state == RADAR_STATE_PRESENT ||
            state == RADAR_STATE_HOLD;
 }
 
-static void refresh_home_presence_locked(radar_source_id_t changed_source,
-                                         radar_presence_state_t previous_state,
-                                         uint64_t now_ms)
+static void rebuild_home_state_locked(RadarHomeState *home)
 {
-    uint8_t occupied_room_count = 0U;
-    radar_source_id_t active_source = RADAR_SOURCE_COUNT;
-    uint64_t active_transition_ms = 0U;
+    if (home == NULL) return;
+    memset(home, 0, sizeof(*home));
     for (radar_source_id_t source = RADAR_SOURCE_S3_LOCAL;
          source < RADAR_SOURCE_COUNT;
          source = (radar_source_id_t)(source + 1)) {
-        const radar_registry_entry_t *entry = &s_slots[source].entry;
-        if (!entry->source_online || !state_occupies_room(entry->snapshot.state)) {
+        RadarSourceState source_state;
+        if (!radar_source_context_get_state(source, &source_state) ||
+            source_state.timestamp_ms == 0U || !source_state.online ||
+            !state_occupies_room(source_state.presence)) {
             continue;
         }
-        if (occupied_room_count < UINT8_MAX) {
-            ++occupied_room_count;
-        }
-        if (active_source == RADAR_SOURCE_COUNT ||
-            entry->last_state_change_ms >= active_transition_ms) {
-            active_source = source;
-            active_transition_ms = entry->last_state_change_ms;
-        }
-    }
-    s_home_presence.occupied_room_count = occupied_room_count;
-    s_home_presence.active_source = active_source;
-    copy_text(s_home_presence.active_room, sizeof(s_home_presence.active_room),
-              active_source < RADAR_SOURCE_COUNT ? s_room_ids[active_source] : "");
-    if (changed_source < RADAR_SOURCE_COUNT &&
-        previous_state != s_slots[changed_source].entry.snapshot.state) {
-        (void)snprintf(s_home_presence.last_transition, sizeof(s_home_presence.last_transition),
-                       "%s:%s->%s", s_room_ids[changed_source],
-                       presence_state_name(previous_state),
-                       presence_state_name(s_slots[changed_source].entry.snapshot.state));
-        s_home_presence.last_transition_ms = now_ms;
+        if (home->occupied_room_count >= RADAR_SOURCE_COUNT) continue;
+        RadarRoomState *room =
+            &home->occupied_rooms[home->occupied_room_count++];
+        room->source_id = source;
+        copy_text(room->source, sizeof(room->source), radar_source_context_source_name(source));
+        copy_text(room->device_id, sizeof(room->device_id), source_state.device_id);
+        copy_text(room->room_id, sizeof(room->room_id), source_state.room_id);
+        room->occupied = true;
+        room->presence = source_state.presence;
+        room->motion = source_state.motion;
+        room->last_update_ms = source_state.timestamp_ms;
+        const uint16_t next_count = (uint16_t)home->home_person_count +
+            source_state.count_summary.source_person_count;
+        home->home_person_count = next_count > UINT8_MAX ? UINT8_MAX : (uint8_t)next_count;
     }
 }
 
@@ -158,17 +120,24 @@ static void registry_unlock(void)
 static void initialize_slot(radar_source_id_t source)
 {
     radar_registry_slot_t *slot = &s_slots[source];
+    const RadarSourceContext *context = radar_source_context_get(source);
     memset(slot, 0, sizeof(*slot));
     slot->entry.source = source;
     slot->entry.snapshot.state = RADAR_STATE_UNKNOWN;
-    copy_text(slot->entry.device_id, sizeof(slot->entry.device_id), s_device_ids[source]);
-    copy_text(slot->entry.room_id, sizeof(slot->entry.room_id), s_room_ids[source]);
+    slot->entry.count_summary.count_state = RADAR_PERSON_COUNT_UNKNOWN;
+    if (context != NULL) {
+        copy_text(slot->entry.device_id, sizeof(slot->entry.device_id), context->device_id);
+        copy_text(slot->entry.room_id, sizeof(slot->entry.room_id), context->room_id);
+    }
 }
 
 bool radar_registry_init(void)
 {
     if (s_initialized) {
         return true;
+    }
+    if (!radar_source_context_init(0U)) {
+        return false;
     }
 #ifndef RADAR_DOMAIN_HOST_TEST
     s_lock = xSemaphoreCreateMutexStatic(&s_lock_storage);
@@ -182,8 +151,6 @@ bool radar_registry_init(void)
         initialize_slot(source);
     }
     s_unattributed_parse_errors = 0U;
-    memset(&s_home_presence, 0, sizeof(s_home_presence));
-    s_home_presence.active_source = RADAR_SOURCE_COUNT;
     s_initialized = true;
     return true;
 }
@@ -201,17 +168,17 @@ radar_source_id_t radar_registry_source_for_local_id(uint8_t local_id)
 
 const char *radar_registry_source_name(radar_source_id_t source)
 {
-    return source_valid(source) ? s_source_names[source] : "UNKNOWN";
+    return radar_source_context_source_name(source);
 }
 
 const char *radar_registry_device_id(radar_source_id_t source)
 {
-    return source_valid(source) ? s_device_ids[source] : NULL;
+    return radar_source_context_device_id(source);
 }
 
 const char *radar_registry_room_id(radar_source_id_t source)
 {
-    return source_valid(source) ? s_room_ids[source] : NULL;
+    return radar_source_context_room_id(source);
 }
 
 bool radar_registry_get(radar_source_id_t source, radar_registry_entry_t *out)
@@ -239,15 +206,19 @@ size_t radar_registry_snapshot(radar_registry_entry_t *out, size_t capacity)
 
 void radar_registry_get_home_presence(radar_home_presence_t *out)
 {
+    radar_registry_get_home_state(out);
+}
+
+void radar_registry_get_home_state(RadarHomeState *out)
+{
     if (out == NULL) {
         return;
     }
     memset(out, 0, sizeof(*out));
-    out->active_source = RADAR_SOURCE_COUNT;
     if (!s_initialized || !registry_lock()) {
         return;
     }
-    *out = s_home_presence;
+    rebuild_home_state_locked(out);
     registry_unlock();
 }
 
@@ -276,9 +247,19 @@ static void copy_payload_to_snapshot(radar_registry_entry_t *entry,
     }
 }
 
+static radar_count_summary_t fallback_count_summary(const radar_protocol_payload_t *payload)
+{
+    radar_count_summary_t summary = {.count_state = RADAR_PERSON_COUNT_UNKNOWN};
+    if (payload != NULL) {
+        summary.visible_track_count = payload->target_count;
+    }
+    return summary;
+}
+
 radar_registry_update_result_t radar_registry_update_remote(
     radar_source_id_t source,
     const radar_protocol_payload_t *payload,
+    const radar_count_summary_t *count_summary,
     uint32_t session_generation,
     uint64_t received_at_ms,
     bool *out_state_changed)
@@ -329,6 +310,7 @@ radar_registry_update_result_t radar_registry_update_remote(
     }
 
     copy_payload_to_snapshot(entry, payload, received_at_ms);
+    entry->count_summary = count_summary != NULL ? *count_summary : fallback_count_summary(payload);
     entry->source_online = payload->uart_online && payload->frame_fresh;
     entry->sequence = payload->sequence;
     entry->source_uptime_ms = payload->uptime_ms;
@@ -336,9 +318,15 @@ radar_registry_update_result_t radar_registry_update_remote(
     slot->last_payload = *payload;
     slot->has_payload = true;
     sat_inc_u32(&entry->diagnostics.accepted_count);
+    RadarSourceContext *context = radar_source_context_mutable(source);
+    if (context != NULL) {
+        context->last_frame_time = entry->snapshot.last_valid_frame_ms;
+        radar_source_context_commit_state(context, entry->snapshot.state,
+                                          entry->source_online, entry->sequence,
+                                          received_at_ms, &entry->count_summary);
+    }
 
     const bool changed = old_online != entry->source_online || old_state != entry->snapshot.state;
-    refresh_home_presence_locked(source, old_state, received_at_ms);
     if (out_state_changed != NULL) {
         *out_state_changed = changed;
     }
@@ -347,6 +335,7 @@ radar_registry_update_result_t radar_registry_update_remote(
 }
 
 bool radar_registry_update_local(const radar_snapshot_t *snapshot,
+                                 const radar_count_summary_t *count_summary,
                                  const radar_registry_local_diagnostics_t *service_diagnostics,
                                  uint64_t received_at_ms,
                                  bool *out_state_changed)
@@ -362,6 +351,8 @@ bool radar_registry_update_local(const radar_snapshot_t *snapshot,
     const bool old_online = entry->source_online;
     const radar_presence_state_t old_state = entry->snapshot.state;
     entry->snapshot = *snapshot;
+    entry->count_summary = count_summary != NULL ? *count_summary :
+        (radar_count_summary_t){.count_state = RADAR_PERSON_COUNT_UNKNOWN};
     entry->source_online = snapshot->uart_online && snapshot->frame_fresh;
     entry->source_uptime_ms = received_at_ms;
     entry->last_report_ms = received_at_ms;
@@ -378,9 +369,15 @@ bool radar_registry_update_local(const radar_snapshot_t *snapshot,
         entry->diagnostics.parse_error_count =
             sat_add_u32(parse_errors, service_diagnostics->uart_read_driver_error);
     }
+    RadarSourceContext *context = radar_source_context_mutable(RADAR_SOURCE_S3_LOCAL);
+    if (context != NULL) {
+        context->last_frame_time = entry->snapshot.last_valid_frame_ms;
+        radar_source_context_commit_state(context, snapshot->state,
+                                          entry->source_online, entry->snapshot.state_seq,
+                                          received_at_ms, &entry->count_summary);
+    }
 
     const bool changed = old_online != entry->source_online || old_state != snapshot->state;
-    refresh_home_presence_locked(RADAR_SOURCE_S3_LOCAL, old_state, received_at_ms);
     if (out_state_changed != NULL) {
         *out_state_changed = changed;
     }
@@ -423,17 +420,23 @@ void radar_registry_refresh(uint64_t now_ms)
         }
         if (entry->source_online || entry->snapshot.state != RADAR_STATE_UNKNOWN ||
             entry->snapshot.frame_fresh) {
-            const radar_presence_state_t previous_state = entry->snapshot.state;
             entry->source_online = false;
             entry->snapshot.state = RADAR_STATE_UNKNOWN;
             entry->snapshot.frame_fresh = false;
             entry->snapshot.current_target_count = 0U;
             memset(entry->snapshot.targets, 0, sizeof(entry->snapshot.targets));
+            memset(&entry->count_summary, 0, sizeof(entry->count_summary));
+            entry->count_summary.count_state = RADAR_PERSON_COUNT_UNKNOWN;
             sat_inc_u32(&entry->snapshot.state_seq);
             entry->snapshot.state_since_ms = now_ms;
             entry->last_state_change_ms = now_ms;
+            RadarSourceContext *context = radar_source_context_mutable((radar_source_id_t)i);
+            if (context != NULL) {
+                radar_source_context_commit_state(context, RADAR_STATE_UNKNOWN,
+                                                  false, entry->snapshot.state_seq,
+                                                  now_ms, &entry->count_summary);
+            }
             sat_inc_u32(&entry->diagnostics.freshness_expiry_count);
-            refresh_home_presence_locked((radar_source_id_t)i, previous_state, now_ms);
         }
     }
     registry_unlock();

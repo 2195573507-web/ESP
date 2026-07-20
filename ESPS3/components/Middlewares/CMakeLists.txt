@@ -9,6 +9,10 @@ set(gateway_srcs
             protocol_adapter/protocol_adapter.c
             server_client/server_client.c
             gateway_event_reporter/gateway_event_reporter.c
+            environment_alarm_adapter/environment_alarm_adapter.c
+            environment_alarm_adapter/environment_alarm_sequence.c
+            environment_alarm_reporter/environment_alarm_delivery.c
+            environment_alarm_reporter/environment_alarm_reporter.c
             sensor_aggregator/sensor_aggregator.c
             smart_home_gateway/smart_home_gateway.c
             voice_proxy/voice_proxy.c
@@ -18,6 +22,7 @@ set(gateway_srcs
             runtime/s3_event_bus.c
             runtime/s3_scheduler.c
             radar_domain/radar_protocol.c
+            radar_domain/radar_source_context.c
             radar_domain/radar_registry.c
             radar_domain/radar_remote_ingest.c
             radar_domain/radar_gateway_ingest.c
@@ -28,6 +33,7 @@ set(gateway_srcs
             radar_domain/radar_coordinate_transform.c
             radar_domain/radar_zone_map.c
             radar_domain/radar_target_tracker.c
+            radar_domain/radar_person_continuity.c
             radar_domain/radar_spatial_state.c
             radar_ingest/radar_ingest.c
             device_stream_gateway/device_stream_gateway.c
@@ -49,6 +55,8 @@ set(priv_include_dirs
             protocol_adapter
             server_client
             gateway_event_reporter
+            environment_alarm_adapter
+            environment_alarm_reporter
             sensor_aggregator
             smart_home_gateway
             voice_proxy
@@ -63,6 +71,7 @@ set(priv_include_dirs
 
 set(requires
             app_config
+            environment_alarm_engine
             esp_event
             esp_hw_support
             esp_http_client

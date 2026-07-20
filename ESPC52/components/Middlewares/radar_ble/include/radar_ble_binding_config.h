@@ -12,7 +12,7 @@
 #define RADAR_BLE_ADDR_TYPE_UNSPECIFIED 0xffU
 #define RADAR_BLE_BINDING_LOCAL_ID 2
 #define RADAR_BLE_BINDING_DEVICE_ID "sensair_shuttle_02"
-#define RADAR_BLE_BINDING_ROOM_ID "living_room"
+#define RADAR_BLE_BINDING_ROOM_ID "bedroom"
 #define RADAR_BLE_BINDING_RADAR_ID "ld2450_01"
 /* Exact MAC remains mandatory; type is learned by the fixed-MAC discovery pass. */
 #define RADAR_BLE_BINDING_ADDRESS_TYPE RADAR_BLE_ADDR_TYPE_ANY

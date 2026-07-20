@@ -68,6 +68,25 @@ struct RadarTarget: Identifiable, Equatable {
     var speed: Int { speedCentimetersPerSecond }
     var direction: Int? { directionDegrees }
     var visible: Bool { isVisible }
+
+    func scoped(to source: RadarSource) -> RadarTarget {
+        RadarTarget(source: source,
+                    trackID: trackID,
+                    xMillimeters: xMillimeters,
+                    yMillimeters: yMillimeters,
+                    rawXMillimeters: rawXMillimeters,
+                    rawYMillimeters: rawYMillimeters,
+                    filteredXMillimeters: filteredXMillimeters,
+                    filteredYMillimeters: filteredYMillimeters,
+                    distanceMillimeters: distanceMillimeters,
+                    angleDegrees: angleDegrees,
+                    speedCentimetersPerSecond: speedCentimetersPerSecond,
+                    directionDegrees: directionDegrees,
+                    confidence: confidence,
+                    isVisible: isVisible,
+                    timestamp: timestamp,
+                    lastSeenTime: lastSeenTime)
+    }
 }
 
 struct RadarSample: Identifiable, Equatable {
@@ -190,6 +209,15 @@ struct RadarStatePatch: Equatable {
     var connectionType: String?
     var sequence: Int64?
     var targetCount: Int?
+    var rawTargetCount: Int?
+    var acceptedTargetCount: Int?
+    var visibleTrackCount: Int?
+    var confirmedActiveTrackCount: Int?
+    var historyTargetCount: Int?
+    var visiblePersonCount: Int?
+    var retainedPersonCount: Int?
+    var sourcePersonCount: Int?
+    var countState: String?
     var presenceState: RadarPresenceState?
     var motionState: String?
     var spatialState: String?
@@ -199,6 +227,7 @@ struct RadarStatePatch: Equatable {
     var droppedFrames: Int?
     var recoveryState: String?
     var deviceID: String?
+    var roomID: String?
     var sensorState: String?
     var occupancyState: String?
     var acceptedFrames: Int?
@@ -215,6 +244,15 @@ struct RadarStatePatch: Equatable {
          connectionType: String? = nil,
          sequence: Int64? = nil,
          targetCount: Int? = nil,
+         rawTargetCount: Int? = nil,
+         acceptedTargetCount: Int? = nil,
+         visibleTrackCount: Int? = nil,
+         confirmedActiveTrackCount: Int? = nil,
+         historyTargetCount: Int? = nil,
+         visiblePersonCount: Int? = nil,
+         retainedPersonCount: Int? = nil,
+         sourcePersonCount: Int? = nil,
+         countState: String? = nil,
          presenceState: RadarPresenceState? = nil,
          motionState: String? = nil,
          spatialState: String? = nil,
@@ -224,6 +262,7 @@ struct RadarStatePatch: Equatable {
          droppedFrames: Int? = nil,
          recoveryState: String? = nil,
          deviceID: String? = nil,
+         roomID: String? = nil,
          sensorState: String? = nil,
          occupancyState: String? = nil,
          acceptedFrames: Int? = nil,
@@ -239,6 +278,15 @@ struct RadarStatePatch: Equatable {
         self.connectionType = connectionType
         self.sequence = sequence
         self.targetCount = targetCount
+        self.rawTargetCount = rawTargetCount
+        self.acceptedTargetCount = acceptedTargetCount
+        self.visibleTrackCount = visibleTrackCount
+        self.confirmedActiveTrackCount = confirmedActiveTrackCount
+        self.historyTargetCount = historyTargetCount
+        self.visiblePersonCount = visiblePersonCount
+        self.retainedPersonCount = retainedPersonCount
+        self.sourcePersonCount = sourcePersonCount
+        self.countState = countState
         self.presenceState = presenceState
         self.motionState = motionState
         self.spatialState = spatialState
@@ -248,6 +296,7 @@ struct RadarStatePatch: Equatable {
         self.droppedFrames = droppedFrames
         self.recoveryState = recoveryState
         self.deviceID = deviceID
+        self.roomID = roomID
         self.sensorState = sensorState
         self.occupancyState = occupancyState
         self.acceptedFrames = acceptedFrames
@@ -263,9 +312,12 @@ struct RadarStatePatch: Equatable {
 
     var hasValues: Bool {
         online != nil || connectionType != nil || sequence != nil || targetCount != nil ||
+            rawTargetCount != nil || acceptedTargetCount != nil || visibleTrackCount != nil ||
+            confirmedActiveTrackCount != nil || historyTargetCount != nil || visiblePersonCount != nil ||
+            retainedPersonCount != nil || sourcePersonCount != nil || countState != nil ||
             presenceState != nil || motionState != nil || spatialState != nil ||
             parserErrors != nil || sequenceRejects != nil || identityMismatches != nil ||
-            droppedFrames != nil || recoveryState != nil || deviceID != nil || sensorState != nil ||
+            droppedFrames != nil || recoveryState != nil || deviceID != nil || roomID != nil || sensorState != nil ||
             occupancyState != nil || acceptedFrames != nil || badHeader != nil || badTail != nil ||
             resyncCount != nil || rxBytes != nil || timeout != nil || fifoOverflow != nil
     }
@@ -275,6 +327,8 @@ enum RadarLogEventKind: Equatable {
     case frameStarted(RadarStatePatch)
     case target(RadarTarget, RadarStatePatch)
     case update(RadarStatePatch)
+    case room(RadarRoomState)
+    case home(RadarHomeState)
 }
 
 struct RadarLogEvent: Equatable {
@@ -294,10 +348,11 @@ struct UnknownRadarDiagnostic: Identifiable, Equatable {
     let timestampMilliseconds: Int64
 }
 
-struct RadarRoomState: Equatable {
+struct RadarSourceState: Equatable {
     let source: RadarSource
     var sourceId: UInt8
     var deviceId: String
+    var roomId: String
     var roomName: String
     var connectionType: String
     var online: Bool
@@ -309,6 +364,16 @@ struct RadarRoomState: Equatable {
     var tracks: [Int: RadarTrack]
     var trackHistory: [Int: [RadarTrackPoint]]
     var targetCount: Int
+    var rawTargetCount: Int
+    var acceptedTargetCount: Int
+    var visibleTrackCount: Int
+    var confirmedActiveTrackCount: Int
+    var historyTargetCount: Int
+    var visiblePersonCount: Int
+    var retainedPersonCount: Int
+    var sourcePersonCount: Int
+    var countState: String
+    var hasExplicitCountSummary: Bool
     var presenceState: RadarPresenceState
     var motionState: String
     var spatialState: String
@@ -336,6 +401,7 @@ struct RadarRoomState: Equatable {
         self.source = source
         sourceId = source.sourceId
         deviceId = source.defaultDeviceID
+        roomId = source.defaultRoomID
         roomName = config.roomName
         connectionType = source.defaultConnectionType
         online = false
@@ -347,6 +413,16 @@ struct RadarRoomState: Equatable {
         tracks = [:]
         trackHistory = [:]
         targetCount = 0
+        rawTargetCount = 0
+        acceptedTargetCount = 0
+        visibleTrackCount = 0
+        confirmedActiveTrackCount = 0
+        historyTargetCount = 0
+        visiblePersonCount = 0
+        retainedPersonCount = 0
+        sourcePersonCount = 0
+        countState = "UNKNOWN"
+        hasExplicitCountSummary = false
         presenceState = .unknown
         motionState = "unknown"
         spatialState = "unknown"
@@ -380,6 +456,43 @@ struct RadarRoomState: Equatable {
     var badHeader: Int { parserHealth.badHeader }
     var badTail: Int { parserHealth.badTail }
     var resyncCount: Int { parserHealth.resyncCount }
+    var visibleTracks: [RadarTarget] { filteredTargets.filter(\.isVisible) }
+    var retainedTrackCount: Int { max(0, filteredTargets.count - visibleTracks.count) }
+    var history: [Int: [RadarTrackPoint]] { trackHistory }
+    var personCount: Int { sourcePersonCount }
+    var timestamp: Date? {
+        guard let lastUpdateMilliseconds else { return nil }
+        return Date(timeIntervalSince1970: Double(lastUpdateMilliseconds) / 1_000)
+    }
+}
+
+struct RadarRoomState: Equatable, Identifiable {
+    let source: RadarSource
+    var roomID: String
+    var occupied: Bool
+    var motion: String
+    var lastUpdateMilliseconds: Int64?
+
+    var id: UInt8 { source.sourceId }
+}
+
+struct RadarHomeState: Equatable {
+    var occupiedRoomCount: Int = 0
+    var occupiedRooms: [RadarRoomState] = []
+    var homePersonCount: Int = 0
+    var timestampMilliseconds: Int64?
+}
+
+typealias RadarState = RadarSourceState
+
+/* Runtime ownership is keyed by the firmware source_id (0/1/2).  The source
+ * convenience subscript cannot create a shared state; it only converts to the
+ * canonical integer key. */
+extension Dictionary where Key == Int, Value == RadarState {
+    subscript(source: RadarSource) -> RadarState? {
+        get { self[Int(source.sourceId)] }
+        set { self[Int(source.sourceId)] = newValue }
+    }
 }
 
 enum RadarClock {

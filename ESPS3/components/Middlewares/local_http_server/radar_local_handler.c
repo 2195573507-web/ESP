@@ -11,6 +11,7 @@
 #include "radar_ingest.h"
 #include "radar_gateway_ingest.h"
 #include "radar_local_adapter.h"
+#include "radar_person_continuity.h"
 #include "radar_registry.h"
 #include "radar_service.h"
 
@@ -135,76 +136,40 @@ esp_err_t radar_local_handler(httpd_req_t *req)
 esp_err_t radar_debug_handler(httpd_req_t *req)
 {
     if (req == NULL) return ESP_ERR_INVALID_ARG;
-    char body[2048];
+    char body[4096];
     size_t used = 0U;
-    bool first_target = true;
-    if (!append_text(body, sizeof(body), &used, "{\"targets\":[")) {
+    if (!append_text(body, sizeof(body), &used, "{\"sources\":[")) {
         return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
     }
 
     radar_readonly_snapshot_t local_snapshot = {0};
     const bool has_local_snapshot = radar_local_adapter_get_readonly_snapshot(&local_snapshot);
-    for (uint8_t index = 0U; has_local_snapshot && index < local_snapshot.track_count; ++index) {
-        const radar_readonly_track_t *track = &local_snapshot.tracks[index];
-        if (!append_text(body, sizeof(body), &used,
-                         "%s{\"source_id\":%u,\"id\":%lu,\"x_mm\":%ld,\"y_mm\":%ld,"
-                         "\"speed_cm_s\":%d,\"confidence\":%lu,\"visible\":%s}",
-                         first_target ? "" : ",",
-                         (unsigned int)RADAR_SOURCE_S3_LOCAL,
-                         (unsigned long)track->track_id,
-                         (long)track->filtered_x_mm,
-                         (long)track->filtered_y_mm,
-                         (int)track->speed_cm_s,
-                         (unsigned long)track->confidence,
-                         track->visible ? "true" : "false")) {
-            return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
-        }
-        first_target = false;
-    }
-
-    for (uint8_t local_id = 1U; local_id <= 2U; ++local_id) {
-        radar_gateway_output_t output = {0};
-        if (!radar_gateway_ingest_get_output(local_id, &output)) continue;
-        for (uint8_t index = 0U; index < output.target_count; ++index) {
-            const radar_gateway_target_output_t *target = &output.targets[index];
-            if (!append_text(body, sizeof(body), &used,
-                             "%s{\"source_id\":%u,\"id\":%lu,\"x_mm\":%ld,\"y_mm\":%ld,"
-                             "\"speed_cm_s\":%d,\"confidence\":%u,\"visible\":%s}",
-                             first_target ? "" : ",",
-                             (unsigned int)local_id,
-                             (unsigned long)target->track_id,
-                             (long)target->x_mm,
-                             (long)target->y_mm,
-                             (int)target->speed_cm_s,
-                             (unsigned int)target->confidence,
-                             target->visible ? "true" : "false")) {
-                return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
-            }
-            first_target = false;
-        }
-    }
-
-    if (!append_text(body, sizeof(body), &used, "],\"sources\":[")) {
-        return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
-    }
-
     radar_service_diagnostics_t local_service = {0};
     radar_service_get_diagnostics(&local_service);
     for (radar_source_id_t source = RADAR_SOURCE_S3_LOCAL;
          source < RADAR_SOURCE_COUNT;
          source = (radar_source_id_t)(source + 1)) {
+        const RadarSourceContext *context = radar_source_context_get(source);
         radar_registry_entry_t entry = {0};
         const bool has_entry = radar_registry_get(source, &entry);
-        const char *source_name = radar_registry_source_name(source);
-        const char *device_id = has_entry && entry.device_id[0] != '\0'
-            ? entry.device_id : radar_registry_device_id(source);
+        const char *source_name = context != NULL ? context->source_name : "UNKNOWN";
+        const char *device_id = context != NULL ? context->device_id : "";
+        const char *room_id = context != NULL ? context->room_id : "";
         bool online = has_entry && entry.source_online;
         const char *sensor_state = online ? "online" : "offline";
         const char *occupancy = has_entry
             ? debug_presence_occupancy_name(entry.snapshot.state) : "unknown";
         const char *recovery_state = online ? "RUNNING" : "FAILED";
         uint32_t targets = has_entry ? entry.snapshot.current_target_count : 0U;
-        uint32_t tracks = targets;
+        uint32_t tracks = 0U;
+        uint32_t raw_targets = 0U;
+        uint32_t accepted_targets = 0U;
+        uint32_t confirmed_active_tracks = 0U;
+        uint32_t history_tracks = 0U;
+        uint32_t visible_persons = 0U;
+        uint32_t retained_persons = 0U;
+        uint32_t business_persons = 0U;
+        radar_person_count_state_t count_state = RADAR_PERSON_COUNT_UNKNOWN;
         uint32_t accepted = has_entry ? entry.diagnostics.accepted_count : 0U;
         uint32_t bad_header = 0U;
         uint32_t bad_tail = 0U;
@@ -219,6 +184,17 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
                 ? debug_occupancy_name(local_snapshot.occupancy_state) : "unknown";
             recovery_state = debug_recovery_state_name(local_service.recovery.state);
             tracks = has_local_snapshot ? local_snapshot.track_count : 0U;
+            if (has_local_snapshot) {
+                raw_targets = local_snapshot.count_summary.raw_target_count;
+                accepted_targets = local_snapshot.count_summary.accepted_target_count;
+                tracks = local_snapshot.count_summary.visible_track_count;
+                confirmed_active_tracks = local_snapshot.count_summary.confirmed_active_track_count;
+                history_tracks = local_snapshot.count_summary.history_target_count;
+                visible_persons = local_snapshot.count_summary.visible_person_count;
+                retained_persons = local_snapshot.count_summary.retained_person_count;
+                business_persons = local_snapshot.count_summary.source_person_count;
+                count_state = local_snapshot.count_summary.count_state;
+            }
             accepted = local_service.parser.valid_frames;
             bad_header = local_service.parser.bad_header;
             bad_tail = local_service.parser.bad_tail;
@@ -234,25 +210,85 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
                 sensor_state = online ? "online" : "offline";
                 occupancy = debug_occupancy_name(output.occupancy);
                 targets = output.target_count;
-                tracks = output.target_count;
+                raw_targets = output.count_summary.raw_target_count;
+                accepted_targets = output.count_summary.accepted_target_count;
+                tracks = output.count_summary.visible_track_count;
+                confirmed_active_tracks = output.count_summary.confirmed_active_track_count;
+                history_tracks = output.count_summary.history_target_count;
+                visible_persons = output.count_summary.visible_person_count;
+                retained_persons = output.count_summary.retained_person_count;
+                business_persons = output.count_summary.source_person_count;
+                count_state = output.count_summary.count_state;
                 last_update = output.updated_at_ms;
             }
         }
 
         if (!append_text(body, sizeof(body), &used,
-                         "%s{\"source\":\"%s\",\"device_id\":\"%s\",\"online\":%s,"
-                         "\"sensor_state\":\"%s\",\"occupancy\":\"%s\",\"targets\":%lu,"
-                         "\"tracks\":%lu,\"accepted\":%lu,\"bad_header\":%lu,"
-                         "\"bad_tail\":%lu,\"resync\":%lu,\"recovery_state\":\"%s\","
-                         "\"last_update\":%llu}",
+                         "%s{\"source_id\":%u,\"source\":\"%s\",\"device_id\":\"%s\",\"room\":\"%s\",\"online\":%s,"
+                         "\"transport\":\"%s\",\"sequence\":%lu,\"sensor_state\":\"%s\",\"occupancy\":\"%s\",\"targets\":[",
                          source == RADAR_SOURCE_S3_LOCAL ? "" : ",",
+                         (unsigned int)source,
                          source_name != NULL ? source_name : "UNKNOWN",
                          device_id != NULL ? device_id : "",
+                         room_id != NULL ? room_id : "",
                          online ? "true" : "false",
+                         context != NULL ? radar_source_context_transport_name(context->transport_type) : "unknown",
+                         (unsigned long)(context != NULL ? context->sequence : 0U),
                          sensor_state,
-                         occupancy,
+                         occupancy)) {
+            return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
+        }
+
+        bool first_source_target = true;
+        if (source == RADAR_SOURCE_S3_LOCAL && has_local_snapshot) {
+            for (uint8_t index = 0U; index < local_snapshot.track_count; ++index) {
+                const radar_readonly_track_t *track = &local_snapshot.tracks[index];
+                if (!append_text(body, sizeof(body), &used,
+                                 "%s{\"source_id\":%u,\"source\":\"%s\",\"device_id\":\"%s\",\"room\":\"%s\",\"id\":%lu,\"x_mm\":%ld,\"y_mm\":%ld,\"visible\":%s}",
+                                 first_source_target ? "" : ",", (unsigned int)source, source_name, device_id, room_id,
+                                 (unsigned long)track->track_id, (long)track->filtered_x_mm,
+                                 (long)track->filtered_y_mm, track->visible ? "true" : "false")) {
+                    return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
+                }
+                first_source_target = false;
+            }
+        } else if (source != RADAR_SOURCE_S3_LOCAL) {
+            const uint8_t local_id = source == RADAR_SOURCE_C51 ? 1U : 2U;
+            radar_gateway_output_t output = {0};
+            if (radar_gateway_ingest_get_output(local_id, &output)) {
+                for (uint8_t index = 0U; index < output.target_count; ++index) {
+                    const radar_gateway_target_output_t *target = &output.targets[index];
+                    if (!append_text(body, sizeof(body), &used,
+                                     "%s{\"source_id\":%u,\"source\":\"%s\",\"device_id\":\"%s\",\"room\":\"%s\",\"id\":%lu,\"x_mm\":%ld,\"y_mm\":%ld,\"visible\":%s}",
+                                     first_source_target ? "" : ",", (unsigned int)source, source_name, device_id, room_id,
+                                     (unsigned long)target->track_id, (long)target->x_mm,
+                                     (long)target->y_mm, target->visible ? "true" : "false")) {
+                        return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
+                    }
+                    first_source_target = false;
+                }
+            }
+        }
+
+        if (!append_text(body, sizeof(body), &used,
+                         "],\"target_count\":%lu,\"tracks\":%lu,\"raw_target_count\":%lu,\"accepted_target_count\":%lu,"
+                         "\"visible_track_count\":%lu,\"confirmed_active_track_count\":%lu,"
+                         "\"history_target_count\":%lu,\"visible_person_count\":%lu,"
+                         "\"retained_person_count\":%lu,\"source_person_count\":%lu,"
+                         "\"count_state\":\"%s\",\"accepted\":%lu,\"bad_header\":%lu,"
+                         "\"bad_tail\":%lu,\"resync\":%lu,\"recovery_state\":\"%s\","
+                         "\"last_update\":%llu}",
                          (unsigned long)targets,
                          (unsigned long)tracks,
+                         (unsigned long)raw_targets,
+                         (unsigned long)accepted_targets,
+                         (unsigned long)tracks,
+                         (unsigned long)confirmed_active_tracks,
+                         (unsigned long)history_tracks,
+                         (unsigned long)visible_persons,
+                         (unsigned long)retained_persons,
+                         (unsigned long)business_persons,
+                         radar_person_count_state_name(count_state),
                          (unsigned long)accepted,
                          (unsigned long)bad_header,
                          (unsigned long)bad_tail,

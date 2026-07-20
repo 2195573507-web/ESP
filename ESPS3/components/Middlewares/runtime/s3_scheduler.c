@@ -22,6 +22,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "gateway_config.h"
@@ -886,7 +887,7 @@ static void protocol_worker_task(void *arg)
     ESP_LOGI(TAG,
              "protocol worker started queue_depth=%u",
              (unsigned int)S3_PROTOCOL_WORKER_QUEUE_DEPTH);
-    app_stack_monitor_log(TAG, "protocol_worker", "entry");
+    app_stack_monitor_report(TAG, "protocol_worker", S3_PROTOCOL_WORKER_TASK_STACK, "entry");
     app_heap_monitor_log(TAG);
 
     while (1) {
@@ -961,7 +962,7 @@ static void stream_worker_task(void *arg)
     ESP_LOGI(TAG,
              "stream worker started queue_depth=%u",
              (unsigned int)S3_STREAM_WORKER_QUEUE_DEPTH);
-    app_stack_monitor_log(TAG, "stream_worker", "entry");
+    app_stack_monitor_report(TAG, "stream_worker", S3_STREAM_WORKER_TASK_STACK, "entry");
     app_heap_monitor_log(TAG);
 
     while (1) {
@@ -1359,7 +1360,7 @@ static void s3_scheduler_task(void *arg)
              "S3 scheduler started as priority event bus base_tick_ms=%u priority_order=CRITICAL>REALTIME>STATE>BACKGROUND",
              (unsigned int)S3_SCHEDULER_BASE_TICK_MS);
     s3_event_bus_log_stats("start");
-    app_stack_monitor_log(TAG, "s3_scheduler_task", "entry");
+    app_stack_monitor_report(TAG, "s3_scheduler", S3_SCHEDULER_TASK_STACK, "entry");
     app_heap_monitor_log(TAG);
 
     int64_t last_tick_ms = 0;
@@ -1391,15 +1392,17 @@ esp_err_t s3_scheduler_init(void)
         return bus_ret;
     }
     if (s_protocol_queue == NULL) {
-        s_protocol_queue = xQueueCreate(S3_PROTOCOL_WORKER_QUEUE_DEPTH,
-                                        sizeof(s3_runtime_ingress_t *));
+        s_protocol_queue = xQueueCreateWithCaps(S3_PROTOCOL_WORKER_QUEUE_DEPTH,
+                                                sizeof(s3_runtime_ingress_t *),
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (s_protocol_queue == NULL) {
             return ESP_ERR_NO_MEM;
         }
     }
     if (s_stream_queue == NULL) {
-        s_stream_queue = xQueueCreate(S3_STREAM_WORKER_QUEUE_DEPTH,
-                                      sizeof(s3_stream_work_item_t));
+        s_stream_queue = xQueueCreateWithCaps(S3_STREAM_WORKER_QUEUE_DEPTH,
+                                              sizeof(s3_stream_work_item_t),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (s_stream_queue == NULL) {
             return ESP_ERR_NO_MEM;
         }
@@ -1428,24 +1431,26 @@ esp_err_t s3_scheduler_start(void)
         return ESP_ERR_INVALID_STATE;
     }
     if (s_protocol_worker_task == NULL) {
-        BaseType_t created = xTaskCreate(protocol_worker_task,
-                                         "protocol_worker",
-                                         S3_PROTOCOL_WORKER_TASK_STACK,
-                                         NULL,
-                                         S3_PROTOCOL_WORKER_TASK_PRIORITY,
-                                         &s_protocol_worker_task);
+        BaseType_t created = xTaskCreateWithCaps(protocol_worker_task,
+                                                 "protocol_worker",
+                                                 S3_PROTOCOL_WORKER_TASK_STACK,
+                                                 NULL,
+                                                 S3_PROTOCOL_WORKER_TASK_PRIORITY,
+                                                 &s_protocol_worker_task,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (created != pdPASS) {
             s_protocol_worker_task = NULL;
             return ESP_ERR_NO_MEM;
         }
     }
     if (s_stream_worker_task == NULL) {
-        BaseType_t created = xTaskCreate(stream_worker_task,
-                                         "stream_worker",
-                                         S3_STREAM_WORKER_TASK_STACK,
-                                         NULL,
-                                         S3_STREAM_WORKER_TASK_PRIORITY,
-                                         &s_stream_worker_task);
+        BaseType_t created = xTaskCreateWithCaps(stream_worker_task,
+                                                 "stream_worker",
+                                                 S3_STREAM_WORKER_TASK_STACK,
+                                                 NULL,
+                                                 S3_STREAM_WORKER_TASK_PRIORITY,
+                                                 &s_stream_worker_task,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (created != pdPASS) {
             s_stream_worker_task = NULL;
             return ESP_ERR_NO_MEM;
@@ -1455,12 +1460,13 @@ esp_err_t s3_scheduler_start(void)
         return ESP_OK;
     }
 
-    BaseType_t created = xTaskCreate(s3_scheduler_task,
-                                     "s3_scheduler",
-                                     S3_SCHEDULER_TASK_STACK,
-                                     NULL,
-                                     S3_SCHEDULER_TASK_PRIORITY,
-                                     &s_scheduler_task);
+    BaseType_t created = xTaskCreateWithCaps(s3_scheduler_task,
+                                             "s3_scheduler",
+                                             S3_SCHEDULER_TASK_STACK,
+                                             NULL,
+                                             S3_SCHEDULER_TASK_PRIORITY,
+                                             &s_scheduler_task,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         s_scheduler_task = NULL;
         return ESP_ERR_NO_MEM;

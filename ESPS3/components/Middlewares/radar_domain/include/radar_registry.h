@@ -6,24 +6,17 @@
 #include <stdint.h>
 
 #include "radar_protocol.h"
+#include "radar_source_context.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define RADAR_REGISTRY_DEVICE_ID_LEN 48U
-#define RADAR_REGISTRY_ROOM_ID_LEN 32U
+#define RADAR_REGISTRY_DEVICE_ID_LEN RADAR_SOURCE_CONTEXT_DEVICE_ID_LEN
+#define RADAR_REGISTRY_ROOM_ID_LEN RADAR_SOURCE_CONTEXT_ROOM_ID_LEN
 #define RADAR_REGISTRY_FRESHNESS_TIMEOUT_MS 3000U
-#define RADAR_HOME_TRANSITION_LEN 96U
 
 /* 接入层统一维护的逻辑雷达源；S3_LOCAL 为本地 UART，C51/C52 为远端。 */
-
-typedef enum {
-    RADAR_SOURCE_S3_LOCAL = 0,
-    RADAR_SOURCE_C51 = 1,
-    RADAR_SOURCE_C52 = 2,
-    RADAR_SOURCE_COUNT,
-} radar_source_id_t;
 
 typedef struct {
     uint32_t accepted_count;
@@ -49,6 +42,9 @@ typedef struct {
     char room_id[RADAR_REGISTRY_ROOM_ID_LEN];
     bool source_online;
     radar_snapshot_t snapshot;
+    /* A target array remains a motion-track transport value.  Business person
+     * counts live here so retained continuity never needs a fake target. */
+    radar_count_summary_t count_summary;
     uint32_t sequence;
     uint64_t source_uptime_ms;
     uint32_t session_generation;
@@ -57,14 +53,26 @@ typedef struct {
     radar_registry_diagnostics_t diagnostics;
 } radar_registry_entry_t;
 
-/* Household-level summary intentionally aggregates room state only, never tracks identities. */
+/* Room state is derived from one source snapshot.  It never owns tracker or
+ * person state and therefore cannot overwrite another source. */
+typedef struct {
+    radar_source_id_t source_id;
+    char source[RADAR_SOURCE_CONTEXT_NAME_LEN];
+    char device_id[RADAR_REGISTRY_DEVICE_ID_LEN];
+    char room_id[RADAR_REGISTRY_ROOM_ID_LEN];
+    bool occupied;
+    radar_presence_state_t presence;
+    radar_motion_state_t motion;
+    uint64_t last_update_ms;
+} RadarRoomState;
+
 typedef struct {
     uint8_t occupied_room_count;
-    radar_source_id_t active_source;
-    char active_room[RADAR_REGISTRY_ROOM_ID_LEN];
-    char last_transition[RADAR_HOME_TRANSITION_LEN];
-    uint64_t last_transition_ms;
-} radar_home_presence_t;
+    RadarRoomState occupied_rooms[RADAR_SOURCE_COUNT];
+    uint8_t home_person_count;
+} RadarHomeState;
+
+typedef RadarHomeState radar_home_presence_t;
 
 typedef enum {
     RADAR_REGISTRY_UPDATE_ACCEPTED = 0,
@@ -82,13 +90,16 @@ const char *radar_registry_room_id(radar_source_id_t source);
 bool radar_registry_get(radar_source_id_t source, radar_registry_entry_t *out);
 size_t radar_registry_snapshot(radar_registry_entry_t *out, size_t capacity);
 void radar_registry_get_home_presence(radar_home_presence_t *out);
+void radar_registry_get_home_state(RadarHomeState *out);
 radar_registry_update_result_t radar_registry_update_remote(
     radar_source_id_t source,
     const radar_protocol_payload_t *payload,
+    const radar_count_summary_t *count_summary,
     uint32_t session_generation,
     uint64_t received_at_ms,
     bool *out_state_changed);
 bool radar_registry_update_local(const radar_snapshot_t *snapshot,
+                                 const radar_count_summary_t *count_summary,
                                  const radar_registry_local_diagnostics_t *service_diagnostics,
                                  uint64_t received_at_ms,
                                  bool *out_state_changed);

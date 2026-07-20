@@ -21,6 +21,8 @@ struct ESPS3RadarLogParser {
                                            isVisible: target.isVisible))
             case .update:
                 return .ignored
+            case .room, .home:
+                return .ignored
             }
         }
     }

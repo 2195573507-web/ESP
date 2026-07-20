@@ -19,7 +19,7 @@ extern "C" {
  * 调用位置：main/gateway_startup_task()。
  * 调用时机：app_main 创建启动任务后立即调用。
  * 输入参数：无。
- * 返回值：无；关键初始化失败会进入 ESP-IDF 错误处理。
+ * 返回值：无；每个模块失败均会记录并降级，其他独立模块继续启动。
  * 失败处理：network_worker 管理本地 HTTP ingress 的启动和重试，S3 主流程继续运行。
  */
 void gateway_orchestrator_start(void);

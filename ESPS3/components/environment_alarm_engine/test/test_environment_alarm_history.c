@@ -1,0 +1,5 @@
+#include "unity.h"
+#include "environment_alarm_engine.h"
+static uint64_t s_now; static uint64_t clock_ms(void *unused){(void)unused;return s_now;}
+static alarm_environment_sample_t item(uint64_t seq,float temp){return (alarm_environment_sample_t){.struct_version=ALARM_ENVIRONMENT_SAMPLE_VERSION,.device_id=ALARM_DEVICE_C52,.ingest_seq=seq,.temperature=temp,.humidity=50,.pressure=1000,.gas_resistance=10000,.air_quality_score=80,.air_quality_level=ALARM_AIR_QUALITY_GOOD,.gas_ratio=1,.stability_score=.9f,.sensor_state=ALARM_SENSOR_READY};}
+TEST_CASE("fast temperature change uses current and oldest window value", "[environment_alarm]") {s_now=0;TEST_ASSERT_EQUAL(ESP_OK,alarm_engine_init(&(alarm_engine_options_t){.monotonic_clock_ms=clock_ms}));alarm_environment_sample_t s=item(1,20);TEST_ASSERT_EQUAL(ESP_OK,alarm_engine_update(&s,NULL));s_now=10000;s=item(2,24);TEST_ASSERT_EQUAL(ESP_OK,alarm_engine_update(&s,NULL));s_now=20000;s=item(3,24);TEST_ASSERT_EQUAL(ESP_OK,alarm_engine_update(&s,NULL));alarm_active_alarm_t a[2];TEST_ASSERT_GREATER_THAN_UINT32(0,alarm_engine_get_active(ALARM_DEVICE_C52,a,2));}

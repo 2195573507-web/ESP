@@ -1,7 +1,9 @@
 import Foundation
 
 struct RadarStateStore {
-    private(set) var states: [RadarSource: RadarRoomState]
+    private(set) var states: [Int: RadarState]
+    private(set) var roomStates: [RadarSource: RadarRoomState] = [:]
+    private(set) var homeState = RadarHomeState()
     private(set) var unknownDiagnostics: [UnknownRadarDiagnostic] = []
     private let freshnessPolicy: RadarFreshnessPolicy
     private let maximumUnknownDiagnostics = 200
@@ -10,14 +12,30 @@ struct RadarStateStore {
          freshnessPolicy: RadarFreshnessPolicy = .default) {
         self.freshnessPolicy = freshnessPolicy
         states = Dictionary(uniqueKeysWithValues: RadarSource.allCases.map { source in
-            (source, RadarRoomState(source: source, config: configs[source] ?? .default(for: source)))
+            (Int(source.sourceId), RadarState(source: source, config: configs[source] ?? .default(for: source)))
         })
     }
 
     mutating func apply(_ event: RadarLogEvent, nowMilliseconds: Int64 = RadarClock.nowMilliseconds) {
         // The app receive time, never an ESP log timestamp, owns target freshness.
         let eventTime = nowMilliseconds
+        if case .home(let home) = event.kind {
+            homeState = home
+            return
+        }
+        if case .room(let room) = event.kind {
+            roomStates[room.source] = room
+            return
+        }
         guard event.source != .unknown else {
+            appendUnknown(event, timestampMilliseconds: eventTime)
+            return
+        }
+        if let deviceID = patchDeviceID(for: event), deviceID != event.source.defaultDeviceID {
+            appendUnknown(event, timestampMilliseconds: eventTime)
+            return
+        }
+        if let roomID = patchRoomID(for: event), roomID != event.source.defaultRoomID {
             appendUnknown(event, timestampMilliseconds: eventTime)
             return
         }
@@ -32,10 +50,15 @@ struct RadarStateStore {
             var targetPatch = patch
             targetPatch.isValidFrame = true
             guard apply(patch: targetPatch, to: &state, eventTime: eventTime) else { break }
-            upsert(target: target, updatesPosition: targetPatch.updatesTargetPosition, into: &state, eventTime: eventTime)
+            upsert(target: target.scoped(to: event.source), updatesPosition: targetPatch.updatesTargetPosition,
+                   into: &state, eventTime: eventTime)
             state.lastValidTargets = state.filteredTargets
         case .update(let patch):
             _ = apply(patch: patch, to: &state, eventTime: eventTime)
+        case .home:
+            break
+        case .room:
+            break
         }
         states[event.source] = state
     }
@@ -51,9 +74,11 @@ struct RadarStateStore {
     mutating func resetRuntimeState() {
         for source in RadarSource.allCases {
             let config = currentConfig(for: source)
-            states[source] = RadarRoomState(source: source, config: config)
+            states[source] = RadarSourceState(source: source, config: config)
         }
         unknownDiagnostics.removeAll()
+        roomStates.removeAll()
+        homeState = RadarHomeState()
     }
 
     mutating func setConfig(_ config: RadarRoomConfig, for source: RadarSource) {
@@ -98,6 +123,24 @@ struct RadarStateStore {
                                zoneConfig: state.zoneConfig)
     }
 
+    private func patchDeviceID(for event: RadarLogEvent) -> String? {
+        switch event.kind {
+        case .frameStarted(let patch), .update(let patch): return patch.deviceID
+        case .target(_, let patch): return patch.deviceID
+        case .home: return nil
+        case .room: return nil
+        }
+    }
+
+    private func patchRoomID(for event: RadarLogEvent) -> String? {
+        switch event.kind {
+        case .frameStarted(let patch), .update(let patch): return patch.roomID
+        case .target(_, let patch): return patch.roomID
+        case .home: return nil
+        case .room: return nil
+        }
+    }
+
     private mutating func appendUnknown(_ event: RadarLogEvent, timestampMilliseconds: Int64) {
         let identity = RadarSource.identify(in: event.rawLine)
         unknownDiagnostics.append(UnknownRadarDiagnostic(rawSummary: String(event.rawLine.prefix(240)),
@@ -116,7 +159,7 @@ struct RadarStateStore {
     }
 
     private func apply(patch: RadarStatePatch,
-                       to state: inout RadarRoomState,
+                       to state: inout RadarSourceState,
                        eventTime: Int64) -> Bool {
         applyHealth(patch: patch, to: &state)
         guard patch.isValidFrame else { return true }
@@ -138,18 +181,60 @@ struct RadarStateStore {
         state.freshnessState = .fresh
         state.online = patch.online ?? true
         if let targetCount = patch.targetCount { state.targetCount = targetCount }
+        if let visibleTrackCount = patch.visibleTrackCount {
+            state.visibleTrackCount = visibleTrackCount
+            state.targetCount = visibleTrackCount
+        }
         if let presenceState = patch.presenceState { state.presenceState = presenceState }
         if let motionState = patch.motionState { state.motionState = motionState }
         if let spatialState = patch.spatialState { state.spatialState = spatialState }
         return true
     }
 
-    private func applyHealth(patch: RadarStatePatch, to state: inout RadarRoomState) {
+    private func applyHealth(patch: RadarStatePatch, to state: inout RadarSourceState) {
         if let online = patch.online { state.online = online }
         if let connectionType = patch.connectionType { state.connectionType = connectionType }
         if let deviceID = patch.deviceID, !deviceID.isEmpty { state.deviceId = deviceID }
+        if let roomID = patch.roomID, !roomID.isEmpty { state.roomId = roomID }
         if let sensorState = patch.sensorState { state.sensorState = sensorState }
         if let occupancyState = patch.occupancyState { state.occupancyState = occupancyState }
+        if let rawTargetCount = patch.rawTargetCount {
+            state.rawTargetCount = rawTargetCount
+            state.hasExplicitCountSummary = true
+        }
+        if let acceptedTargetCount = patch.acceptedTargetCount {
+            state.acceptedTargetCount = acceptedTargetCount
+            state.hasExplicitCountSummary = true
+        }
+        if let visibleTrackCount = patch.visibleTrackCount {
+            state.visibleTrackCount = visibleTrackCount
+            state.targetCount = visibleTrackCount
+            state.hasExplicitCountSummary = true
+        }
+        if let confirmedActiveTrackCount = patch.confirmedActiveTrackCount {
+            state.confirmedActiveTrackCount = confirmedActiveTrackCount
+            state.hasExplicitCountSummary = true
+        }
+        if let historyTargetCount = patch.historyTargetCount {
+            state.historyTargetCount = historyTargetCount
+            state.hasExplicitCountSummary = true
+        }
+        if let visiblePersonCount = patch.visiblePersonCount {
+            state.visiblePersonCount = visiblePersonCount
+            state.hasExplicitCountSummary = true
+        }
+        if let retainedPersonCount = patch.retainedPersonCount {
+            state.retainedPersonCount = retainedPersonCount
+            state.hasExplicitCountSummary = true
+        }
+        if let sourcePersonCount = patch.sourcePersonCount {
+            state.sourcePersonCount = sourcePersonCount
+            state.hasExplicitCountSummary = true
+        }
+        if let countState = patch.countState {
+            state.countState = countState.uppercased()
+            state.hasExplicitCountSummary = true
+        }
         if let parserErrors = patch.parserErrors { state.parseErrorCount = max(state.parseErrorCount, parserErrors) }
         if let sequenceRejects = patch.sequenceRejects { state.sequenceRejectCount = max(state.sequenceRejectCount, sequenceRejects) }
         if let identityMismatches = patch.identityMismatches { state.identityMismatchCount = max(state.identityMismatchCount, identityMismatches) }
@@ -177,7 +262,7 @@ struct RadarStateStore {
 
     private func upsert(target: RadarTarget,
                         updatesPosition: Bool,
-                        into state: inout RadarRoomState,
+                        into state: inout RadarSourceState,
                         eventTime: Int64) {
         guard updatesPosition else {
             // A disappearance/raw-slot report must never overwrite or delete the last accepted position.
@@ -205,6 +290,7 @@ struct RadarStateStore {
                                                       lastSeenMs: Int64(stale.lastSeenTime.timeIntervalSince1970 * 1_000))
             state.targetCount = state.filteredTargets.filter(\.isVisible).count
             state.stableTargetCount = state.targetCount
+            applyTrackOnlyCountFallback(to: &state)
             return
         }
 
@@ -236,6 +322,7 @@ struct RadarStateStore {
         state.targetDisappearanceMilliseconds[accepted.trackID] = eventTime
         state.targetCount = state.filteredTargets.filter(\.isVisible).count
         state.stableTargetCount = state.targetCount
+        applyTrackOnlyCountFallback(to: &state)
         state.lastValidTargets = state.filteredTargets
         if state.targetCount > 0 && state.presenceState == .unknown {
             state.presenceState = accepted.speedCentimetersPerSecond == 0 ? .hold : .motion
@@ -252,5 +339,17 @@ struct RadarStateStore {
             targets.append(target)
             targets.sort { $0.trackID < $1.trackID }
         }
+    }
+
+    private func applyTrackOnlyCountFallback(to state: inout RadarSourceState) {
+        guard !state.hasExplicitCountSummary else { return }
+
+        // A legacy track line has no person-continuity evidence.  Keep the
+        // visual track metric useful without inventing person observations.
+        state.visibleTrackCount = state.targetCount
+        state.visiblePersonCount = 0
+        state.retainedPersonCount = 0
+        state.sourcePersonCount = 0
+        state.countState = "UNKNOWN"
     }
 }

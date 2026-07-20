@@ -47,6 +47,7 @@ radar_remote_ingest_result_t radar_remote_ingest_admit(
     radar_registry_update_result_t update =
         radar_registry_update_remote(source,
                                      payload,
+                                     NULL,
                                      identity->session_generation,
                                      received_at_ms,
                                      out_state_changed);

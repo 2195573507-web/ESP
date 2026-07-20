@@ -85,6 +85,20 @@ static inline UBaseType_t app_stack_monitor_log(const char *tag,
     return high_water;
 }
 
+static inline void app_stack_monitor_report(const char *tag,
+                                            const char *task_name,
+                                            size_t configured_stack_bytes,
+                                            const char *stage)
+{
+    const UBaseType_t high_water = app_stack_monitor_high_water();
+    ESP_LOGI(app_stack_monitor_safe_text(tag),
+             "TASK_STACK_REPORT task=%s stack_bytes=%u high_water_bytes=%u stage=%s",
+             app_stack_monitor_safe_text(task_name),
+             (unsigned int)configured_stack_bytes,
+             (unsigned int)high_water,
+             app_stack_monitor_safe_text(stage));
+}
+
 static inline UBaseType_t app_stack_monitor_log_periodic(const char *tag,
                                                          const char *task_name,
                                                          int64_t *last_log_ms,

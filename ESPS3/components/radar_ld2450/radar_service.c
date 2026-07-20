@@ -5,8 +5,10 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -52,6 +54,9 @@ static uint32_t s_processed_rx_bytes;
 
 #define RADAR_RAW_HEX_LOG_MAX_BYTES 256U
 #define RADAR_RAW_HEX_LOG_INTERVAL_MS 1000U
+#define RADAR_S3_LOG_IDENTITY_FORMAT \
+    " source_id=0 source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local sequence=%lu"
+#define RADAR_S3_LOG_IDENTITY_ARGS (unsigned long)s_snapshot_updates
 
 static void handle_frame(const radar_frame_t *frame, void *ctx);
 
@@ -74,11 +79,12 @@ static void log_raw_rx_hex(const uint8_t *data, size_t data_len, uint64_t timest
                                 ? RADAR_RAW_HEX_LOG_MAX_BYTES
                                 : data_len;
     ESP_LOGI(TAG,
-             "RADAR_RAW_FRAME: len=%u timestamp_ms=%llu dump_len=%u%s",
+             "RADAR_RX_FRAME event=raw_hex len=%u timestamp_ms=%llu dump_len=%u%s" RADAR_S3_LOG_IDENTITY_FORMAT,
              (unsigned int)data_len,
              (unsigned long long)timestamp_ms,
              (unsigned int)dump_len,
-             data_len > dump_len ? " (truncated)" : "");
+             data_len > dump_len ? " (truncated)" : "",
+             RADAR_S3_LOG_IDENTITY_ARGS);
 
     for (size_t offset = 0U; offset < dump_len; offset += 16U) {
         char hex_line[16U * 3U];
@@ -94,7 +100,10 @@ static void log_raw_rx_hex(const uint8_t *data, size_t data_len, uint64_t timest
             }
             written += (size_t)count;
         }
-        ESP_LOGI(TAG, "%s", hex_line);
+        ESP_LOGI(TAG,
+                 "RADAR_RX_FRAME event=raw_hex_data bytes=%s" RADAR_S3_LOG_IDENTITY_FORMAT,
+                 hex_line,
+                 RADAR_S3_LOG_IDENTITY_ARGS);
     }
     last_log_ms = timestamp_ms;
 }
@@ -233,19 +242,24 @@ static void apply_recovery_transition(uint64_t timestamp_ms)
             xSemaphoreGive(s_lock);
         }
         ESP_LOGW(TAG,
-                 "UART recovery snapshot partial=%lu skipped=%lu last_rx_ms=%llu",
+                 "RADAR_SOURCE_STATE event=uart_recovery_snapshot partial=%lu skipped=%lu last_rx_ms=%llu" RADAR_S3_LOG_IDENTITY_FORMAT,
                  (unsigned long)diagnostics.partial_length,
                  (unsigned long)diagnostics.skipped_bytes,
-                 (unsigned long long)s_last_rx_byte_ms);
+                 (unsigned long long)s_last_rx_byte_ms,
+                 RADAR_S3_LOG_IDENTITY_ARGS);
         const esp_err_t flush_ret = ld2450_uart_flush();
         const esp_err_t ret = ld2450_uart_deinit();
         if (flush_ret != ESP_OK) {
-            ESP_LOGW(TAG, "UART recovery FIFO flush failed ret=%d", (int)flush_ret);
+            ESP_LOGW(TAG,
+                     "RADAR_SOURCE_STATE event=uart_recovery_flush_failed ret=%d" RADAR_S3_LOG_IDENTITY_FORMAT,
+                     (int)flush_ret,
+                     RADAR_S3_LOG_IDENTITY_ARGS);
         }
         if (ret != ESP_OK) {
             ESP_LOGW(TAG,
-                     "UART recovery deinit failed ret=%d; keeping backoff",
-                     (int)ret);
+                     "RADAR_SOURCE_STATE event=uart_recovery_deinit_failed ret=%d backoff=1" RADAR_S3_LOG_IDENTITY_FORMAT,
+                     (int)ret,
+                     RADAR_S3_LOG_IDENTITY_ARGS);
             if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
                 radar_uart_recovery_note_init_result(&s_recovery, false, timestamp_ms);
                 s_uart_healthy = false;
@@ -283,9 +297,14 @@ static void retry_uart_if_due(uint64_t timestamp_ms)
         xSemaphoreGive(s_lock);
     }
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "UART recovery reinitialized; awaiting consecutive valid frames");
+        ESP_LOGI(TAG,
+                 "RADAR_SOURCE_STATE event=uart_recovery_reinitialized awaiting_valid_frames=1" RADAR_S3_LOG_IDENTITY_FORMAT,
+                 RADAR_S3_LOG_IDENTITY_ARGS);
     } else {
-        ESP_LOGW(TAG, "UART recovery init failed ret=%d; retry remains backoff", (int)ret);
+        ESP_LOGW(TAG,
+                 "RADAR_SOURCE_STATE event=uart_recovery_init_failed ret=%d backoff=1" RADAR_S3_LOG_IDENTITY_FORMAT,
+                 (int)ret,
+                 RADAR_S3_LOG_IDENTITY_ARGS);
     }
 }
 
@@ -305,14 +324,16 @@ static void radar_rx_task(void *arg)
     uint8_t read_buffer[RADAR_CONFIG_UART_READ_BYTES];
 
     ESP_LOGI(TAG,
-             "RADAR_UART_CONFIG baud=%d rx_buf=%d timeout_ms=%u",
+             "RADAR_SOURCE_STATE event=uart_config baud=%d rx_buf=%d timeout_ms=%u" RADAR_S3_LOG_IDENTITY_FORMAT,
              RADAR_CONFIG_UART_BAUD_RATE,
              RADAR_CONFIG_UART_RX_RING_BYTES,
-             (unsigned int)RADAR_CONFIG_UART_READ_TIMEOUT_MS);
+             (unsigned int)RADAR_CONFIG_UART_READ_TIMEOUT_MS,
+             RADAR_S3_LOG_IDENTITY_ARGS);
     ESP_LOGI(TAG,
-             "RX task started read_bytes=%u timeout_ms=%u",
+             "RADAR_SOURCE_STATE event=rx_task_started read_bytes=%u timeout_ms=%u" RADAR_S3_LOG_IDENTITY_FORMAT,
              (unsigned int)sizeof(read_buffer),
-             (unsigned int)RADAR_CONFIG_UART_READ_TIMEOUT_MS);
+             (unsigned int)RADAR_CONFIG_UART_READ_TIMEOUT_MS,
+             RADAR_S3_LOG_IDENTITY_ARGS);
 
     while (true) {
         if (config_is_active()) {
@@ -425,12 +446,13 @@ esp_err_t radar_service_start(void)
         xSemaphoreGive(s_lock);
     }
 
-    BaseType_t created = xTaskCreate(radar_rx_task,
-                                     "radar_rx",
-                                     RADAR_CONFIG_UART_RX_TASK_STACK,
-                                     NULL,
-                                     RADAR_CONFIG_UART_RX_TASK_PRIORITY,
-                                     &s_rx_task);
+    BaseType_t created = xTaskCreateWithCaps(radar_rx_task,
+                                             "radar_rx",
+                                             RADAR_CONFIG_UART_RX_TASK_STACK,
+                                             NULL,
+                                             RADAR_CONFIG_UART_RX_TASK_PRIORITY,
+                                             &s_rx_task,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         s_rx_task = NULL;
         (void)ld2450_uart_deinit();
@@ -438,13 +460,14 @@ esp_err_t radar_service_start(void)
     }
 
     ESP_LOGI(TAG,
-             "UART init port=%d tx=%d rx=%d baud=%d format=8N1 ret=%d ring=%d",
+             "RADAR_SOURCE_STATE event=uart_init port=%d tx=%d rx=%d baud=%d format=8N1 ret=%d ring=%d" RADAR_S3_LOG_IDENTITY_FORMAT,
              RADAR_CONFIG_UART_PORT_INDEX,
              RADAR_CONFIG_UART_TX_GPIO,
              RADAR_CONFIG_UART_RX_GPIO,
              RADAR_CONFIG_UART_BAUD_RATE,
              (int)ret,
-             RADAR_CONFIG_UART_RX_RING_BYTES);
+             RADAR_CONFIG_UART_RX_RING_BYTES,
+             RADAR_S3_LOG_IDENTITY_ARGS);
     return ret == ESP_OK ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 

@@ -16,6 +16,7 @@
 #include "bme_cache_manager.h"
 #include "cJSON.h"
 #include "child_registry.h"
+#include "environment_alarm_adapter.h"
 #include "esp111_protocol_common.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -888,6 +889,17 @@ esp_err_t sensor_aggregator_handle_envelope(const protocol_adapter_envelope_t *e
                  result->error_code,
                  status,
                  esp_err_to_name(ret));
+    }
+
+    if (kind == PROTOCOL_ADAPTER_MESSAGE_SENSOR_BME690) {
+        const esp_err_t alarm_ret = environment_alarm_adapter_ingest(envelope);
+        if (alarm_ret != ESP_OK && alarm_ret != ESP_ERR_NO_MEM &&
+            alarm_ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG,
+                     "environment alarm adapter deferred device_id=%s ret=%s",
+                     envelope->device_id,
+                     esp_err_to_name(alarm_ret));
+        }
     }
 
     sensor_aggregator_upload_snapshot();

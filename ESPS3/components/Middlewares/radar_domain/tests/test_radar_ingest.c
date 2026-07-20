@@ -157,7 +157,18 @@ static void test_source_isolation_and_freshness(void)
         .uart_online = true,
         .frame_fresh = true,
     };
-    assert(radar_registry_update_local(&local, NULL, 8000U, &changed));
+    const radar_count_summary_t local_counts = {
+        .raw_target_count = 1U,
+        .accepted_target_count = 1U,
+        .visible_track_count = 0U,
+        .confirmed_active_track_count = 1U,
+        .history_target_count = 7U,
+        .visible_person_count = 0U,
+        .retained_person_count = 1U,
+        .source_person_count = 1U,
+        .count_state = RADAR_PERSON_COUNT_ESTIMATED,
+    };
+    assert(radar_registry_update_local(&local, &local_counts, NULL, 8000U, &changed));
 
     radar_registry_note_parse_error(RADAR_SOURCE_C51);
     radar_registry_refresh(8001U);
@@ -174,7 +185,64 @@ static void test_source_isolation_and_freshness(void)
     assert(c52_entry.source_online);
     assert(local_entry.snapshot.state == RADAR_STATE_HOLD);
     assert(local_entry.source_online);
+    assert(local_entry.count_summary.source_person_count == 1U);
+    assert(local_entry.count_summary.retained_person_count == 1U);
+    assert(local_entry.count_summary.history_target_count == 7U);
+    assert(local_entry.count_summary.count_state == RADAR_PERSON_COUNT_ESTIMATED);
     assert(c51_entry.diagnostics.parse_error_count == 1U);
+
+    /* HOME is rebuilt from source snapshots.  The required S3_LOCAL + C52
+     * case must never retain C51 or a previous active source. */
+    const radar_count_summary_t c51_counts = {
+        .raw_target_count = 1U,
+        .accepted_target_count = 1U,
+        .visible_track_count = 1U,
+        .confirmed_active_track_count = 1U,
+        .visible_person_count = 2U,
+        .retained_person_count = 2U,
+        .source_person_count = 2U,
+        .count_state = RADAR_PERSON_COUNT_OBSERVED,
+    };
+    radar_protocol_payload_t c51 = payload(1U, 2U, 9000U, RADAR_STATE_VACANT_INFERRED);
+    assert(radar_registry_update_remote(RADAR_SOURCE_C51, &c51, &c51_counts,
+                                        1U, 9000U, &changed) ==
+           RADAR_REGISTRY_UPDATE_ACCEPTED);
+    c52 = payload(2U, 2U, 9000U, RADAR_STATE_PRESENT);
+    const radar_count_summary_t c52_counts = {
+        .raw_target_count = 1U,
+        .accepted_target_count = 1U,
+        .visible_track_count = 1U,
+        .confirmed_active_track_count = 1U,
+        .visible_person_count = 1U,
+        .source_person_count = 1U,
+        .count_state = RADAR_PERSON_COUNT_OBSERVED,
+    };
+    assert(radar_registry_update_remote(RADAR_SOURCE_C52, &c52, &c52_counts,
+                                        2U, 9000U, &changed) ==
+           RADAR_REGISTRY_UPDATE_ACCEPTED);
+    local.state = RADAR_STATE_PRESENT;
+    local.state_since_ms = 9000U;
+    const radar_count_summary_t s3_counts = {
+        .visible_person_count = 1U,
+        .source_person_count = 1U,
+        .count_state = RADAR_PERSON_COUNT_OBSERVED,
+    };
+    assert(radar_registry_update_local(&local, &s3_counts, NULL, 9000U, &changed));
+    RadarHomeState home = {0};
+    radar_registry_get_home_state(&home);
+    assert(home.occupied_room_count == 2U);
+    assert(home.home_person_count == 2U);
+    assert(home.occupied_rooms[0].source_id == RADAR_SOURCE_S3_LOCAL);
+    assert(strcmp(home.occupied_rooms[0].room_id, "s3_local") == 0);
+    assert(home.occupied_rooms[1].source_id == RADAR_SOURCE_C52);
+    assert(strcmp(home.occupied_rooms[1].room_id, "bedroom") == 0);
+    const RadarSourceContext *c52_context = radar_source_context_get(RADAR_SOURCE_C52);
+    const RadarSourceContext *s3_context = radar_source_context_get(RADAR_SOURCE_S3_LOCAL);
+    assert(c52_context != NULL && s3_context != NULL);
+    assert(c52_context->presence_state == RADAR_STATE_PRESENT);
+    assert(c52_context->state_version > 0U);
+    assert(c52_context->last_update_timestamp == 9000U);
+    assert(s3_context->presence_state == RADAR_STATE_PRESENT);
 }
 
 int main(void)

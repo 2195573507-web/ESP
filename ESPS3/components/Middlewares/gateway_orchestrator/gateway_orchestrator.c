@@ -13,7 +13,8 @@
 #include "child_registry.h"
 #include "command_router.h"
 #include "device_stream_gateway.h"
-#include "esp_check.h"
+#include "environment_alarm_adapter.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "gateway_config.h"
 #include "gateway_event_reporter.h"
@@ -35,46 +36,104 @@
 
 static const char *TAG = "gateway_main";
 
+static void startup_memory_check(const char *module)
+{
+    ESP_LOGI(TAG,
+             "STARTUP_MEMORY_CHECK module=%s internal_free=%u internal_largest=%u psram_free=%u",
+             module != NULL ? module : "unknown",
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
+
+static void startup_module_result(const char *module, esp_err_t ret)
+{
+    startup_memory_check(module);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "module disabled module=%s ret=%s", module, esp_err_to_name(ret));
+    }
+}
+
 void gateway_orchestrator_start(void)
 {
     app_stack_monitor_log(TAG, "gateway_startup_task", "orchestrator_enter");
     app_stack_monitor_log(TAG, "gateway_orchestrator", "orchestrator_enter");
     gateway_config_log_boot_profile();
 
-    /*
-     * 启动顺序：
-     * 1. 先初始化本地状态和 Server-facing helper；
-     * 2. 在任何 ingress 入队前初始化 scheduler；
-     * 3. 打开本地服务前先启动 Wi-Fi 和 network state worker；
-     * 4. HTTP/UDP ingress 交付 work 前先启动 scheduler worker。
-     */
-    offline_policy_init();
-    gateway_event_reporter_init();
-    ESP_ERROR_CHECK(bme_cache_manager_init());
-    ESP_ERROR_CHECK(child_registry_init());
-    ESP_ERROR_CHECK(command_router_init());
-    sensor_aggregator_init();
-    ESP_ERROR_CHECK(smart_home_gateway_init());
-    ESP_ERROR_CHECK(voice_proxy_init());
-    ESP_ERROR_CHECK(wake_prompt_cache_gateway_init());
-    ESP_ERROR_CHECK(device_stream_gateway_init());
-    ESP_ERROR_CHECK(resource_manager_init());
-    ESP_ERROR_CHECK(radar_registry_init() ? ESP_OK : ESP_ERR_NO_MEM);
-    ESP_ERROR_CHECK(radar_ingest_start());
-    ESP_ERROR_CHECK(s3_scheduler_init());
-    ESP_ERROR_CHECK(network_worker_init());
-    ESP_ERROR_CHECK(network_replay_worker_init());
-
-    ESP_ERROR_CHECK(gateway_wifi_start());
+    startup_memory_check("wifi.before");
+    startup_memory_check("event_loop.before");
+    esp_err_t wifi_ret = gateway_wifi_start();
+    startup_module_result("event_loop.after", wifi_ret);
+    startup_module_result("wifi.after", wifi_ret);
     app_stack_monitor_log(TAG, "gateway_startup_task", "after_gateway_wifi_start");
     app_stack_monitor_log(TAG, "gateway_orchestrator", "after_gateway_wifi_start");
 
-    ESP_ERROR_CHECK(s3_scheduler_start());
-    ESP_ERROR_CHECK(radar_local_adapter_start());
-    ESP_ERROR_CHECK(radar_diagnostics_start());
-    /* local HTTP is owned by network_worker after it has observed SoftAP ready. */
-    ESP_ERROR_CHECK(network_worker_enable_local_http_server());
-    ESP_ERROR_CHECK(device_stream_gateway_start());
+    /* Phase 1: prepare the no-task runtime queue before network callbacks publish state. */
+    const esp_err_t resource_ret = resource_manager_init();
+    const esp_err_t scheduler_init_ret = resource_ret == ESP_OK ? s3_scheduler_init() : resource_ret;
+
+    /* Phase 1: connectivity.  The worker retains its own HTTP retry policy. */
+    startup_memory_check("network_worker.before");
+    const esp_err_t network_worker_ret = network_worker_init();
+    startup_module_result("network_worker.after", network_worker_ret);
+    startup_memory_check("local_http.before");
+    const esp_err_t local_http_ret = network_worker_ret == ESP_OK
+        ? network_worker_enable_local_http_server() : ESP_ERR_INVALID_STATE;
+    startup_module_result("local_http.after", local_http_ret);
+
+    /* Phase 2: sensors.  A failed sensor is isolated from the gateway core. */
+    startup_memory_check("radar.before");
+    const esp_err_t radar_registry_ret = radar_registry_init() ? ESP_OK : ESP_ERR_NO_MEM;
+    const esp_err_t radar_ingest_ret = radar_registry_ret == ESP_OK
+        ? radar_ingest_start() : radar_registry_ret;
+    const esp_err_t radar_local_ret = radar_ingest_ret == ESP_OK
+        ? radar_local_adapter_start() : radar_ingest_ret;
+    startup_module_result("radar.after", radar_local_ret);
+
+    startup_memory_check("BME.before");
+    const esp_err_t bme_ret = bme_cache_manager_init();
+    startup_module_result("BME.after", bme_ret);
+
+    /* Lightweight state-only services do not allocate task stacks. */
+    offline_policy_init();
+    gateway_event_reporter_init();
+    startup_memory_check("command.before");
+    const esp_err_t child_registry_ret = child_registry_init();
+    const esp_err_t command_ret = child_registry_ret == ESP_OK
+        ? command_router_init() : child_registry_ret;
+    startup_module_result("command.after", command_ret);
+    sensor_aggregator_init();
+
+    /* Phase 3: analysis and dispatch. */
+    startup_memory_check("radar_diagnostics.before");
+    const esp_err_t radar_diagnostics_ret = radar_local_ret == ESP_OK
+        ? radar_diagnostics_start() : radar_local_ret;
+    startup_module_result("radar_diagnostics.after", radar_diagnostics_ret);
+
+    startup_memory_check("environment_alarm.before");
+    const esp_err_t environment_alarm_ret = environment_alarm_adapter_init();
+    startup_module_result("environment_alarm.after", environment_alarm_ret);
+
+    startup_memory_check("scheduler.before");
+    const esp_err_t scheduler_ret = scheduler_init_ret == ESP_OK ? s3_scheduler_start() : scheduler_init_ret;
+    startup_module_result("scheduler.after", scheduler_ret);
+
+    startup_memory_check("reporter.before");
+    const esp_err_t smart_home_ret = smart_home_gateway_init();
+    const esp_err_t wake_prompt_ret = smart_home_ret == ESP_OK
+        ? wake_prompt_cache_gateway_init() : smart_home_ret;
+    const esp_err_t replay_ret = wake_prompt_ret == ESP_OK
+        ? network_replay_worker_init() : wake_prompt_ret;
+    const esp_err_t device_stream_init_ret = replay_ret == ESP_OK
+        ? device_stream_gateway_init() : replay_ret;
+    const esp_err_t device_stream_ret = device_stream_init_ret == ESP_OK && scheduler_ret == ESP_OK
+        ? device_stream_gateway_start() : (device_stream_init_ret != ESP_OK ? device_stream_init_ret : scheduler_ret);
+    startup_module_result("reporter.after", device_stream_ret);
+
+    /* Phase 4: voice is intentionally last because it owns the largest request stack. */
+    startup_memory_check("voice.before");
+    const esp_err_t voice_ret = voice_proxy_init();
+    startup_module_result("voice.after", voice_ret);
     app_stack_monitor_log(TAG, "gateway_startup_task", "scheduler_started");
     app_stack_monitor_log(TAG, "gateway_orchestrator", "services_started");
 

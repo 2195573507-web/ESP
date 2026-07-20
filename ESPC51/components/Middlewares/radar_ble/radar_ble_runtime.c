@@ -37,7 +37,10 @@ static void process_task(void *arg)
         if (status.state != s_last_state) {
             s_last_state = status.state;
             ESP_LOGI(TAG,
-                     "radar_ble_state local_id=%u state=%s link_online=%u",
+                     "RADAR_SOURCE_STATE event=ble_state source_id=%u source=C51 device_id=%s room=%s sequence=0 local_id=%u state=%s link_online=%u",
+                     (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
+                     RADAR_BLE_BINDING_DEVICE_ID,
+                     RADAR_BLE_BINDING_ROOM_ID,
                      (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
                      radar_ble_state_name(status.state),
                      link_online ? 1U : 0U);
@@ -70,7 +73,10 @@ esp_err_t radar_ble_runtime_start(void)
     const int transport_ret = radar_ble_transport_start(notify_cb, NULL);
     if (transport_ret != 0) {
         ESP_LOGW(TAG,
-                 "radar_ble_unavailable local_id=%u reason=BLOCKED_BY_RADAR_GATT_UUID ret=%d",
+                 "RADAR_SOURCE_STATE event=ble_unavailable source_id=%u source=C51 device_id=%s room=%s sequence=0 local_id=%u reason=BLOCKED_BY_RADAR_GATT_UUID ret=%d",
+                 (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
+                 RADAR_BLE_BINDING_DEVICE_ID,
+                 RADAR_BLE_BINDING_ROOM_ID,
                  (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
                  transport_ret);
     }

@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #endif
@@ -24,11 +25,13 @@
 
 typedef struct {
     bool pending;
+    RadarSourceContext *context;
     radar_gateway_sample_t sample;
 } radar_ingest_pending_t;
 
 typedef struct {
     uint64_t recorded_at_ms;
+    radar_source_id_t source_id;
     uint8_t local_id;
     uint32_t request_sequence;
     uint32_t frame_seq;
@@ -37,9 +40,9 @@ typedef struct {
 } radar_ingest_history_entry_t;
 
 static radar_ingest_pending_t s_pending[RADAR_GATEWAY_MAX_REMOTE_SOURCES];
-static radar_ingest_history_entry_t *s_history;
-static uint16_t s_history_head;
-static uint16_t s_history_count;
+static radar_ingest_history_entry_t *s_history[RADAR_INGEST_REMOTE_SOURCE_COUNT];
+static uint16_t s_history_head[RADAR_INGEST_REMOTE_SOURCE_COUNT];
+static uint16_t s_history_count[RADAR_INGEST_REMOTE_SOURCE_COUNT];
 static bool s_started;
 #ifndef RADAR_INGEST_HOST_TEST
 static const char *TAG = "radar_ingest";
@@ -47,17 +50,47 @@ static StaticSemaphore_t s_lock_storage;
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_worker;
 #else
-static radar_ingest_history_entry_t s_history_host[RADAR_INGEST_HISTORY_DEPTH];
+static radar_ingest_history_entry_t
+    s_history_host[RADAR_INGEST_REMOTE_SOURCE_COUNT][RADAR_INGEST_HISTORY_DEPTH_PER_SOURCE];
 #endif
 
 #ifndef RADAR_INGEST_HOST_TEST
 static const char *source_name(uint8_t local_id)
 {
-    switch (local_id) {
-    case 1U: return "C51";
-    case 2U: return "C52";
-    default: return "unknown";
-    }
+    return radar_source_context_source_name(radar_registry_source_for_local_id(local_id));
+}
+
+static const char *source_device_id(uint8_t local_id)
+{
+    const char *device_id = radar_registry_device_id(radar_registry_source_for_local_id(local_id));
+    return device_id != NULL ? device_id : "";
+}
+
+static const char *source_room_id(uint8_t local_id)
+{
+    const char *room_id = radar_registry_room_id(radar_registry_source_for_local_id(local_id));
+    return room_id != NULL ? room_id : "";
+}
+
+static uint32_t source_sequence(uint8_t local_id)
+{
+    const RadarSourceContext *context = radar_source_context_get(
+        radar_registry_source_for_local_id(local_id));
+    return context != NULL ? context->sequence : 0U;
+}
+
+static void log_drop(const char *reason, uint8_t local_id)
+{
+    const radar_source_id_t source = radar_registry_source_for_local_id(local_id);
+    ESP_LOGW(TAG,
+             "RADAR_RX_FRAME event=drop reason=%s source_id=%u source=%s device_id=%s room=%s local_id=%u sequence=%lu",
+             reason != NULL ? reason : "unknown",
+             (unsigned int)source,
+             source_name(local_id),
+             source_device_id(local_id)[0] != '\0' ? source_device_id(local_id) : "unknown",
+             source_room_id(local_id)[0] != '\0' ? source_room_id(local_id) : "unknown",
+             (unsigned int)local_id,
+             (unsigned long)source_sequence(local_id));
 }
 #endif
 
@@ -171,17 +204,21 @@ static radar_ingest_result_t parse_json(const char *json,
 
     cJSON *value = cJSON_GetObjectItemCaseSensitive(root, "v");
     static const char *const value_keys[] = {
-        "device_id", "link_state", "sample_valid", "frame_seq", "frame_uptime_ms", "target_count", "targets"
+        "device_id", "room_id", "link_state", "sample_valid", "frame_seq", "frame_uptime_ms", "target_count", "targets"
     };
     if (!object_has_exact_keys(value, value_keys, sizeof(value_keys) / sizeof(value_keys[0]))) {
         cJSON_Delete(root);
         return RADAR_INGEST_INVALID_SCHEMA;
     }
     cJSON *device_id = cJSON_GetObjectItemCaseSensitive(value, "device_id");
+    cJSON *room_id = cJSON_GetObjectItemCaseSensitive(value, "room_id");
     const radar_source_id_t source = radar_registry_source_for_local_id(out->local_id);
     const char *expected_device_id = radar_registry_device_id(source);
+    const char *expected_room_id = radar_registry_room_id(source);
     if (!cJSON_IsString(device_id) || device_id->valuestring == NULL || source == RADAR_SOURCE_COUNT ||
-        expected_device_id == NULL || strcmp(device_id->valuestring, expected_device_id) != 0) {
+        expected_device_id == NULL || strcmp(device_id->valuestring, expected_device_id) != 0 ||
+        !cJSON_IsString(room_id) || room_id->valuestring == NULL || expected_room_id == NULL ||
+        strcmp(room_id->valuestring, expected_room_id) != 0) {
         cJSON_Delete(root);
         return RADAR_INGEST_IDENTITY_MISMATCH;
     }
@@ -256,18 +293,28 @@ static void ingest_unlock(void)
 
 static void record_history(const radar_gateway_sample_t *sample, uint64_t now_ms)
 {
-    if (sample == NULL || s_history == NULL || !ingest_lock()) return;
-    s_history[s_history_head] = (radar_ingest_history_entry_t){
+    if (sample == NULL || sample->local_id == 0U ||
+        sample->local_id > RADAR_INGEST_REMOTE_SOURCE_COUNT || !ingest_lock()) return;
+    const size_t source_index = sample->local_id - 1U;
+    if (s_history[source_index] == NULL) {
+        ingest_unlock();
+        return;
+    }
+    s_history[source_index][s_history_head[source_index]] = (radar_ingest_history_entry_t){
         .recorded_at_ms = now_ms,
+        .source_id = radar_registry_source_for_local_id(sample->local_id),
         .local_id = sample->local_id,
         .request_sequence = sample->request_sequence,
         .frame_seq = sample->frame_seq,
         .target_count = sample->target_count,
     };
-    memcpy(s_history[s_history_head].targets, sample->targets,
-           sizeof(s_history[s_history_head].targets));
-    s_history_head = (uint16_t)((s_history_head + 1U) % RADAR_INGEST_HISTORY_DEPTH);
-    if (s_history_count < RADAR_INGEST_HISTORY_DEPTH) ++s_history_count;
+    memcpy(s_history[source_index][s_history_head[source_index]].targets, sample->targets,
+           sizeof(s_history[source_index][s_history_head[source_index]].targets));
+    s_history_head[source_index] = (uint16_t)((s_history_head[source_index] + 1U) %
+                                               RADAR_INGEST_HISTORY_DEPTH_PER_SOURCE);
+    if (s_history_count[source_index] < RADAR_INGEST_HISTORY_DEPTH_PER_SOURCE) {
+        ++s_history_count[source_index];
+    }
     ingest_unlock();
 }
 
@@ -281,6 +328,14 @@ void radar_ingest_process_pending(uint64_t now_ms)
 
     for (size_t index = 0U; index < RADAR_GATEWAY_MAX_REMOTE_SOURCES; ++index) {
         if (!pending[index].pending) continue;
+        const radar_source_id_t source = radar_registry_source_for_local_id(
+            pending[index].sample.local_id);
+        if (pending[index].context == NULL || pending[index].context->source_id != source) {
+#ifndef RADAR_INGEST_HOST_TEST
+            log_drop("source_context_mismatch", pending[index].sample.local_id);
+#endif
+            continue;
+        }
         radar_gateway_output_t output = {0};
         const radar_gateway_ingest_result_t result =
             radar_gateway_ingest_admit(&pending[index].sample, 1U, now_ms, &output);
@@ -289,8 +344,7 @@ void radar_ingest_process_pending(uint64_t now_ms)
         }
 #ifndef RADAR_INGEST_HOST_TEST
         if (result != RADAR_GATEWAY_INGEST_ACCEPTED && result != RADAR_GATEWAY_INGEST_DUPLICATE) {
-            ESP_LOGW(TAG, "RADAR_REMOTE_RADAR_DROP reason=%s",
-                     radar_gateway_ingest_result_name(result));
+            log_drop(radar_gateway_ingest_result_name(result), pending[index].sample.local_id);
         }
 #else
         (void)result;
@@ -321,27 +375,35 @@ esp_err_t radar_ingest_start(void)
     if (s_started) return ESP_OK;
     if (radar_gateway_ingest_start() != ESP_OK) return ESP_ERR_NO_MEM;
     memset(s_pending, 0, sizeof(s_pending));
-    s_history_head = 0U;
-    s_history_count = 0U;
+    memset(s_history_head, 0, sizeof(s_history_head));
+    memset(s_history_count, 0, sizeof(s_history_count));
 #ifndef RADAR_INGEST_HOST_TEST
-    s_history = heap_caps_calloc(RADAR_INGEST_HISTORY_DEPTH, sizeof(*s_history),
-                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_history == NULL) return ESP_ERR_NO_MEM;
+    radar_ingest_history_entry_t *history = heap_caps_calloc(RADAR_INGEST_HISTORY_DEPTH,
+                                                              sizeof(*history),
+                                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (history == NULL) return ESP_ERR_NO_MEM;
+    for (size_t i = 0U; i < RADAR_INGEST_REMOTE_SOURCE_COUNT; ++i) {
+        s_history[i] = &history[i * RADAR_INGEST_HISTORY_DEPTH_PER_SOURCE];
+    }
     s_lock = xSemaphoreCreateMutexStatic(&s_lock_storage);
     if (s_lock == NULL) return ESP_ERR_NO_MEM;
 #if CONFIG_FREERTOS_UNICORE
-    const BaseType_t created = xTaskCreate(radar_worker_task, "radar_worker", RADAR_INGEST_WORKER_STACK,
-                                           NULL, RADAR_INGEST_WORKER_PRIORITY, &s_worker);
+    const BaseType_t created = xTaskCreateWithCaps(radar_worker_task, "radar_worker", RADAR_INGEST_WORKER_STACK,
+                                                   NULL, RADAR_INGEST_WORKER_PRIORITY, &s_worker,
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #else
-    const BaseType_t created = xTaskCreatePinnedToCore(radar_worker_task, "radar_worker",
-                                                       RADAR_INGEST_WORKER_STACK, NULL,
-                                                       RADAR_INGEST_WORKER_PRIORITY, &s_worker, 1);
+    const BaseType_t created = xTaskCreatePinnedToCoreWithCaps(radar_worker_task, "radar_worker",
+                                                               RADAR_INGEST_WORKER_STACK, NULL,
+                                                               RADAR_INGEST_WORKER_PRIORITY, &s_worker, 1,
+                                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #endif
     if (created != pdPASS) return ESP_ERR_NO_MEM;
 #endif
 #ifdef RADAR_INGEST_HOST_TEST
-    s_history = s_history_host;
-    memset(s_history, 0, sizeof(s_history_host));
+    for (size_t i = 0U; i < RADAR_INGEST_REMOTE_SOURCE_COUNT; ++i) {
+        s_history[i] = s_history_host[i];
+    }
+    memset(s_history_host, 0, sizeof(s_history_host));
 #endif
     s_started = true;
     return ESP_OK;
@@ -350,10 +412,16 @@ esp_err_t radar_ingest_start(void)
 bool radar_ingest_history_get_stats(radar_ingest_history_stats_t *out)
 {
     if (out == NULL || !s_started || !ingest_lock()) return false;
+    uint16_t count = 0U;
+    bool psram_backed = true;
+    for (size_t i = 0U; i < RADAR_INGEST_REMOTE_SOURCE_COUNT; ++i) {
+        count = (uint16_t)(count + s_history_count[i]);
+        psram_backed = psram_backed && s_history[i] != NULL;
+    }
     *out = (radar_ingest_history_stats_t){
-        .count = s_history_count,
+        .count = count,
         .capacity = RADAR_INGEST_HISTORY_DEPTH,
-        .psram_backed = s_history != NULL,
+        .psram_backed = psram_backed,
     };
     ingest_unlock();
     return true;
@@ -363,46 +431,68 @@ radar_ingest_result_t radar_ingest_process_json(const char *json,
                                                 size_t json_len,
                                                 uint64_t received_at_ms)
 {
+#ifdef RADAR_INGEST_HOST_TEST
     (void)received_at_ms;
+#endif
     radar_gateway_sample_t sample = {0};
     const radar_ingest_result_t result = parse_json(json, json_len, &sample);
 #ifndef RADAR_INGEST_HOST_TEST
     ESP_LOGI(TAG,
-             "RADAR_REMOTE_RADAR_RX content_length=%u source=%s local_id=%u",
+             "RADAR_RX_FRAME event=http_receive content_length=%u source_id=%u source=%s device_id=%s room=%s local_id=%u sequence=%lu timestamp_ms=%llu",
              (unsigned int)json_len,
+             (unsigned int)radar_registry_source_for_local_id(sample.local_id),
              source_name(sample.local_id),
-             (unsigned int)sample.local_id);
+             source_device_id(sample.local_id), source_room_id(sample.local_id),
+             (unsigned int)sample.local_id,
+             (unsigned long)sample.request_sequence,
+             (unsigned long long)received_at_ms);
 #endif
     if (result != RADAR_INGEST_ACCEPTED) {
 #ifndef RADAR_INGEST_HOST_TEST
-        ESP_LOGW(TAG, "RADAR_REMOTE_RADAR_DROP reason=%s", radar_ingest_result_name(result));
+        log_drop(radar_ingest_result_name(result), sample.local_id);
 #endif
         return result;
     }
 #ifndef RADAR_INGEST_HOST_TEST
     ESP_LOGI(TAG,
-             "RADAR_HTTP_INGEST source=%s local_id=%u targets=%u payload_size=%u",
+             "RADAR_RX_FRAME event=http_admit source_id=%u source=%s device_id=%s room=%s local_id=%u targets=%u payload_size=%u sequence=%lu timestamp_ms=%llu",
+             (unsigned int)radar_registry_source_for_local_id(sample.local_id),
              source_name(sample.local_id),
+             source_device_id(sample.local_id), source_room_id(sample.local_id),
              (unsigned int)sample.local_id,
              (unsigned int)sample.target_count,
-             (unsigned int)json_len);
+             (unsigned int)json_len,
+             (unsigned long)sample.request_sequence,
+             (unsigned long long)received_at_ms);
 #endif
+    const radar_source_id_t source = radar_registry_source_for_local_id(sample.local_id);
+    RadarSourceContext *context = radar_source_context_mutable(source);
     const size_t index = sample.local_id - 1U;
     if (!s_started || index >= RADAR_GATEWAY_MAX_REMOTE_SOURCES || !ingest_lock()) {
 #ifndef RADAR_INGEST_HOST_TEST
-        ESP_LOGW(TAG, "RADAR_REMOTE_RADAR_DROP reason=%s",
-                 radar_ingest_result_name(RADAR_INGEST_UNAVAILABLE));
+        log_drop(radar_ingest_result_name(RADAR_INGEST_UNAVAILABLE), sample.local_id);
 #endif
         return RADAR_INGEST_UNAVAILABLE;
     }
-    s_pending[index] = (radar_ingest_pending_t){.pending = true, .sample = sample};
+    if (context == NULL) {
+        ingest_unlock();
+        return RADAR_INGEST_UNAVAILABLE;
+    }
+    s_pending[index] = (radar_ingest_pending_t){
+        .pending = true,
+        .context = context,
+        .sample = sample,
+    };
     ingest_unlock();
 #ifndef RADAR_INGEST_HOST_TEST
     ESP_LOGI(TAG,
-             "RADAR_REMOTE_RADAR_ACCEPT source=%s targets=%u seq=%lu",
+             "RADAR_RX_FRAME event=queued source_id=%u source=%s device_id=%s room=%s targets=%u sequence=%lu frame_sequence=%lu timestamp_ms=%llu",
+             (unsigned int)radar_registry_source_for_local_id(sample.local_id),
              source_name(sample.local_id),
+             source_device_id(sample.local_id), source_room_id(sample.local_id),
              (unsigned int)sample.target_count,
-             (unsigned long)sample.request_sequence);
+             (unsigned long)sample.request_sequence, (unsigned long)sample.frame_seq,
+             (unsigned long long)received_at_ms);
 #endif
     return RADAR_INGEST_ACCEPTED;
 }

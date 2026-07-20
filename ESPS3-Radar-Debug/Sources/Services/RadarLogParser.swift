@@ -66,22 +66,54 @@ struct RadarLogParser {
         let trimmed = record.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
+        if trimmed.range(of: "RADAR_HOME_STATE", options: [.caseInsensitive]) != nil {
+            let home = homeState(in: trimmed)
+            return [RadarLogEvent(source: .unknown, sourceReason: "home state", rawLine: trimmed,
+                                  timestampMilliseconds: home.timestampMilliseconds, kind: .home(home))]
+        }
+        if trimmed.range(of: "RADAR_ROOM_STATE", options: [.caseInsensitive]) != nil {
+            let identity = RadarSource.identify(in: trimmed)
+            guard identity.source != .unknown else { return [] }
+            let room = RadarRoomState(source: identity.source,
+                                      roomID: RadarSource.fieldValue(in: trimmed, keys: ["room"]) ?? identity.source.defaultRoomID,
+                                      occupied: booleanValue(in: trimmed, keys: ["occupied"]) ?? false,
+                                      motion: RadarSource.fieldValue(in: trimmed, keys: ["motion"]) ?? "unknown",
+                                      lastUpdateMilliseconds: timestampMilliseconds(in: trimmed))
+            return [RadarLogEvent(source: identity.source, sourceReason: "room state", rawLine: trimmed,
+                                  timestampMilliseconds: room.lastUpdateMilliseconds, kind: .room(room))]
+        }
+
         let identity = RadarSource.identify(in: trimmed)
         let isRadarRx = trimmed.range(of: "RADAR_RX", options: [.caseInsensitive]) != nil ||
             trimmed.range(of: "radar_raw_rx", options: [.caseInsensitive]) != nil
         let isSourceScopedDiagnostic = isRadarRx ||
             trimmed.range(of: "parser[", options: [.caseInsensitive]) != nil ||
             trimmed.range(of: "recovery[", options: [.caseInsensitive]) != nil ||
-            trimmed.range(of: "local track=", options: [.caseInsensitive]) != nil
+            trimmed.range(of: "local track=", options: [.caseInsensitive]) != nil ||
+            trimmed.range(of: "RADAR_PERSON_UPDATE", options: [.caseInsensitive]) != nil ||
+            trimmed.range(of: "RADAR_COUNTS", options: [.caseInsensitive]) != nil ||
+            trimmed.range(of: "PERSON_", options: [.caseInsensitive]) != nil
         let source: RadarSource
         let sourceReason: String
         if identity.source != .unknown {
             source = identity.source
             sourceReason = identity.reason
             mostRecentSource = source
-        } else if isSourceScopedDiagnostic, let mostRecentSource {
-            source = mostRecentSource
-            sourceReason = "recent source for radar diagnostic"
+        } else if !identity.reason.contains("conflict"), isSourceScopedDiagnostic {
+            /* Only the legacy S3 UART grammar is allowed an implicit source.
+             * Remote records must carry an explicit source/device pair so an
+             * interleaved C51/C52 stream cannot overwrite the last room. */
+            let isLegacyLocalMarker = trimmed.range(of: #"\b(?:local|radar_local|radar_uart|parser|recovery)\b"#, options: [.regularExpression, .caseInsensitive]) != nil
+            let isLegacyLocal = isLegacyLocalMarker &&
+                (mostRecentSource == nil || mostRecentSource == .s3Local)
+            if isLegacyLocal {
+                source = .s3Local
+                sourceReason = "legacy S3 local source"
+                mostRecentSource = .s3Local
+            } else {
+                source = .unknown
+                sourceReason = "missing explicit source for remote diagnostic"
+            }
         } else {
             source = identity.source
             sourceReason = identity.reason
@@ -137,7 +169,7 @@ struct RadarLogParser {
                                         timestampMilliseconds: timestamp,
                                         kind: .target(target, targetPatch)))
         } else if let match = Self.compactTrackPattern.firstMatch(in: trimmed, range: range),
-                  let track = compactTarget(from: match, record: trimmed, timestamp: timestamp) {
+                  let track = compactTarget(from: match, source: source, record: trimmed, timestamp: timestamp) {
             var targetPatch = patch
             targetPatch.sequence = nil
             targetPatch.isValidFrame = true
@@ -231,13 +263,14 @@ struct RadarLogParser {
     }
 
     private func compactTarget(from match: NSTextCheckingResult,
+                               source: RadarSource,
                                record: String,
                                timestamp: Int64?) -> RadarTarget? {
         guard let x = integer(match, at: 2, record: record),
               let y = integer(match, at: 3, record: record) else { return nil }
         let trackID = integer(match, at: 1, record: record) ?? 0
         let distance = Int((Double(x) * Double(x) + Double(y) * Double(y)).squareRoot())
-        return RadarTarget(source: .s3Local,
+        return RadarTarget(source: source,
                            trackID: trackID,
                            xMillimeters: x,
                            yMillimeters: y,
@@ -256,7 +289,17 @@ struct RadarLogParser {
         let online = booleanValue(in: text, keys: ["online", "radar_online"]) ?? booleanValue(sensor)
         let connectionType = RadarSource.fieldValue(in: text, keys: ["connection_type", "link_type", "transport"])
         let sequence = integerValue(in: text, keys: ["frame_seq", "sequence", "seq"])
-        let targetCount = integerValue(in: text, keys: ["tracks", "target_count", "targets"]).flatMap(Int.init)
+        let rawTargetCount = integerValue(in: text, keys: ["raw_target_count"]).flatMap(Int.init)
+        let acceptedTargetCount = integerValue(in: text, keys: ["accepted_target_count"]).flatMap(Int.init)
+        let visibleTrackCount = integerValue(in: text, keys: ["visible_track_count"]).flatMap(Int.init)
+        let confirmedActiveTrackCount = integerValue(in: text, keys: ["confirmed_active_track_count"]).flatMap(Int.init)
+        let historyTargetCount = integerValue(in: text, keys: ["history_target_count"]).flatMap(Int.init)
+        let visiblePersonCount = integerValue(in: text, keys: ["visible_person_count"]).flatMap(Int.init)
+        let retainedPersonCount = integerValue(in: text, keys: ["retained_person_count"]).flatMap(Int.init)
+        let sourcePersonCount = integerValue(in: text, keys: ["source_person_count"]).flatMap(Int.init)
+        let countState = RadarSource.fieldValue(in: text, keys: ["count_state"])
+        let targetCount = visibleTrackCount ??
+            integerValue(in: text, keys: ["tracks", "target_count", "targets"]).flatMap(Int.init)
         let occupancy = RadarSource.fieldValue(in: text, keys: ["occupancy"])
         let presence = RadarSource.fieldValue(in: text, keys: ["presence", "presence_state"])
             .flatMap(RadarPresenceState.init(rawValue:)) ?? occupancy.flatMap(RadarPresenceState.init(rawValue:))
@@ -281,10 +324,23 @@ struct RadarLogParser {
         let rxBytes = isRadarRx ? integerValue(in: text, keys: ["rx_bytes", "bytes"]).flatMap(Int.init) : nil
         let timeout = isRadarRx ? integerValue(in: text, keys: ["timeout"]).flatMap(Int.init) : nil
         let fifoOverflow = isRadarRx ? integerValue(in: text, keys: ["fifo_overflow", "fifo_overflow_count"]).flatMap(Int.init) : nil
+        let isCountOrRoomUpdate = text.range(of: "RADAR_PERSON_UPDATE", options: [.caseInsensitive]) != nil ||
+            text.range(of: "RADAR_COUNTS", options: [.caseInsensitive]) != nil ||
+            text.range(of: "RADAR_ROOM_STATE", options: [.caseInsensitive]) != nil ||
+            text.range(of: "RADAR_HOME_STATE", options: [.caseInsensitive]) != nil
         return RadarStatePatch(online: online,
                                connectionType: connectionType,
                                sequence: sequence,
                                targetCount: targetCount,
+                               rawTargetCount: rawTargetCount,
+                               acceptedTargetCount: acceptedTargetCount,
+                               visibleTrackCount: visibleTrackCount,
+                               confirmedActiveTrackCount: confirmedActiveTrackCount,
+                               historyTargetCount: historyTargetCount,
+                               visiblePersonCount: visiblePersonCount,
+                               retainedPersonCount: retainedPersonCount,
+                               sourcePersonCount: sourcePersonCount,
+                               countState: countState,
                                presenceState: presence,
                                motionState: motion,
                                spatialState: spatial,
@@ -294,6 +350,7 @@ struct RadarLogParser {
                                droppedFrames: droppedFrames,
                                recoveryState: recoveryState,
                                deviceID: RadarSource.fieldValue(in: text, keys: ["device_id", "device", "did"]),
+                               roomID: RadarSource.fieldValue(in: text, keys: ["room_id", "room"]),
                                sensorState: sensorState,
                                occupancyState: occupancy,
                                acceptedFrames: acceptedFrames,
@@ -303,7 +360,27 @@ struct RadarLogParser {
                                rxBytes: rxBytes,
                                timeout: timeout,
                                fifoOverflow: fifoOverflow,
-                               isValidFrame: targetCount != nil)
+                               isValidFrame: targetCount != nil && !isCountOrRoomUpdate)
+    }
+
+    private func homeState(in text: String) -> RadarHomeState {
+        let timestamp = timestampMilliseconds(in: text)
+        let declaredCount = integerValue(in: text, keys: ["occupied_room_count"]).flatMap(Int.init) ?? 0
+        let homePersonCount = integerValue(in: text, keys: ["home_person_count"]).flatMap(Int.init) ?? 0
+        let marker = "occupied_rooms=["
+        guard let start = text.range(of: marker, options: [.caseInsensitive]),
+              let end = text[start.upperBound...].firstIndex(of: "]") else {
+            return RadarHomeState(occupiedRoomCount: declaredCount, homePersonCount: homePersonCount,
+                                  timestampMilliseconds: timestamp)
+        }
+        let rooms = text[start.upperBound..<end].split(separator: "|").compactMap { item -> RadarRoomState? in
+            let parts = item.split(separator: ":", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let source = RadarSource.source(named: parts[0]) else { return nil }
+            return RadarRoomState(source: source, roomID: parts[1], occupied: true,
+                                  motion: "unknown", lastUpdateMilliseconds: timestamp)
+        }
+        return RadarHomeState(occupiedRoomCount: declaredCount, occupiedRooms: rooms,
+                              homePersonCount: homePersonCount, timestampMilliseconds: timestamp)
     }
 
     private func recoveryState(in text: String) -> String? {

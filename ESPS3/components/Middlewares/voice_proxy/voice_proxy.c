@@ -12,12 +12,14 @@
 #include <errno.h>
 #include <string.h>
 
+#include "app_stack_monitor.h"
 #include "child_registry.h"
 #include "esp111_protocol_common.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -267,12 +269,13 @@ esp_err_t voice_proxy_init(void)
         s_voice_lock = NULL;
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreate(voice_proxy_worker_task,
-                    "voice_proxy",
-                    VOICE_PROXY_WORKER_STACK,
-                    NULL,
-                    VOICE_PROXY_WORKER_PRIORITY,
-                    &s_voice_worker) != pdPASS) {
+    if (xTaskCreateWithCaps(voice_proxy_worker_task,
+                            "voice_proxy",
+                            VOICE_PROXY_WORKER_STACK,
+                            NULL,
+                            VOICE_PROXY_WORKER_PRIORITY,
+                            &s_voice_worker,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         vQueueDelete(s_voice_queue);
         s_voice_queue = NULL;
         vSemaphoreDelete(s_voice_lock);
@@ -424,6 +427,10 @@ static esp_err_t voice_proxy_process_reserved_turn(httpd_req_t *req, const char 
 static void voice_proxy_worker_task(void *arg)
 {
     (void)arg;
+    app_stack_monitor_report(TAG,
+                             "voice_proxy",
+                             VOICE_PROXY_WORKER_STACK,
+                             "entry");
     while (true) {
         voice_proxy_job_t job = {0};
         if (xQueueReceive(s_voice_queue, &job, portMAX_DELAY) != pdTRUE) {

@@ -137,6 +137,22 @@
 #define RADAR_CONFIG_MOTION_EXIT_FRAMES 8U
 #define RADAR_CONFIG_TARGET_JUMP_MAX_MM 1500U
 
+/* --------------------------- Person continuity -------------------------- */
+
+/* These parameters only govern short-term business continuity.  They do not
+ * turn a LD2450 slot or a motion track into a persistent human identity. */
+#define RADAR_CONFIG_PERSON_STILL_HOLD_MS 3000U
+#define RADAR_CONFIG_PERSON_DORMANT_TIMEOUT_MS 12000U
+#define RADAR_CONFIG_PERSON_REACQUIRE_GATE_MM 2000U
+#define RADAR_CONFIG_PERSON_SAME_ZONE_BONUS_MM 250U
+#define RADAR_CONFIG_PERSON_ADJACENT_ZONE_ALLOW 1
+#define RADAR_CONFIG_PERSON_NEW_CONFIRM_FRAMES 2U
+#define RADAR_CONFIG_PERSON_NEW_NEAR_DORMANT_CONFIRM_FRAMES 3U
+/* Keep short prediction bounded: velocity starts to decay after 400 ms and
+ * reaches zero after another 600 ms. */
+#define RADAR_CONFIG_PERSON_VELOCITY_DECAY_START_MS 400U
+#define RADAR_CONFIG_PERSON_VELOCITY_DECAY_MS 600U
+
 /* --------------------------- S3 任务与诊断 --------------------------- */
 
 #define RADAR_CONFIG_LOCAL_ADAPTER_POLL_MS 20U

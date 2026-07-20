@@ -22,8 +22,8 @@
 #error "MAIN_IDLE_DELAY_MS must be greater than 0"
 #endif
 
-#if APP_STARTUP_TASK_STACK < 6144
-#error "APP_STARTUP_TASK_STACK must be at least 6144"
+#if APP_STARTUP_TASK_STACK < 8192
+#error "APP_STARTUP_TASK_STACK must be at least 8192 for cache-off startup paths"
 #endif
 
 #if APP_STARTUP_TASK_PRIORITY <= 0

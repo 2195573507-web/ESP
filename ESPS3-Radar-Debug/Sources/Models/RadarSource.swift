@@ -20,6 +20,10 @@ enum RadarSource: UInt8, CaseIterable, Identifiable, Codable, Hashable {
 
     static let roomSources: [RadarSource] = [.s3Local, .c51, .c52]
 
+    static func source(named value: String) -> RadarSource? {
+        sourceValue(value)
+    }
+
     var displayName: String {
         switch self {
         case .s3Local: "S3 本地雷达"
@@ -38,6 +42,15 @@ enum RadarSource: UInt8, CaseIterable, Identifiable, Codable, Hashable {
         }
     }
 
+    var defaultRoomID: String {
+        switch self {
+        case .s3Local: "s3_local"
+        case .c51: "living_room"
+        case .c52: "bedroom"
+        case .unknown: "unknown"
+        }
+    }
+
     var defaultConnectionType: String {
         switch self {
         case .s3Local: "UART / 本地雷达"
@@ -51,7 +64,11 @@ enum RadarSource: UInt8, CaseIterable, Identifiable, Codable, Hashable {
         let explicitSource = fieldValue(in: text, keys: ["source"])
         if let explicitSource {
             if let source = sourceValue(explicitSource) {
-                return (source, "explicit source", explicitSource, fieldValue(in: text, keys: ["device_id", "device", "did"]))
+                let deviceID = fieldValue(in: text, keys: ["device_id", "device", "did"])
+                if let deviceID, deviceSource(deviceID) != source {
+                    return (.unknown, "explicit source/device_id conflict", explicitSource, deviceID)
+                }
+                return (source, "explicit source", explicitSource, deviceID)
             }
             return (.unknown, "unrecognized explicit source", explicitSource, fieldValue(in: text, keys: ["device_id", "device", "did"]))
         }
@@ -59,7 +76,11 @@ enum RadarSource: UInt8, CaseIterable, Identifiable, Codable, Hashable {
         let localSource = fieldValue(in: text, keys: ["local_source", "source_id"])
         if let localSource {
             if let source = sourceValue(localSource) {
-                return (source, "local_source/source_id", localSource, fieldValue(in: text, keys: ["device_id", "local_id", "device", "did"]))
+                let deviceID = fieldValue(in: text, keys: ["device_id", "device", "did"])
+                if let deviceID, deviceSource(deviceID) != source {
+                    return (.unknown, "local_source/source_id device_id conflict", localSource, deviceID)
+                }
+                return (source, "local_source/source_id", localSource, deviceID)
             }
             return (.unknown, "unrecognized local_source/source_id", localSource, fieldValue(in: text, keys: ["device_id", "local_id", "device", "did"]))
         }

@@ -11,6 +11,7 @@
 
 #include "cJSON.h"
 #include "esp111_protocol_common.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -32,7 +33,9 @@ typedef struct {
     int64_t last_size_log_ms;
 } bme_cache_state_t;
 
-static bme_cache_state_t s_cache;
+/* The BME history is retained across reconnects and is too large for internal BSS. */
+static bme_cache_state_t *s_cache_storage;
+#define s_cache (*s_cache_storage)
 static SemaphoreHandle_t s_lock;
 
 static int64_t now_ms(void)
@@ -46,7 +49,7 @@ static void free_record_storage(bme_cache_record_t *record)
         return;
     }
     if (record->server_json != NULL) {
-        cJSON_free(record->server_json);
+        heap_caps_free(record->server_json);
         record->server_json = NULL;
     }
 }
@@ -114,7 +117,7 @@ static bool duplicate_json(const char *json, char **out)
         return false;
     }
     const size_t len = strlen(json);
-    char *copy = cJSON_malloc(len + 1U);
+    char *copy = heap_caps_malloc(len + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (copy == NULL) {
         return false;
     }
@@ -231,9 +234,21 @@ static esp_err_t copy_record_for_output(const bme_cache_record_t *src,
 
 esp_err_t bme_cache_manager_init(void)
 {
+    if (s_cache_storage == NULL) {
+        s_cache_storage = heap_caps_calloc(1U,
+                                           sizeof(*s_cache_storage),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_cache_storage == NULL) {
+            ESP_LOGE(TAG, "BME cache PSRAM allocation failed bytes=%u",
+                     (unsigned int)sizeof(*s_cache_storage));
+            return ESP_ERR_NO_MEM;
+        }
+    }
     if (s_lock == NULL) {
         s_lock = xSemaphoreCreateMutex();
         if (s_lock == NULL) {
+            heap_caps_free(s_cache_storage);
+            s_cache_storage = NULL;
             return ESP_ERR_NO_MEM;
         }
     }
@@ -247,8 +262,9 @@ esp_err_t bme_cache_manager_init(void)
     xSemaphoreGive(s_lock);
 
     ESP_LOGI(TAG,
-             "BME cache initialized capacity=%u",
-             (unsigned int)BME_CACHE_MANAGER_CAPACITY);
+             "BME cache initialized capacity=%u storage=psram bytes=%u",
+             (unsigned int)BME_CACHE_MANAGER_CAPACITY,
+             (unsigned int)sizeof(*s_cache_storage));
     return ESP_OK;
 }
 
