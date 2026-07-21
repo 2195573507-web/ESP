@@ -2415,7 +2415,7 @@ esp_err_t network_worker_init(void)
                                                  NULL,
                                                  NETWORK_WORKER_UPLOAD_TASK_PRIORITY,
                                                  &s_upload_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_upload_task = NULL;
             return network_worker_init_failed("upload_task_internal");
@@ -2432,7 +2432,7 @@ esp_err_t network_worker_init(void)
                                                  NULL,
                                                  NETWORK_WORKER_COMMAND_TASK_PRIORITY,
                                                  &s_command_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_command_task = NULL;
             return network_worker_init_failed("command_task_internal");
@@ -2449,7 +2449,7 @@ esp_err_t network_worker_init(void)
                                                  NULL,
                                                  NETWORK_WORKER_UPLOAD_TASK_PRIORITY - 1U,
                                                  &s_snapshot_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_snapshot_task = NULL;
             return network_worker_init_failed("snapshot_task_internal");
@@ -2460,9 +2460,9 @@ esp_err_t network_worker_init(void)
                                            NETWORK_WORKER_UPLOAD_TASK_STACK);
     }
     ESP_LOGI(TAG,
-             "NETWORK_WORKER_INIT_OK task_stacks_internal=%u queues_psram=4 command_ack_buffer_psram=%u",
-             (unsigned int)(NETWORK_WORKER_TASK_STACK +
-                            NETWORK_WORKER_UPLOAD_TASK_STACK +
+             "NETWORK_WORKER_INIT_OK task_stack_internal=%u task_stacks_psram=%u queues_psram=4 command_ack_buffer_psram=%u",
+             (unsigned int)NETWORK_WORKER_TASK_STACK,
+             (unsigned int)(NETWORK_WORKER_UPLOAD_TASK_STACK +
                             NETWORK_WORKER_COMMAND_TASK_STACK +
                             NETWORK_WORKER_UPLOAD_TASK_STACK),
              (unsigned int)SERVER_CLIENT_SMALL_BODY_BYTES);

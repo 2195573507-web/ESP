@@ -20,19 +20,12 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "radar_resource_adapter.h"
 #include "server_comm_http.h"
 #include "terminal_config.h"
 
 static const char *TAG = "bme_server_client";
 static TickType_t s_bme_retry_not_before;
 static uint32_t s_bme_failure_count;
-
-static uint64_t bme_server_client_now_ms(void)
-{
-    const int64_t now_us = esp_timer_get_time();
-    return now_us > 0 ? (uint64_t)(now_us / 1000) : 0U;
-}
 
 static bool bme_server_client_retry_ready(void)
 {
@@ -172,13 +165,6 @@ esp_err_t bme_server_client_upload_reading(const char *sensor_id,
     if (!bme_server_client_retry_ready()) {
         return ESP_ERR_NOT_FINISHED;
     }
-    const uint64_t now_ms = bme_server_client_now_ms();
-#if CONFIG_C5_BME_ADAPTIVE_REPORT
-    if (!radar_resource_adapter_bme_upload_due(now_ms)) {
-        return ESP_ERR_NOT_FINISHED;
-    }
-#endif
-
     char escaped_sensor_id[64];
     char escaped_level[24];
     char escaped_confidence[24];
@@ -349,8 +335,5 @@ esp_err_t bme_server_client_upload_reading(const char *sensor_id,
                  (unsigned long)air_quality->sample_count);
     }
     bme_server_client_note_upload_result(ret);
-#if CONFIG_C5_BME_ADAPTIVE_REPORT
-    radar_resource_adapter_complete_bme_upload(ret == ESP_OK, bme_server_client_now_ms());
-#endif
     return ret;
 }

@@ -35,6 +35,8 @@ _Static_assert((RADAR_DIAG_TASK_STACK_BYTES % sizeof(StackType_t)) == 0U,
                "radar_diag stack bytes must align to StackType_t");
 static StaticTask_t s_task_storage;
 static StackType_t s_task_stack[RADAR_DIAG_TASK_STACK_DEPTH];
+_Static_assert(sizeof(s_task_stack) == RADAR_DIAG_TASK_STACK_BYTES,
+               "radar_diag static stack must match configured bytes");
 /* The full value snapshot is larger than the diagnostics task's safe stack budget. */
 static radar_diag_snapshot_t *s_task_snapshot;
 static radar_registry_entry_t s_registry_entries[RADAR_SOURCE_COUNT];
@@ -240,8 +242,8 @@ bool radar_diag_snapshot_copy(radar_diag_snapshot_t *out)
     memset(out, 0, sizeof(*out));
 
     const size_t count = radar_registry_snapshot(s_registry_entries, RADAR_SOURCE_COUNT);
-    out->registry_count = count;
-    for (size_t i = 0U; i < count; ++i) {
+    out->registry_count = count > RADAR_SOURCE_COUNT ? RADAR_SOURCE_COUNT : count;
+    for (size_t i = 0U; i < out->registry_count; ++i) {
         copy_registry_entry(&out->registry[i], &s_registry_entries[i]);
     }
     out->unattributed_parse_errors = radar_registry_unattributed_parse_errors();
@@ -288,7 +290,9 @@ void radar_diagnostics_log_transition(radar_source_id_t source,
 
 static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_ms)
 {
-    for (size_t i = 0U; i < snapshot->registry_count; ++i) {
+    const size_t registry_count = snapshot->registry_count > RADAR_SOURCE_COUNT
+        ? RADAR_SOURCE_COUNT : snapshot->registry_count;
+    for (size_t i = 0U; i < registry_count; ++i) {
         const radar_diag_registry_snapshot_t *entry = &snapshot->registry[i];
         ESP_LOGI(TAG,
                  "RADAR_SOURCE_STATE event=diagnostic source_id=%u source=%s device_id=%s room=%s sequence=%lu state=%s targets=%u online=%d uart_online=%d valid_age_ms=%" PRIu64 " motion_age_ms=%" PRIu64 " parse_errors=%lu sequence_rejects=%lu identity_mismatches=%lu freshness_expiry=%lu",
@@ -301,7 +305,6 @@ static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_
                  (unsigned int)entry->snapshot.current_target_count,
                  entry->source_online ? 1 : 0,
                  entry->snapshot.uart_online ? 1 : 0,
-                 entry->snapshot.frame_fresh ? 1 : 0,
                  age_ms(entry->snapshot.last_valid_frame_ms, current_ms),
                  age_ms(entry->snapshot.last_motion_ms, current_ms),
                  (unsigned long)(entry->diagnostics.parse_error_count == UINT32_MAX ? 0U :
@@ -397,7 +400,9 @@ static void log_summary(const radar_diag_snapshot_t *snapshot, uint64_t current_
                  local_room_id != NULL ? local_room_id : "unknown",
                  local_sequence);
     }
-    for (size_t i = 0U; i < spatial->accepted_target_count; ++i) {
+    const size_t accepted_count = spatial->accepted_target_count > LD2450_MAX_TARGETS
+        ? LD2450_MAX_TARGETS : spatial->accepted_target_count;
+    for (size_t i = 0U; i < accepted_count; ++i) {
         const radar_spatial_target_t *target = &spatial->accepted_targets[i];
         ESP_LOGI(TAG,
                  "RADAR_TRACK_UPDATE event=accepted index=%u x=%ld y=%ld distance=%lu angle=%d speed=%d source_id=%u source=%s device_id=%s room=%s sequence=%lu",
@@ -461,8 +466,10 @@ static void diagnostics_task(void *arg)
         const uint64_t current_ms = now_ms();
         radar_registry_refresh(current_ms);
 
-        if (radar_diag_snapshot_copy(s_task_snapshot)) {
-            for (size_t i = 0U; i < s_task_snapshot->registry_count; ++i) {
+        if (s_task_snapshot != NULL && radar_diag_snapshot_copy(s_task_snapshot)) {
+            const size_t registry_count = s_task_snapshot->registry_count > RADAR_SOURCE_COUNT
+                ? RADAR_SOURCE_COUNT : s_task_snapshot->registry_count;
+            for (size_t i = 0U; i < registry_count; ++i) {
                 const radar_diag_registry_snapshot_t *entry = &s_task_snapshot->registry[i];
                 if (have_previous &&
                     (entry->snapshot.state != previous_state[i] ||
@@ -473,7 +480,7 @@ static void diagnostics_task(void *arg)
                 previous_state[i] = entry->snapshot.state;
                 previous_online[i] = entry->source_online;
             }
-            have_previous = s_task_snapshot->registry_count == RADAR_SOURCE_COUNT;
+            have_previous = registry_count == RADAR_SOURCE_COUNT;
 
             if (s_task_snapshot->has_local_spatial) {
                 const radar_spatial_snapshot_t *spatial = &s_task_snapshot->local_spatial;

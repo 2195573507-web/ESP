@@ -17,10 +17,6 @@
 #include "lcd_board_profile.h"
 #include "lcd_fault_injection.h"
 
-#define LCD_BOOTSTRAP_DMA_FREE_MIN (30U * 1024U)
-#define LCD_BOOTSTRAP_DMA_LARGEST_MIN (20U * 1024U)
-#define LCD_STEADY_DMA_FREE_MIN (24U * 1024U)
-#define LCD_STEADY_DMA_LARGEST_MIN (16U * 1024U)
 #define LCD_RUNTIME_DMA_LARGEST_WARN (12U * 1024U)
 
 static const char *TAG = "lcd_driver";
@@ -34,12 +30,31 @@ typedef struct {
     esp_lcd_panel_io_handle_t io;
     esp_lcd_panel_handle_t panel;
     lv_display_t *display;
+    lcd_driver_lvgl_release_fn lvgl_release;
+    void *lvgl_user_ctx;
+    bool lvgl_pool_prepared;
     lcd_driver_metrics_t metrics;
 } lcd_driver_context_t;
 
 static lcd_driver_context_t s_ctx;
 static StaticSemaphore_t s_lock_storage;
 static SemaphoreHandle_t s_lock;
+
+typedef struct {
+    const char *owner;
+    size_t size;
+    uint32_t caps;
+} lcd_alloc_request_t;
+
+static void lcd_driver_log_alloc_plan(const char *owner, uint32_t caps, size_t size, const char *region)
+{
+    ESP_LOGI(TAG,
+             "MEM_ALLOC_PLAN owner=%s caps=0x%08lx size=%u region=%s",
+             owner,
+             (unsigned long)caps,
+             (unsigned int)size,
+             region);
+}
 
 static void lcd_driver_capture_metrics(void)
 {
@@ -76,27 +91,64 @@ static void lcd_driver_log_memory(const char *stage)
              (unsigned)s_ctx.metrics.steady_dma_bytes);
 }
 
-static esp_err_t lcd_driver_require_memory(size_t free_min, size_t largest_min, const char *stage)
+static void lcd_driver_log_lvgl_stage(const char *stage)
 {
-    const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
-    const uint32_t dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
-    const size_t internal_free = heap_caps_get_free_size(internal_caps);
-    const size_t internal_largest = heap_caps_get_largest_free_block(internal_caps);
-    const size_t dma_free = heap_caps_get_free_size(dma_caps);
-    const size_t dma_largest = heap_caps_get_largest_free_block(dma_caps);
+    lv_theme_t *theme = NULL;
+    lv_draw_buf_t *draw_buf = NULL;
+    void *buffer = NULL;
+    if (s_ctx.display != NULL) {
+        theme = lv_display_get_theme(s_ctx.display);
+        draw_buf = lv_display_get_buf_active(s_ctx.display);
+        if (draw_buf != NULL) {
+            buffer = draw_buf->data;
+        }
+    }
+    ESP_LOGI(TAG,
+             "LVGL_INIT_STAGE %s display=%p theme=%p version=%d.%d.%d buffer=%p",
+             stage,
+             (void *)s_ctx.display,
+             (void *)theme,
+             lv_version_major(),
+             lv_version_minor(),
+             lv_version_patch(),
+             buffer);
+}
 
-    if (internal_free < free_min || internal_largest < largest_min ||
-        dma_free < free_min || dma_largest < largest_min) {
-        ESP_LOGE(TAG,
-                 "LCD_MEM_ADMISSION_FAIL stage=%s internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u required_free=%u required_largest=%u",
-                 stage,
-                 (unsigned)internal_free,
-                 (unsigned)internal_largest,
-                 (unsigned)dma_free,
-                 (unsigned)dma_largest,
-                 (unsigned)free_min,
-                 (unsigned)largest_min);
-        return ESP_ERR_NO_MEM;
+static esp_err_t lcd_driver_admit_plan(const char *stage,
+                                       const lcd_alloc_request_t *plan,
+                                       size_t plan_count)
+{
+    if (plan == NULL || plan_count == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (size_t i = 0U; i < plan_count; ++i) {
+        size_t required_free = 0U;
+        size_t required_largest = 0U;
+        for (size_t j = 0U; j < plan_count; ++j) {
+            if (plan[j].caps != plan[i].caps) {
+                continue;
+            }
+            required_free += plan[j].size;
+            if (plan[j].size > required_largest) {
+                required_largest = plan[j].size;
+            }
+        }
+
+        const size_t available_free = heap_caps_get_free_size(plan[i].caps);
+        const size_t available_largest = heap_caps_get_largest_free_block(plan[i].caps);
+        if (available_free < required_free || available_largest < required_largest) {
+            ESP_LOGE(TAG,
+                     "LCD_MEM_ADMISSION_FAIL stage=%s owner=%s caps=0x%08lx available_free=%u available_largest=%u required_free=%u required_largest=%u",
+                     stage,
+                     plan[i].owner,
+                     (unsigned long)plan[i].caps,
+                     (unsigned)available_free,
+                     (unsigned)available_largest,
+                     (unsigned)required_free,
+                     (unsigned)required_largest);
+            return ESP_ERR_NO_MEM;
+        }
     }
     return ESP_OK;
 }
@@ -200,12 +252,14 @@ esp_err_t lcd_driver_start(void)
     }
 
     lcd_driver_reset_context(LCD_DRIVER_ALLOCATING);
-    esp_err_t ret = lcd_driver_require_memory(LCD_BOOTSTRAP_DMA_FREE_MIN,
-                                               LCD_BOOTSTRAP_DMA_LARGEST_MIN,
-                                               "bootstrap");
-    if (ret != ESP_OK) {
-        goto fail;
-    }
+    const lcd_alloc_request_t bootstrap_plan[] = {
+        {
+            .owner = "lcd_legacy_dma",
+            .size = LCD_LEGACY_DMA_BYTES,
+            .caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+        },
+    };
+    esp_err_t ret;
 
     ret = lcd_driver_init_backlight();
     if (ret != ESP_OK) {
@@ -282,9 +336,18 @@ esp_err_t lcd_driver_start(void)
     }
 
     if (lcd_fault_injection_should_fail(LCD_FAULT_LEGACY_DMA)) { ret = ESP_ERR_NO_MEM; goto fail; }
-    s_ctx.legacy_dma_buffer = heap_caps_calloc(1,
-                                                LCD_LEGACY_DMA_BYTES,
-                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    const uint32_t legacy_dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
+    ret = lcd_driver_admit_plan("bootstrap",
+                                bootstrap_plan,
+                                sizeof(bootstrap_plan) / sizeof(bootstrap_plan[0]));
+    if (ret != ESP_OK) {
+        goto fail;
+    }
+    lcd_driver_log_alloc_plan(bootstrap_plan[0].owner,
+                              legacy_dma_caps,
+                              bootstrap_plan[0].size,
+                              "internal_dma");
+    s_ctx.legacy_dma_buffer = heap_caps_calloc(1, LCD_LEGACY_DMA_BYTES, legacy_dma_caps);
     if (s_ctx.legacy_dma_buffer == NULL || !esp_ptr_dma_capable(s_ctx.legacy_dma_buffer) ||
         !esp_ptr_internal(s_ctx.legacy_dma_buffer)) {
         ESP_LOGE(TAG, "LCD legacy DMA allocation/capability validation failed");
@@ -294,7 +357,7 @@ esp_err_t lcd_driver_start(void)
 
     lcd_driver_set_backlight(true);
     s_ctx.state = LCD_DRIVER_READY;
-    lcd_driver_log_memory("panel_ready_legacy_9600");
+    lcd_driver_log_memory("panel_ready_legacy_4800");
     lcd_driver_unlock();
     return ESP_OK;
 
@@ -308,7 +371,9 @@ fail:
     return ret;
 }
 
-esp_err_t lcd_driver_register_lvgl(void)
+esp_err_t lcd_driver_register_lvgl(lcd_driver_lvgl_prepare_fn prepare,
+                                   lcd_driver_lvgl_release_fn release,
+                                   void *user_ctx)
 {
     const esp_err_t lock_ret = lcd_driver_lock();
     if (lock_ret != ESP_OK) {
@@ -319,7 +384,7 @@ esp_err_t lcd_driver_register_lvgl(void)
         return ESP_OK;
     }
     if (s_ctx.state != LCD_DRIVER_READY || s_ctx.panel == NULL || s_ctx.io == NULL ||
-        s_ctx.legacy_dma_buffer == NULL) {
+        s_ctx.legacy_dma_buffer == NULL || prepare == NULL || release == NULL) {
         lcd_driver_unlock();
         return ESP_ERR_INVALID_STATE;
     }
@@ -329,14 +394,29 @@ esp_err_t lcd_driver_register_lvgl(void)
         .task_stack = 4096,
         .task_affinity = -1,
         .task_max_sleep_ms = 1000,
-        .task_stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
+        .task_stack_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
         .timer_period_ms = 20,
     };
+    lcd_driver_log_alloc_plan("lcd_lvgl_port_stack", lvgl_cfg.task_stack_caps, lvgl_cfg.task_stack, "psram");
+    bool lvgl_locked = false;
     esp_err_t ret = lcd_fault_injection_should_fail(LCD_FAULT_LVGL_PORT) ? ESP_ERR_NO_MEM : lvgl_port_init(&lvgl_cfg);
     if (ret != ESP_OK) {
         goto fail;
     }
     s_ctx.lvgl_port_started = true;
+
+    if (!lvgl_port_lock(1000U)) {
+        ret = ESP_ERR_TIMEOUT;
+        goto fail;
+    }
+    lvgl_locked = true;
+    ret = prepare(user_ctx);
+    if (ret != ESP_OK) {
+        goto fail;
+    }
+    s_ctx.lvgl_release = release;
+    s_ctx.lvgl_user_ctx = user_ctx;
+    s_ctx.lvgl_pool_prepared = true;
 
     const lvgl_port_display_cfg_t display_cfg = {
         .io_handle = s_ctx.io,
@@ -363,7 +443,29 @@ esp_err_t lcd_driver_register_lvgl(void)
             .direct_mode = false,
         },
     };
+    const lcd_alloc_request_t steady_plan[] = {
+        {
+            .owner = "lcd_lvgl_draw_buffer",
+            .size = display_cfg.buffer_size * sizeof(uint16_t) * (display_cfg.double_buffer ? 2U : 1U),
+            .caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+        },
+    };
+    ret = lcd_driver_admit_plan("lvgl_draw_buffer",
+                                steady_plan,
+                                sizeof(steady_plan) / sizeof(steady_plan[0]));
+    if (ret != ESP_OK) {
+        goto fail;
+    }
+    lcd_driver_log_alloc_plan(steady_plan[0].owner,
+                              steady_plan[0].caps,
+                              steady_plan[0].size,
+                              "internal_dma");
+    /* LVGL9 creates its default theme synchronously inside lv_display_create(). */
+    lcd_driver_log_lvgl_stage("before_display_create");
+    lcd_driver_log_lvgl_stage("before_theme_init");
     s_ctx.display = lcd_fault_injection_should_fail(LCD_FAULT_LVGL_DISPLAY) ? NULL : lvgl_port_add_disp(&display_cfg);
+    lcd_driver_log_lvgl_stage("after_theme_init");
+    lcd_driver_log_lvgl_stage("after_display_create");
     if (s_ctx.display == NULL) {
         ret = ESP_ERR_NO_MEM;
         goto fail;
@@ -376,30 +478,34 @@ esp_err_t lcd_driver_register_lvgl(void)
         goto fail;
     }
 
-    /* The 9600 B bootstrap buffer is no longer reachable after this point. */
+    /* The 4800 B bootstrap buffer is no longer reachable after this point. */
     lcd_driver_release_legacy_buffer();
-    ret = lcd_driver_require_memory(LCD_STEADY_DMA_FREE_MIN,
-                                    LCD_STEADY_DMA_LARGEST_MIN,
-                                    "lvgl_steady");
-    if (ret != ESP_OK) {
-        goto fail;
-    }
     s_ctx.state = LCD_DRIVER_PUBLISHED;
     lcd_driver_log_memory("lvgl_registered_draw_4800");
     if (s_ctx.metrics.dma_largest < LCD_RUNTIME_DMA_LARGEST_WARN) {
         ESP_LOGW(TAG, "LCD_DMA_LARGEST_LOW largest=%u", (unsigned)s_ctx.metrics.dma_largest);
     }
+    lvgl_port_unlock();
+    lvgl_locked = false;
     lcd_driver_unlock();
     return ESP_OK;
 
 fail:
+    lcd_driver_log_lvgl_stage("failed");
     if (s_ctx.display != NULL) {
         (void)lvgl_port_remove_disp(s_ctx.display);
         s_ctx.display = NULL;
     }
+    if (lvgl_locked) {
+        lvgl_port_unlock();
+    }
     if (s_ctx.lvgl_port_started) {
         (void)lvgl_port_deinit();
         s_ctx.lvgl_port_started = false;
+    }
+    if (s_ctx.lvgl_pool_prepared && s_ctx.lvgl_release != NULL) {
+        s_ctx.lvgl_release(s_ctx.lvgl_user_ctx);
+        s_ctx.lvgl_pool_prepared = false;
     }
     lcd_driver_release_legacy_buffer();
     lcd_driver_set_backlight(false);
@@ -422,13 +528,24 @@ esp_err_t lcd_driver_stop(void)
     }
     s_ctx.state = LCD_DRIVER_STOPPING;
     lcd_driver_set_backlight(false);
+    if (s_ctx.lvgl_port_started && !lvgl_port_lock(1000U)) {
+        lcd_driver_unlock();
+        return ESP_ERR_TIMEOUT;
+    }
     if (s_ctx.display != NULL) {
         (void)lvgl_port_remove_disp(s_ctx.display);
         s_ctx.display = NULL;
     }
     if (s_ctx.lvgl_port_started) {
+        lvgl_port_unlock();
+    }
+    if (s_ctx.lvgl_port_started) {
         (void)lvgl_port_deinit();
         s_ctx.lvgl_port_started = false;
+    }
+    if (s_ctx.lvgl_pool_prepared && s_ctx.lvgl_release != NULL) {
+        s_ctx.lvgl_release(s_ctx.lvgl_user_ctx);
+        s_ctx.lvgl_pool_prepared = false;
     }
     lcd_driver_release_legacy_buffer();
     lcd_driver_release_panel();

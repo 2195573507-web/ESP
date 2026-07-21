@@ -919,13 +919,22 @@ static esp_err_t commands_pending_handler(httpd_req_t *req)
                           "id is not allowed");
     }
 
-    char body[2048];
-    esp_err_t ret = command_router_build_pending_json(device_id, body, sizeof(body));
-    return ret == ESP_OK ? send_json(req, "200 OK", body)
-                         : send_error(req,
-                                      "400 Bad Request",
-                                      ESP111_PROTOCOL_ERROR_COMMAND_POLL_FAILED,
-                                      esp_err_to_name(ret));
+    char *body = heap_caps_calloc(1U, 2048U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (body == NULL) {
+        return send_error(req,
+                          "503 Service Unavailable",
+                          ESP111_PROTOCOL_ERROR_COMMAND_POLL_FAILED,
+                          "no_memory");
+    }
+    esp_err_t ret = command_router_build_pending_json(device_id, body, 2048U);
+    const esp_err_t response_ret = ret == ESP_OK
+        ? send_json(req, "200 OK", body)
+        : send_error(req,
+                     "400 Bad Request",
+                     ESP111_PROTOCOL_ERROR_COMMAND_POLL_FAILED,
+                     esp_err_to_name(ret));
+    heap_caps_free(body);
+    return response_ret;
 }
 
 static esp_err_t command_ack_handler(httpd_req_t *req)
@@ -1079,6 +1088,7 @@ esp_err_t local_http_server_start_with_reason(const char *reason)
     config.max_uri_handlers = 14;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8192;
+    config.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
 
     httpd_handle_t server = NULL;
     esp_err_t ret = httpd_start(&server, &config);
@@ -1106,6 +1116,7 @@ esp_err_t local_http_server_start_with_reason(const char *reason)
         {.uri = ESP111_PROTOCOL_ROUTE_SENSOR, .method = HTTP_POST, .handler = status_or_sensor_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_RADAR_RESULT, .method = HTTP_POST, .handler = radar_local_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_RADAR_DEBUG, .method = HTTP_GET, .handler = radar_debug_handler},
+        {.uri = ESP111_PROTOCOL_ROUTE_RADAR_HOME_SNAPSHOT, .method = HTTP_GET, .handler = radar_home_snapshot_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_DEVICE_STREAM, .method = HTTP_POST, .handler = device_stream_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_VOICE_TURN, .method = HTTP_POST, .handler = voice_proxy_handle_turn},
         {.uri = ESP111_PROTOCOL_ROUTE_WAKE_PROMPT_AUDIO, .method = HTTP_GET, .handler = wake_prompt_cache_gateway_handle_http},

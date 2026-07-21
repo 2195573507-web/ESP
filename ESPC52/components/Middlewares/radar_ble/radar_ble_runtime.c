@@ -64,8 +64,13 @@ esp_err_t radar_ble_runtime_start(void)
     if (ret != ESP_OK) {
         return ret;
     }
+    /* BLE callbacks execute in the NimBLE context; this periodic state task is not ISR/DMA. */
+    ESP_LOGI(TAG,
+             "MEM_ALLOC_PLAN owner=radar_ble_rx_stack caps=0x%08lx size=%u region=psram",
+             (unsigned long)(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             2048U);
     if (xTaskCreateWithCaps(process_task, "radar_ble_rx", 2048, NULL, 2, &s_task,
-                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         s_task = NULL;
         radar_domain_stop();
         return ESP_ERR_NO_MEM;
@@ -89,7 +94,7 @@ void radar_ble_runtime_stop(void)
 {
     radar_ble_transport_stop();
     if (s_task != NULL) {
-        vTaskDelete(s_task);
+        vTaskDeleteWithCaps(s_task);
         s_task = NULL;
     }
     s_started = false;

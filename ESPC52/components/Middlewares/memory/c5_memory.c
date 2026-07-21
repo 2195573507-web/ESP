@@ -21,6 +21,30 @@ static uint32_t c5_mem_caps(c5_mem_type_t type)
     }
 }
 
+static const char *c5_mem_region(c5_mem_type_t type)
+{
+    switch (type) {
+    case C5_MEM_INTERNAL_DMA:
+        return "internal_dma";
+    case C5_MEM_INTERNAL_CONTROL:
+        return "internal_control";
+    case C5_MEM_PSRAM:
+        return "psram";
+    default:
+        return "invalid";
+    }
+}
+
+static void c5_mem_log_plan(c5_mem_type_t type, size_t size, const char *owner)
+{
+    ESP_LOGI(TAG,
+             "MEM_ALLOC_PLAN owner=%s caps=0x%08lx size=%u region=%s",
+             owner != NULL ? owner : "<none>",
+             (unsigned long)c5_mem_caps(type),
+             (unsigned int)size,
+             c5_mem_region(type));
+}
+
 c5_mem_capacity_t c5_mem_capacity(c5_mem_type_t type)
 {
     const uint32_t caps = c5_mem_caps(type);
@@ -71,6 +95,7 @@ void c5_mem_log(const char *stage)
 
 void *c5_mem_alloc(size_t size, c5_mem_type_t type, const char *owner)
 {
+    c5_mem_log_plan(type, size, owner);
     if (c5_mem_require(type, size, size, owner) != ESP_OK) {
         return NULL;
     }
@@ -89,6 +114,7 @@ void *c5_mem_calloc(size_t count, size_t size, c5_mem_type_t type, const char *o
         return NULL;
     }
     const size_t allocation_size = count * size;
+    c5_mem_log_plan(type, allocation_size, owner);
     if (c5_mem_require(type, allocation_size, allocation_size, owner) != ESP_OK) {
         return NULL;
     }
@@ -103,6 +129,7 @@ void *c5_mem_calloc(size_t count, size_t size, c5_mem_type_t type, const char *o
 
 void *c5_mem_realloc(void *ptr, size_t size, c5_mem_type_t type, const char *owner)
 {
+    c5_mem_log_plan(type, size, owner);
     if (size != 0U && c5_mem_require(type, size, size, owner) != ESP_OK) {
         return NULL;
     }

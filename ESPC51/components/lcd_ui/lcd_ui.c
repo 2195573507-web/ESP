@@ -8,9 +8,12 @@
 
 #include "lcd_assets.h"
 #include "lcd_board_profile.h"
+#include "lcd_fault_injection.h"
 #include "lcd_touch.h"
 
 #define LCD_UI_ARENA_BYTES (96U * 1024U)
+#define LCD_UI_POOL_OFFSET_BYTES 4096U
+#define LCD_UI_POOL_BYTES (LCD_UI_ARENA_BYTES - LCD_UI_POOL_OFFSET_BYTES)
 #define LCD_UI_ANIMATION_MS 100U
 #define LCD_UI_BOOT_MS 3000U
 
@@ -51,6 +54,8 @@ typedef struct {
 static lcd_ui_context_t *s_ui;
 
 _Static_assert(sizeof(lcd_ui_context_t) <= 4096U, "UI control block must leave the PSRAM arena intact");
+_Static_assert((LCD_UI_POOL_OFFSET_BYTES % sizeof(void *)) == 0U,
+               "LVGL PSRAM pool must preserve heap allocation alignment");
 
 static lv_obj_t *lcd_ui_label(lv_obj_t *parent, const char *text, int16_t x, int16_t y, int16_t width, lv_color_t color)
 {
@@ -317,13 +322,14 @@ no_mem:
     return ESP_ERR_NO_MEM;
 }
 
-esp_err_t lcd_ui_start(lv_display_t *display, lcd_ui_wake_request_fn wake_request, void *wake_ctx)
+esp_err_t lcd_ui_prepare_lvgl_pool(void *user_ctx)
 {
+    (void)user_ctx;
     if (s_ui != NULL) {
         return ESP_OK;
     }
-    if (display == NULL) {
-        return ESP_ERR_INVALID_ARG;
+    if (lcd_fault_injection_should_fail(LCD_FAULT_UI_ARENA)) {
+        return ESP_ERR_NO_MEM;
     }
     const uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     if (heap_caps_get_free_size(caps) < LCD_UI_ARENA_BYTES ||
@@ -339,6 +345,54 @@ esp_err_t lcd_ui_start(lv_display_t *display, lcd_ui_wake_request_fn wake_reques
         return ESP_ERR_NO_MEM;
     }
     ui->arena = (uint8_t *)ui;
+    void *const pool_addr = ui->arena + LCD_UI_POOL_OFFSET_BYTES;
+    const size_t pool_size = LCD_UI_POOL_BYTES;
+    ESP_LOGI(TAG,
+             "LVGL_MEM_INIT_STAGE before_pool addr=%p size=%u align=%u builtin=%u expand=%u psram_free=%u psram_largest=%u",
+             pool_addr,
+             (unsigned)pool_size,
+             (unsigned)((uintptr_t)pool_addr % sizeof(void *)),
+             (unsigned)LV_MEM_SIZE,
+             (unsigned)LV_MEM_POOL_EXPAND_SIZE,
+             (unsigned)heap_caps_get_free_size(caps),
+             (unsigned)heap_caps_get_largest_free_block(caps));
+    ui->lvgl_pool = lv_mem_add_pool(pool_addr, pool_size);
+    ESP_LOGI(TAG,
+             "LVGL_MEM_INIT_STAGE after_pool pool=%p psram_free=%u psram_largest=%u",
+             ui->lvgl_pool,
+             (unsigned)heap_caps_get_free_size(caps),
+             (unsigned)heap_caps_get_largest_free_block(caps));
+    if (ui->lvgl_pool == NULL) {
+        heap_caps_free(ui);
+        ESP_LOGE(TAG, "LCD_UI LVGL PSRAM pool registration failed");
+        return ESP_ERR_NO_MEM;
+    }
+    s_ui = ui;
+    ESP_LOGI(TAG, "LCD_UI_POOL_READY psram_arena=%u", (unsigned)LCD_UI_ARENA_BYTES);
+    return ESP_OK;
+}
+
+void lcd_ui_release_lvgl_pool(void *user_ctx)
+{
+    (void)user_ctx;
+    lcd_ui_context_t *const ui = s_ui;
+    if (ui == NULL) {
+        return;
+    }
+    s_ui = NULL;
+    /* lv_deinit() has already released LVGL's pool metadata and theme data. */
+    heap_caps_free(ui);
+}
+
+esp_err_t lcd_ui_start(lv_display_t *display, lcd_ui_wake_request_fn wake_request, void *wake_ctx)
+{
+    if (display == NULL || s_ui == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_ui->display != NULL) {
+        return s_ui->display == display ? ESP_OK : ESP_ERR_INVALID_STATE;
+    }
+    lcd_ui_context_t *const ui = s_ui;
     ui->display = display;
     ui->wake_request = wake_request;
     ui->wake_ctx = wake_ctx;
@@ -349,14 +403,6 @@ esp_err_t lcd_ui_start(lv_display_t *display, lcd_ui_wake_request_fn wake_reques
     (void)snprintf(ui->voice_text, sizeof(ui->voice_text), "VOICE IDLE");
     (void)snprintf(ui->alarm_text, sizeof(ui->alarm_text), "ALARM 0");
     ui->command_text[0] = '\0';
-
-    ui->lvgl_pool = lv_mem_add_pool(ui->arena + 4096U, LCD_UI_ARENA_BYTES - 4096U);
-    if (ui->lvgl_pool == NULL) {
-        heap_caps_free(ui);
-        ESP_LOGE(TAG, "LCD_UI LVGL PSRAM pool registration failed");
-        return ESP_ERR_NO_MEM;
-    }
-    s_ui = ui;
     const esp_err_t ret = lcd_ui_create(ui);
     if (ret != ESP_OK) {
         (void)lcd_ui_stop();
@@ -372,7 +418,6 @@ esp_err_t lcd_ui_stop(void)
     if (ui == NULL) {
         return ESP_OK;
     }
-    s_ui = NULL;
     if (ui->animation_timer != NULL) {
         lv_timer_delete(ui->animation_timer);
         ui->animation_timer = NULL;
@@ -388,21 +433,20 @@ esp_err_t lcd_ui_stop(void)
     (void)lcd_touch_stop();
     if (ui->boot_page != NULL) {
         lv_obj_delete(ui->boot_page);
+        ui->boot_page = NULL;
     }
     if (ui->command_overlay != NULL) {
         lv_obj_delete(ui->command_overlay);
+        ui->command_overlay = NULL;
     }
     if (ui->status_page != NULL) {
         lv_obj_delete(ui->status_page);
+        ui->status_page = NULL;
     }
     if (ui->dashboard != NULL) {
         lv_obj_delete(ui->dashboard);
+        ui->dashboard = NULL;
     }
-    if (ui->lvgl_pool != NULL) {
-        lv_mem_remove_pool(ui->lvgl_pool);
-        ui->lvgl_pool = NULL;
-    }
-    heap_caps_free(ui);
     return ESP_OK;
 }
 

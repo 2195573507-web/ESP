@@ -27,6 +27,7 @@ typedef enum {
     C5_EVENT_HEARTBEAT,
     C5_EVENT_STATUS,
     C5_EVENT_COMMAND,
+    C5_EVENT_RADAR_HOME_SNAPSHOT,
     C5_EVENT_MAX,
 } c5_event_type_t;
 

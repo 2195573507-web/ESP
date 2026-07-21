@@ -311,7 +311,11 @@ void radar_spatial_state_on_frame(radar_spatial_state_t *state,
             }
             continue;
         }
-        accepted[state->snapshot.accepted_target_count++] = transformed;
+        if (state->snapshot.accepted_target_count < LD2450_MAX_TARGETS) {
+            accepted[state->snapshot.accepted_target_count++] = transformed;
+        } else {
+            ++state->tracker.diagnostics.dropped_target_count;
+        }
     }
     memcpy(state->snapshot.accepted_targets, accepted, sizeof(accepted));
 #if CONFIG_S3_RADAR_ZONE_ACTIVE

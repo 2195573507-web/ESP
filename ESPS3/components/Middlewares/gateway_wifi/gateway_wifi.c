@@ -13,6 +13,7 @@
 
 #include "esp_event.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -207,7 +208,13 @@ static esp_err_t ensure_nvs(void)
 {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
+        /* NVS recovery is part of the optional uplink path.  Do not turn an
+         * erase failure into a startup panic while AP/local HTTP can still run. */
+        ret = nvs_flash_erase();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "nvs erase failed during recovery ret=%s", esp_err_to_name(ret));
+            return ret;
+        }
         ret = nvs_flash_init();
     }
     return ret;
@@ -574,7 +581,11 @@ esp_err_t gateway_wifi_collect_sta_scan_candidates(size_t *out_scan_count)
         return ESP_ERR_NOT_FOUND;
     }
 
-    wifi_ap_record_t *records = calloc(ap_count, sizeof(*records));
+    /* A scan can return dozens of records.  Keep this burst allocation out of
+     * the scarce internal heap used by WiFi/event tasks during startup. */
+    wifi_ap_record_t *records = heap_caps_calloc(ap_count,
+                                                 sizeof(*records),
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (records == NULL) {
         ESP_LOGW(TAG, "WIFI_SCAN_DONE count=%u ret=ESP_ERR_NO_MEM", (unsigned int)ap_count);
         return ESP_ERR_NO_MEM;
@@ -583,7 +594,7 @@ esp_err_t gateway_wifi_collect_sta_scan_candidates(size_t *out_scan_count)
     uint16_t record_count = ap_count;
     ret = esp_wifi_scan_get_ap_records(&record_count, records);
     if (ret != ESP_OK) {
-        free(records);
+        heap_caps_free(records);
         ESP_LOGW(TAG, "WIFI_SCAN_DONE count=%u ret=%s", (unsigned int)ap_count, esp_err_to_name(ret));
         return ret;
     }
@@ -626,7 +637,7 @@ esp_err_t gateway_wifi_collect_sta_scan_candidates(size_t *out_scan_count)
                 (sta_scan_candidate_t){.ap = *ap, .credential_index = credential_index};
         }
     }
-    free(records);
+    heap_caps_free(records);
 
     if (s_sta_scan_candidate_count > 1U) {
         qsort(s_sta_scan_candidates,
@@ -830,7 +841,7 @@ esp_err_t gateway_wifi_start(void)
     strlcpy((char *)ap_config.ap.password,
             config->softap_password,
             sizeof(ap_config.ap.password));
-    ap_config.ap.ssid_len = strlen(config->softap_ssid);
+    ap_config.ap.ssid_len = strnlen(config->softap_ssid, sizeof(ap_config.ap.ssid));
     ap_config.ap.channel = config->softap_channel;
     ap_config.ap.max_connection = config->softap_max_connection;
     if (ap_config.ap.max_connection > GATEWAY_CONFIG_MAX_CHILDREN) {
@@ -839,7 +850,7 @@ esp_err_t gateway_wifi_start(void)
                  (unsigned int)ap_config.ap.max_connection,
                  (unsigned int)GATEWAY_CONFIG_MAX_CHILDREN);
     }
-    ap_config.ap.authmode = strlen(config->softap_password) > 0 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    ap_config.ap.authmode = config->softap_password[0] != '\0' ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     ap_config.ap.pmf_cfg.required = false;
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "set APSTA mode failed");

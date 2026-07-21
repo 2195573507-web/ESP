@@ -152,6 +152,7 @@ extern "C" {
 #define ESP111_PROTOCOL_ROUTE_RADAR_STATE "/local/v1/radar/state"
 #define ESP111_PROTOCOL_ROUTE_RADAR_RESULT "/local/v1/radar/result"
 #define ESP111_PROTOCOL_ROUTE_RADAR_DEBUG "/local/v1/radar/debug"
+#define ESP111_PROTOCOL_ROUTE_RADAR_HOME_SNAPSHOT "/local/v1/radar/home_snapshot"
 #define ESP111_PROTOCOL_ROUTE_DEVICE_STREAM "/local/v1/stream"
 #define ESP111_PROTOCOL_ROUTE_VOICE_TURN "/local/v1/voice/turn"
 #define ESP111_PROTOCOL_ROUTE_VOICE_PROMPT_CACHE "/local/v1/voice/prompt-cache"

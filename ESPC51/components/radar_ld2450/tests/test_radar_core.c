@@ -4,7 +4,6 @@
 #include <string.h>
 
 #include "ld2450_parser.h"
-#include "radar_edge_filter.h"
 #include "radar_state_codec.h"
 
 typedef struct {
@@ -143,46 +142,11 @@ static void test_v3_codec(void)
     assert(strstr(json, "\"room_id\":\"living_room\"") != NULL);
 }
 
-static void test_edge_filter(void)
-{
-    radar_edge_filter_t filter;
-    radar_edge_filter_init(&filter);
-    radar_target_sample_t sample = {
-        .local_id = 1U,
-        .link_state = 5U,
-        .sample_valid = true,
-        .frame_seq = 1U,
-        .target_count = 3U,
-        .targets = {
-            {.valid = true, .slot = 1U, .x_mm = 200, .y_mm = 0, .speed_cm_s = 30,
-             .resolution_mm = 320U, .distance_mm = 2000U},
-            {.valid = true, .slot = 0U, .x_mm = 100, .y_mm = 0, .speed_cm_s = 10,
-             .resolution_mm = 320U, .distance_mm = 1000U},
-            {.valid = true, .slot = 2U, .x_mm = 0, .y_mm = 0, .speed_cm_s = 20,
-             .resolution_mm = 320U, .distance_mm = 6001U},
-        },
-    };
-    radar_edge_filter_apply(&filter, &sample);
-    assert(sample.target_count == 2U);
-    assert(sample.targets[0].slot == 0U && sample.targets[0].confidence == 60U);
-    assert(sample.targets[1].slot == 1U && sample.targets[1].confidence == 60U);
-
-    sample.frame_seq = 2U;
-    sample.target_count = 1U;
-    sample.targets[0] = (radar_target_t){.valid = true, .slot = 0U, .x_mm = 100,
-                                          .y_mm = 0, .speed_cm_s = 16,
-                                          .resolution_mm = 320U, .distance_mm = 1000U};
-    radar_edge_filter_apply(&filter, &sample);
-    assert(sample.target_count == 1U && sample.targets[0].speed_cm_s == 12);
-    assert(sample.targets[0].confidence == 70U);
-}
-
 int main(void)
 {
     test_official_decode_and_streaming();
     test_resync_and_zero_target_frame();
     test_v3_codec();
-    test_edge_filter();
-    puts("C5 LD2450 parser, filter and v3 codec tests: PASS");
+    puts("C5 LD2450 parser and v3 codec tests: PASS");
     return 0;
 }

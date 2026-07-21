@@ -93,8 +93,10 @@ static void registry_snapshot_from_spatial(const radar_spatial_snapshot_t *spati
     snapshot->uart_online = spatial->sensor_state != RADAR_SENSOR_OFFLINE;
     snapshot->frame_fresh = spatial->sensor_state == RADAR_SENSOR_VALID;
     snapshot->last_valid_frame_ms = spatial->latest_frame_ms;
-    snapshot->current_target_count = spatial->visible_track_count;
-    for (size_t i = 0U; i < spatial->visible_track_count; ++i) {
+    const size_t visible_count = spatial->visible_track_count > LD2450_MAX_TARGETS
+        ? LD2450_MAX_TARGETS : spatial->visible_track_count;
+    snapshot->current_target_count = (uint8_t)visible_count;
+    for (size_t i = 0U; i < visible_count; ++i) {
         const radar_track_snapshot_t *target = &spatial->current_targets[i];
         snapshot->targets[i] = (radar_target_t){
             .valid = true,
@@ -463,7 +465,9 @@ bool radar_local_adapter_get_readonly_snapshot(radar_readonly_snapshot_t *out)
     out->occupancy_state = spatial.occupancy_state;
     out->motion_state = spatial.motion_state;
     out->count_summary = count_summary_from_spatial(&spatial);
-    for (size_t i = 0U; i < spatial.visible_track_count; ++i) {
+    const size_t visible_count = spatial.visible_track_count > RADAR_TRACKER_MAX_TRACKS
+        ? RADAR_TRACKER_MAX_TRACKS : spatial.visible_track_count;
+    for (size_t i = 0U; i < visible_count; ++i) {
         const radar_track_snapshot_t *track = &spatial.current_targets[i];
         out->tracks[out->track_count++] = (radar_readonly_track_t){
             .track_id = track->track_id,

@@ -1619,7 +1619,7 @@ esp_err_t s3_scheduler_start(void)
                                                  NULL,
                                                  S3_PROTOCOL_WORKER_TASK_PRIORITY,
                                                  &s_protocol_worker_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_protocol_worker_task = NULL;
             return ESP_ERR_NO_MEM;
@@ -1637,7 +1637,7 @@ esp_err_t s3_scheduler_start(void)
                                                  NULL,
                                                  S3_STREAM_WORKER_TASK_PRIORITY,
                                                  &s_stream_worker_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_stream_worker_task = NULL;
             goto fail;
@@ -1658,7 +1658,7 @@ esp_err_t s3_scheduler_start(void)
                                              NULL,
                                              S3_SCHEDULER_TASK_PRIORITY,
                                              &s_scheduler_task,
-                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                             APP_TASK_STACK_CAPS_PSRAM);
     if (created != pdPASS) {
         s_scheduler_task = NULL;
         goto fail;

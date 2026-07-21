@@ -130,7 +130,9 @@ static void format_occupied_rooms(const RadarHomeState *home,
     const int prefix_written = snprintf(out, out_size, "[");
     if (prefix_written < 0 || (size_t)prefix_written >= out_size) return;
     used = (size_t)prefix_written;
-    for (uint8_t i = 0U; i < home->occupied_room_count; ++i) {
+    const size_t room_count = home->occupied_room_count > RADAR_SOURCE_COUNT
+        ? RADAR_SOURCE_COUNT : home->occupied_room_count;
+    for (size_t i = 0U; i < room_count; ++i) {
         const RadarRoomState *room = &home->occupied_rooms[i];
         const int written = snprintf(out + used, out_size - used, "%s%s:%s",
                                      i == 0U ? "" : "|", room->source, room->room_id);

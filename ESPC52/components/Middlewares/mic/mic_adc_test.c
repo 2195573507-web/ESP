@@ -1858,12 +1858,23 @@ esp_err_t mic_adc_test_start(void)
         return ESP_FAIL;
     }
     if (mic_adc_shutdown_is_in_progress()) {
-        ESP_LOGW(TAG, "Mic ADC start rejected: shutdown is in progress");
-        return ESP_ERR_INVALID_STATE;
+        ESP_LOGI(TAG,
+                 "MIC_ADC_NOT_READY reason=shutdown_in_progress ret=%s",
+                 esp_err_to_name(MIC_ADC_ERR_NOT_READY));
+        return MIC_ADC_ERR_NOT_READY;
     }
     if (s_mic_adc_task_handle != NULL) {
         mic_adc_log_heap("Mic ADC start API: reuse existing task");
         return ESP_OK;
+    }
+
+    /* Do not reserve Mic control resources until the STA stability window has
+     * elapsed.  voice_chain owns the retry and keeps its framework alive. */
+    if (!wifi_is_stable()) {
+        ESP_LOGI(TAG,
+                 "MIC_ADC_NOT_READY reason=wifi_not_stable ret=%s",
+                 esp_err_to_name(MIC_ADC_ERR_NOT_READY));
+        return MIC_ADC_ERR_NOT_READY;
     }
 
     if (s_mic_adc_control_events == NULL) {
@@ -1886,13 +1897,6 @@ esp_err_t mic_adc_test_start(void)
                              MIC_CTRL_INIT_READY |
                              MIC_CTRL_INIT_ABORT);
     mic_adc_log_heap("Mic ADC start API: after control event clear");
-
-    mic_adc_log_heap("Mic ADC start API: before wifi ready check");
-    if (!wifi_is_stable()) {
-        ESP_LOGW(TAG, "WiFi is not stable yet, skip Mic ADC/VAD start");
-        return ESP_ERR_INVALID_STATE;
-    }
-    mic_adc_log_heap("Mic ADC start API: after wifi ready check");
 
     mic_adc_log_start_stage("mic_pre_roll_alloc", "before", ESP_ERR_NOT_FINISHED);
     esp_err_t ret = mic_adc_allocate_psram_audio_storage();

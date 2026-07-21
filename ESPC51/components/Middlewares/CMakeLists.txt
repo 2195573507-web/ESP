@@ -57,7 +57,7 @@ set(radar_domain_srcs
             radar_domain/radar_memory_manager.c
             radar_domain/radar_buffer.c
             radar_domain/radar_upload_queue.c
-            radar_domain/radar_resource_adapter.c
+            radar_domain/radar_home_snapshot_client.c
             radar_domain/radar_worker.c)
 
 set(system_srcs
@@ -127,7 +127,6 @@ set(requires
             esp111_protocol_common
             radar_ld2450
             lcd_ui
-            radar_domain
             bt
             espressif__esp-sr)
 

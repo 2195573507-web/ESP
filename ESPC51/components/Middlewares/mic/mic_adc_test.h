@@ -10,6 +10,10 @@
 #include "soc/soc_caps.h"
 #include "app_debug_config.h"
 
+/* ESP-IDF has no generic ESP_ERR_NOT_READY.  Keep the temporary startup
+ * condition distinct from an invalid lifecycle or an ADC hardware failure. */
+#define MIC_ADC_ERR_NOT_READY ESP_ERR_NOT_FINISHED
+
 /* 硬件连接：OPA_OUT -> ESP32-C5 GPIO6 / ADC1_CH5。 */
 #define MIC_ADC_GPIO_NUM             6                         // Mic 输入 GPIO。
 #define MIC_ADC_UNIT                 ADC_UNIT_1                // GPIO6 属于 ADC1。
@@ -75,7 +79,8 @@
  * 5. 外层 VAD 触发 VOICE_END 后先发送 post-roll，再进入 FINISHING；
  *    finish/stop 完成本轮 session 后回到 IDLE，继续等待下一次说话。
  *
- * @return 成功返回 ESP_OK，失败返回 ESP-IDF 错误码。
+ * @return 成功返回 ESP_OK；WiFi 尚未稳定或前一轮收尾中返回
+ * MIC_ADC_ERR_NOT_READY；硬件或资源错误返回对应 ESP-IDF 错误码。
  */
 esp_err_t mic_adc_test_start(void);
 

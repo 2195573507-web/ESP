@@ -6,8 +6,11 @@
 #include <stdlib.h>
 
 #include "app_debug_config.h"
+#include "c5_backpressure_controller.h"
+#include "c5_memory.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_partition.h"
 #include "esp_wn_iface.h"
 #include "esp_wn_models.h"
 #include "freertos/FreeRTOS.h"
@@ -25,6 +28,11 @@ static const char *LOCAL_WAKE_MODEL_KEYWORD = "nihaoxiaozhi";
 #define LOCAL_WAKE_FALLBACK_BEEP_SAMPLES 1600U
 #define LOCAL_WAKE_FALLBACK_BEEP_HALF_PERIOD_SAMPLES 8U
 #define LOCAL_WAKE_FALLBACK_BEEP_AMPLITUDE 1200
+/* ESP-SR maps the model partition from flash.  The opaque loader routes its
+ * large allocations through the configured PSRAM-capable heap; this wrapper
+ * needs only a small internal control reserve. */
+#define LOCAL_WAKE_MIN_INTERNAL_CONTROL_FREE (4U * 1024U)
+#define LOCAL_WAKE_MIN_INTERNAL_CONTROL_LARGEST (1024U)
 
 static portMUX_TYPE s_wake_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_initialized;
@@ -39,6 +47,64 @@ static model_iface_data_t *s_model_data;
 static size_t s_wakenet_chunk_samples;
 static int16_t s_fallback_beep[LOCAL_WAKE_FALLBACK_BEEP_SAMPLES];
 static bool s_fallback_beep_ready;
+
+static esp_err_t local_wake_word_admit_model_create(void)
+{
+    const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const uint32_t psram_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    const size_t internal_free = heap_caps_get_free_size(internal_caps);
+    const size_t internal_largest = heap_caps_get_largest_free_block(internal_caps);
+    const size_t psram_free = heap_caps_get_free_size(psram_caps);
+    const size_t psram_largest = heap_caps_get_largest_free_block(psram_caps);
+    const esp_partition_t *model_partition =
+        esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                 ESP_PARTITION_SUBTYPE_ANY,
+                                 LOCAL_WAKE_MODEL_PARTITION);
+    const char *reason = NULL;
+    esp_err_t ret = ESP_OK;
+
+    if (!c5_scheduler_is_dispatcher_ready()) {
+        reason = "dispatcher_unavailable";
+        ret = ESP_ERR_INVALID_STATE;
+    }
+    if (ret == ESP_OK && (model_partition == NULL || model_partition->size == 0U)) {
+        reason = "model_storage_unavailable";
+        ret = ESP_ERR_NOT_FOUND;
+    }
+    if (ret == ESP_OK) {
+        if (internal_free < LOCAL_WAKE_MIN_INTERNAL_CONTROL_FREE ||
+            internal_largest < LOCAL_WAKE_MIN_INTERNAL_CONTROL_LARGEST) {
+            reason = "internal_control_reserve_unavailable";
+            ret = ESP_ERR_NO_MEM;
+        } else if (psram_free == 0U || psram_largest == 0U) {
+            reason = "psram_unavailable";
+            ret = ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "C5_RESOURCE_DENIED module=voice_wake reason=%s ret=%s internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u model_partition_bytes=%u dispatcher_ready=%u",
+                 reason,
+                 esp_err_to_name(ret),
+                 (unsigned int)internal_free,
+                 (unsigned int)internal_largest,
+                 (unsigned int)psram_free,
+                 (unsigned int)psram_largest,
+                 (unsigned int)(model_partition != NULL ? model_partition->size : 0U),
+                 c5_scheduler_is_dispatcher_ready() ? 1U : 0U);
+        return ret;
+    }
+
+    ESP_LOGI(TAG,
+             "C5_RESOURCE_ADMISSION module=voice_wake internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u model_partition_bytes=%u dispatcher_ready=1",
+             (unsigned int)internal_free,
+             (unsigned int)internal_largest,
+             (unsigned int)psram_free,
+             (unsigned int)psram_largest,
+             (unsigned int)model_partition->size);
+    return ESP_OK;
+}
 
 static void local_wake_word_log_heap(const char *label)
 {
@@ -135,6 +201,10 @@ esp_err_t local_wake_word_init(void)
 {
     local_wake_word_reset_runtime_flags();
     local_wake_word_mark_detector_unready();
+    const esp_err_t admission_ret = local_wake_word_admit_model_create();
+    if (admission_ret != ESP_OK) {
+        return admission_ret;
+    }
     local_wake_word_log_heap("WakeNet init before model load");
 
     s_models = esp_srmodel_init(LOCAL_WAKE_MODEL_PARTITION);
@@ -173,6 +243,9 @@ esp_err_t local_wake_word_init(void)
     if (s_model_data == NULL) {
         ESP_LOGE(TAG, "WakeNet create failed model=%s", model_name);
         local_wake_word_log_heap("WakeNet create failed");
+        esp_srmodel_deinit(s_models);
+        s_models = NULL;
+        s_wakenet = NULL;
         return ESP_ERR_NO_MEM;
     }
 

@@ -45,6 +45,8 @@ static inline UBaseType_t app_stack_monitor_log(const char *tag,
     return high_water;
 }
 
+void app_stack_monitor_log_system_state(const char *tag, const char *stage);
+
 /* Invoke only at lifecycle boundaries; full heap walks are not suitable for
  * ISR or high-frequency audio callbacks. */
 static inline bool app_runtime_guard_check_heap_integrity(const char *tag,

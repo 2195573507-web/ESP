@@ -275,7 +275,7 @@ esp_err_t voice_proxy_init(void)
                             NULL,
                             VOICE_PROXY_WORKER_PRIORITY,
                             &s_voice_worker,
-                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+                            APP_TASK_STACK_CAPS_PSRAM) != pdPASS) {
         vQueueDelete(s_voice_queue);
         s_voice_queue = NULL;
         vSemaphoreDelete(s_voice_lock);

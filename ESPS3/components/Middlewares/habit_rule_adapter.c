@@ -13,7 +13,10 @@ static bool habit_rule_snapshot(void *context, habit_room_snapshot_t *out)
     radar_home_snapshot_t snapshot;
     if (out == NULL || !radar_home_snapshot_get(&snapshot) || !snapshot.occupancy_known ||
         snapshot.room_count == 0U) return false;
-    const radar_home_snapshot_room_t *room = &snapshot.rooms[next_room % snapshot.room_count];
+    const size_t room_count = snapshot.room_count > RADAR_HOME_SNAPSHOT_MAX_ROOMS
+        ? RADAR_HOME_SNAPSHOT_MAX_ROOMS : snapshot.room_count;
+    if (room_count == 0U) return false;
+    const radar_home_snapshot_room_t *room = &snapshot.rooms[next_room % room_count];
     ++next_room;
     if (!room->known || room->room_id[0] == '\0' || room->timestamp_ms == 0U) return false;
     memset(out, 0, sizeof(*out));

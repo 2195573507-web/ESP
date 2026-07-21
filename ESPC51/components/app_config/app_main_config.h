@@ -32,19 +32,6 @@
 #define MAIN_ENABLE_SPEAKER_SELF_TEST 0
 #endif
 
-/* Adaptive telemetry is additive: disabling each switch restores its legacy cadence. */
-#ifndef CONFIG_C5_RADAR_ADAPTIVE_UPLOAD
-#define CONFIG_C5_RADAR_ADAPTIVE_UPLOAD 1
-#endif
-
-#ifndef CONFIG_C5_BME_ADAPTIVE_REPORT
-#define CONFIG_C5_BME_ADAPTIVE_REPORT 1
-#endif
-
-#ifndef CONFIG_C5_VOICE_TELEMETRY_THROTTLE
-#define CONFIG_C5_VOICE_TELEMETRY_THROTTLE 1
-#endif
-
 #ifndef C5_SCHEDULER_TASK_STACK
 /* C5 event dispatcher 栈；业务 HTTP/JSON/传感器路径在 worker 中执行。 */
 #define C5_SCHEDULER_TASK_STACK 12288U
@@ -76,8 +63,11 @@
 #endif
 
 #ifndef APP_STARTUP_TASK_STACK
-/* 复杂 WiFi/HTTP/audio 启动链路任务栈，单位字节；避免压占 ESP-IDF main_task 栈。 */
-#define APP_STARTUP_TASK_STACK 12288U
+    /*
+     * Flash/NVS/Wi-Fi initialization can freeze caches. Keep this startup-only
+     * stack in internal RAM and leave enough headroom for those call chains.
+     */
+#define APP_STARTUP_TASK_STACK 16384U
 #endif
 
 #ifndef APP_STARTUP_TASK_PRIORITY
@@ -121,8 +111,8 @@
 #error "C5_WORKER_TASK_PRIORITY must be greater than 0"
 #endif
 
-#if APP_STARTUP_TASK_STACK < 8192
-#error "APP_STARTUP_TASK_STACK must be at least 8192"
+#if APP_STARTUP_TASK_STACK < 16384
+#error "APP_STARTUP_TASK_STACK must be at least 16384"
 #endif
 
 #if APP_STARTUP_TASK_PRIORITY <= 0

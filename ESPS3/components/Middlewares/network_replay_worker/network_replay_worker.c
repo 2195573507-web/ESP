@@ -264,7 +264,7 @@ esp_err_t network_replay_worker_init(void)
                                              NULL,
                                              NETWORK_REPLAY_WORKER_TASK_PRIORITY,
                                              &s_replay_task,
-                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                             APP_TASK_STACK_CAPS_PSRAM);
     if (created != pdPASS) {
         s_replay_task = NULL;
         return ESP_ERR_NO_MEM;

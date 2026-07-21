@@ -28,6 +28,10 @@ static void gateway_startup_task(void *arg)
 {
     (void)arg;
 
+    /* app_main records the post-create heap boundary before this task can
+     * initialise a module on the other core. */
+    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
     app_stack_monitor_report(TAG,
                              "gateway_startup_task",
                              APP_STARTUP_TASK_STACK,
@@ -61,6 +65,7 @@ void app_main(void)
     app_debug_apply_log_levels();
     app_stack_monitor_log(TAG, "app_main", "entry");
 
+    (void)app_heap_integrity_check(TAG, "app_main_enter");
     BaseType_t created = xTaskCreateWithCaps(gateway_startup_task,
                                              "gateway_startup",
                                              APP_STARTUP_TASK_STACK,
@@ -69,6 +74,7 @@ void app_main(void)
                                              &s_gateway_task,
                                              /* Flash/NVS cache-off paths require an internal-RAM stack. */
                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    (void)app_heap_integrity_check(TAG, "after_task_create");
     app_stack_monitor_log(TAG, "app_main", "after_gateway_task_create");
     if (created != pdPASS) {
         s_gateway_task = NULL;
@@ -83,6 +89,7 @@ void app_main(void)
                                        "gateway_startup",
                                        s_gateway_task,
                                        APP_STARTUP_TASK_STACK);
+    xTaskNotifyGive(s_gateway_task);
 
     app_stack_monitor_log(TAG, "app_main", "return");
 }

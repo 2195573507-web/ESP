@@ -18,7 +18,9 @@ static void copy_text(char *out, size_t out_size, const char *value)
 
 static int find_room(const radar_home_snapshot_t *snapshot, const char *room_id)
 {
-    for (uint8_t index = 0U; index < snapshot->room_count; ++index) {
+    const uint8_t room_count = snapshot->room_count > RADAR_HOME_SNAPSHOT_MAX_ROOMS
+        ? RADAR_HOME_SNAPSHOT_MAX_ROOMS : snapshot->room_count;
+    for (uint8_t index = 0U; index < room_count; ++index) {
         if (strcmp(snapshot->rooms[index].room_id, room_id) == 0) return (int)index;
     }
     return -1;
@@ -27,7 +29,9 @@ static int find_room(const radar_home_snapshot_t *snapshot, const char *room_id)
 static const RadarRoomState *find_occupied_source(const RadarHomeState *home,
                                                    radar_source_id_t source)
 {
-    for (uint8_t index = 0U; index < home->occupied_room_count; ++index) {
+    const uint8_t room_count = home->occupied_room_count > RADAR_SOURCE_COUNT
+        ? RADAR_SOURCE_COUNT : home->occupied_room_count;
+    for (uint8_t index = 0U; index < room_count; ++index) {
         if (home->occupied_rooms[index].source_id == source) return &home->occupied_rooms[index];
     }
     return NULL;
@@ -76,7 +80,9 @@ bool radar_home_snapshot_get(radar_home_snapshot_t *out)
         }
     }
 
-    for (uint8_t index = 0U; index < out->room_count; ++index) {
+    const uint8_t room_count = out->room_count > RADAR_HOME_SNAPSHOT_MAX_ROOMS
+        ? RADAR_HOME_SNAPSHOT_MAX_ROOMS : out->room_count;
+    for (uint8_t index = 0U; index < room_count; ++index) {
         const radar_home_snapshot_room_t *room = &out->rooms[index];
         out->occupied = out->occupied || room->occupied;
         const uint16_t count = (uint16_t)out->person_count + room->person_count;

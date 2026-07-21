@@ -1,0 +1,9 @@
+
+
+# Load bootloader symbols
+set confirm off
+    add-symbol-file /Users/zhiqin/ESP 部分开发/build-c5-startup-c51/bootloader/bootloader.elf
+set confirm on
+
+# Load application symbols
+file /Users/zhiqin/ESP 部分开发/build-c5-startup-c51/00_Learn.elf

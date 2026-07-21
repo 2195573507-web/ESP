@@ -26,7 +26,7 @@
     xQueueCreateWithCaps((depth), (item_size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define ENV_ALARM_REPORTER_TASK_CREATE(task, name, stack, arg, priority, handle) \
     xTaskCreateWithCaps((task), (name), (stack), (arg), (priority), (handle), \
-                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #else
 #include <stdlib.h>
 #define ENV_ALARM_STORAGE_ALLOC(count, size) calloc((count), (size))

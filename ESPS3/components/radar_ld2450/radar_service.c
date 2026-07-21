@@ -125,6 +125,9 @@ static void log_raw_rx_hex(const uint8_t *data, size_t data_len, uint64_t timest
             }
             written += (size_t)count;
         }
+        /* snprintf leaves no room for a terminator only on truncation, which
+         * is handled above.  Keep the %s argument explicitly bounded. */
+        hex_line[written] = '\0';
         ESP_LOGI(TAG,
                  "RADAR_RX_FRAME event=raw_hex_data bytes=%s" RADAR_S3_LOG_IDENTITY_FORMAT,
                  hex_line,
@@ -174,6 +177,14 @@ static void enqueue_rx_bytes(const uint8_t *data, size_t data_len)
         return;
     }
     const size_t capacity = sizeof(s_pending_rx_bytes);
+    if (s_pending_rx_length > capacity) {
+        ESP_LOGE(TAG,
+                 "RADAR_MEMORY_CORRUPTION stage=rx_pending_length value=%u capacity=%u action=reset",
+                 (unsigned int)s_pending_rx_length,
+                 (unsigned int)capacity);
+        s_pending_rx_length = 0U;
+        sat_inc_u32(&s_pending_rx_drops);
+    }
     const size_t available = capacity - s_pending_rx_length;
     const size_t copied = data_len < available ? data_len : available;
     if (copied > 0U) {
@@ -192,7 +203,14 @@ size_t radar_service_process_pending(uint64_t processed_at_ms)
         xSemaphoreTake(s_rx_buffer_lock, portMAX_DELAY) != pdTRUE) {
         return 0U;
     }
-    const size_t length = s_pending_rx_length;
+    const size_t length = s_pending_rx_length > sizeof(s_parser_feed_bytes)
+        ? sizeof(s_parser_feed_bytes) : s_pending_rx_length;
+    if (s_pending_rx_length > sizeof(s_parser_feed_bytes)) {
+        ESP_LOGE(TAG,
+                 "RADAR_MEMORY_CORRUPTION stage=rx_pending_copy value=%u capacity=%u action=clamp",
+                 (unsigned int)s_pending_rx_length,
+                 (unsigned int)sizeof(s_parser_feed_bytes));
+    }
     if (length > 0U) {
         memcpy(s_parser_feed_bytes, s_pending_rx_bytes, length);
         s_pending_rx_length = 0U;
