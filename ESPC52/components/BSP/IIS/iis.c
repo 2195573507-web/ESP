@@ -41,12 +41,28 @@ static bool s_iis_config_logged = false;
 
 static void iis_log_dma_heap_before_init(void)
 {
+    const unsigned int slot_num = IIS_PDM_SLOT_MODE == I2S_SLOT_MODE_MONO ? 1U : 2U;
+    const unsigned int bytes_per_sample = sizeof(int16_t);
+    const unsigned int bytes_per_dma_buffer =
+        IIS_EFFECTIVE_DMA_FRAME_NUM * slot_num * bytes_per_sample;
+    const unsigned int estimated_total_dma_bytes =
+        IIS_EFFECTIVE_DMA_DESC_NUM * bytes_per_dma_buffer;
     ESP_LOGI(TAG,
-             "IIS_DMA_CHECK\ninternal_free=%u\ninternal_largest=%u\ndma_free=%u\ndma_largest=%u",
-             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             "IIS_DMA_REQUIREMENT dma_desc_num=%u dma_frame_num=%u slot_num=%u "
+             "data_bit_width=%u bytes_per_sample=%u bytes_per_dma_buffer=%u "
+             "estimated_total_dma_bytes=%u dma_free=%u dma_largest=%u "
+             "internal_free=%u internal_largest=%u",
+             (unsigned int)IIS_EFFECTIVE_DMA_DESC_NUM,
+             (unsigned int)IIS_EFFECTIVE_DMA_FRAME_NUM,
+             slot_num,
+             (unsigned int)IIS_BITS_PER_SAMPLE,
+             bytes_per_sample,
+             bytes_per_dma_buffer,
+             estimated_total_dma_bytes,
              (unsigned int)heap_caps_get_free_size(MALLOC_CAP_DMA),
-             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 }
 
 static void iis_log_values(const char *message,
@@ -336,6 +352,7 @@ esp_err_t iis_init(void)
     }
 
     s_tx_enabled = false;
+    ESP_LOGI(TAG, "SPEAKER_TX_INIT_OK");
     iis_log_hardware_config_once();
     ESP_LOGD(TAG,
              "IIS/PDM TX ready enabled=%d sclk=%u bclk=%u dma_total=%u",
@@ -435,12 +452,17 @@ esp_err_t iis_stop(void)
     return err;
 }
 
-esp_err_t iis_deinit(void)
+esp_err_t iis_deinit_timed(uint32_t lock_timeout_ms)
 {
     if (s_iis_mutex == NULL) {
         return ESP_OK;
     }
-    if (xSemaphoreTake(s_iis_mutex, portMAX_DELAY) != pdTRUE) {
+    TickType_t timeout_ticks = lock_timeout_ms == UINT32_MAX ?
+                                   portMAX_DELAY : pdMS_TO_TICKS(lock_timeout_ms);
+    if (lock_timeout_ms > 0U && timeout_ticks == 0U) {
+        timeout_ticks = 1U;
+    }
+    if (xSemaphoreTake(s_iis_mutex, timeout_ticks) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
 
@@ -463,9 +485,17 @@ esp_err_t iis_deinit(void)
         s_tx_enabled = false;
     }
     (void)iis_pa_set_enabled(false, "iis_deinit");
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "SPEAKER_TX_DEINIT_OK");
+    }
 
     xSemaphoreGive(s_iis_mutex);
     return ret;
+}
+
+esp_err_t iis_deinit(void)
+{
+    return iis_deinit_timed(UINT32_MAX);
 }
 
 esp_err_t iis_get_info(i2s_chan_info_t *out_info)

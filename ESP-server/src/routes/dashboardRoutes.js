@@ -103,6 +103,7 @@ function createDashboardRouter(options) {
             const queued = enqueuePersistenceJob({
                 type: "gateway.dashboard_snapshot",
                 priority: PRIORITY_HIGH,
+                snapshot_id: result.snapshotId,
                 run: async () => {
                     await persistDashboardSnapshot(dbRun, dbAll, result);
                     for (const deviceId of result.data.bound_device_ids || []) {

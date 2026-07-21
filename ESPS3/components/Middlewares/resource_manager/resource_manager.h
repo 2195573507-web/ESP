@@ -125,6 +125,18 @@ size_t resource_manager_snapshot_live(
 bool resource_manager_get_session(const char *device_id,
                                   resource_manager_session_view_t *out_view);
 
+/**
+ * @brief Read one session view while bounding the manager mutex wait.
+ *
+ * `ESP_OK` means the lock was acquired; `out_found` then distinguishes a
+ * missing session from a populated view. HTTP ingress uses this to fail
+ * admission instead of waiting indefinitely behind lifecycle work.
+ */
+esp_err_t resource_manager_get_session_timed(const char *device_id,
+                                             resource_manager_session_view_t *out_view,
+                                             uint32_t lock_timeout_ms,
+                                             bool *out_found);
+
 /** @brief Emit a consistent session diagnostic log for lifecycle boundaries. */
 void resource_manager_log_session_diagnostic(const char *device_id,
                                              const char *link_id,

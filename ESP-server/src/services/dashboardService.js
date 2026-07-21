@@ -475,7 +475,10 @@ function normalizeSnapshotDevice(device, serverRecvMs, gatewayTimestampMs) {
         return null;
     }
 
-    const online = booleanValue(device.online, false);
+    const voiceBusy = booleanValue(device.voice_busy, false);
+    // voice_busy is an active S3 child-registry state. It must not be exposed
+    // as offline merely because the separate online bit is momentarily stale.
+    const online = booleanValue(device.online, false) || voiceBusy;
     const childLastSeenMs = integerOrNull(device.child_last_seen_ms ?? device.last_seen_ms);
     const lastSeenMs = projectChildLastSeenMs(childLastSeenMs, gatewayTimestampMs, serverRecvMs);
 
@@ -492,7 +495,7 @@ function normalizeSnapshotDevice(device, serverRecvMs, gatewayTimestampMs) {
         status: trimText(device.status, 40) || (online ? "online" : "offline"),
         offline_reason: trimText(device.offline_reason, 128) || null,
         link_lost: booleanValue(device.link_lost, false),
-        voice_busy: booleanValue(device.voice_busy, false),
+        voice_busy: voiceBusy,
         child_last_seen_ms: childLastSeenMs,
         server_received_ms: serverRecvMs,
         // Public status timestamps stay in Server epoch time. child_last_seen_ms
@@ -573,6 +576,7 @@ function computeHomeSummary(devices) {
     const summary = {
         online_device_count: 0,
         offline_device_count: 0,
+        unknown_device_count: 0,
         avg_temperature: null,
         avg_humidity: null,
         avg_air_quality: null
@@ -583,10 +587,12 @@ function computeHomeSummary(devices) {
     let count = 0;
 
     for (const device of devices) {
-        if (device.online) {
+        if (device.online === true) {
             summary.online_device_count += 1;
-        } else {
+        } else if (device.online === false) {
             summary.offline_device_count += 1;
+        } else {
+            summary.unknown_device_count += 1;
         }
         if (device.online && device.sensors) {
             if (Number.isFinite(device.sensors.temperature)) {
@@ -1082,15 +1088,17 @@ function readAirQuality(row) {
 }
 
 function mapDashboardDeviceStatus(status, fallbackDeviceId = "") {
+    const observed = Boolean(status);
     return {
         device_id: resolveDeviceId(status?.device_id || fallbackDeviceId),
-        online: Boolean(status?.online),
-        device_online: Boolean(status?.device_online),
-        status: textOrNull(status?.status),
-        status_source: textOrNull(status?.status_source),
+        online: observed ? Boolean(status.online) : null,
+        device_online: observed ? Boolean(status.device_online) : null,
+        status: textOrNull(status?.status) || "unknown",
+        status_source: textOrNull(status?.status_source) || "not_observed",
+        observed,
         offline_reason: textOrNull(status?.offline_reason),
-        link_lost: Boolean(status?.link_lost),
-        voice_busy: Boolean(status?.voice_busy),
+        link_lost: observed ? Boolean(status.link_lost) : null,
+        voice_busy: observed ? Boolean(status.voice_busy) : null,
         child_last_seen_ms: status?.child_last_seen_ms ?? null,
         server_received_ms: status?.server_received_ms ?? null,
         last_seen_ms: status?.last_seen_ms ?? null,
@@ -1347,8 +1355,12 @@ function mapDashboardSensor(row, deviceStatus = null, moduleStatus = null, optio
 
     const airQuality = readAirQuality(row);
     const delay = pickSensorDelay(row, deviceStatus, moduleStatus);
-    const deviceOnline = Boolean(deviceStatus?.online);
-    const sensorOnline = Boolean(moduleStatus?.online);
+    const deviceObserved = Boolean(deviceStatus);
+    const deviceOnline = deviceObserved ? Boolean(deviceStatus.online) : null;
+    const sensorOnline = moduleStatus ? Boolean(moduleStatus.online) : null;
+    const online = deviceOnline === null
+        ? null
+        : (sensorOnline === null ? deviceOnline : (deviceOnline && sensorOnline));
 
     return {
         id: row.id,
@@ -1365,9 +1377,12 @@ function mapDashboardSensor(row, deviceStatus = null, moduleStatus = null, optio
         server_recv_ms: integerOrNull(row.server_recv_ms),
         server_time_iso: textOrNull(row.server_time_iso),
         upload_delay_ms: integerOrNull(row.upload_delay_ms),
-        online: deviceOnline && sensorOnline,
+        online,
         device_online: deviceOnline,
         sensor_online: sensorOnline,
+        status: deviceStatus?.status || "unknown",
+        status_source: deviceStatus?.status_source || "not_observed",
+        offline_reason: deviceStatus?.offline_reason ?? null,
         ...delay,
         ...airQuality,
         time_sync: options.includeTimeSync ? getTimeSyncStatus() : undefined
@@ -1607,7 +1622,7 @@ async function readDashboardOverview(dbAll, query = {}, options = {}) {
         local_id: null,
         name: "",
         room_name: "unassigned",
-        online: Boolean(sensorLatest?.online ?? deviceStatus?.online),
+        online: sensorLatest?.online ?? deviceStatus?.online ?? null,
         wifi_rssi: null,
         timestamp: sensorLatest?.timestamp ?? deviceStatus?.last_seen_ms ?? Date.now(),
         sensors: sensorLatest ? {

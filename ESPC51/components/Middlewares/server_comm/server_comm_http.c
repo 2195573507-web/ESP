@@ -63,11 +63,16 @@ struct server_comm_raw_stream {
 };
 
 static void server_comm_reset_response(server_comm_http_response_t *response);
+static bool server_comm_request_is_reconnect_for_current_task(void);
+static bool server_comm_endpoint_is_wake_prompt(const char *endpoint);
+static bool server_comm_endpoint_is_voice_turn(const char *endpoint);
+static void server_comm_log_voice_busy_skip(const char *label, const char *endpoint);
 
 static portMUX_TYPE s_server_comm_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_voice_request_task;
 static TaskHandle_t s_wake_prompt_request_task;
 static bool s_non_voice_paused;
+static uint32_t s_non_voice_inflight;
 static int64_t s_last_voice_busy_log_ms;
 
 void server_comm_http_set_voice_request_active(bool active)
@@ -89,6 +94,28 @@ void server_comm_http_set_non_voice_paused(bool paused)
     portENTER_CRITICAL(&s_server_comm_lock);
     s_non_voice_paused = paused;
     portEXIT_CRITICAL(&s_server_comm_lock);
+}
+
+esp_err_t server_comm_http_wait_for_non_voice_idle(uint32_t timeout_ms)
+{
+    const int64_t deadline_ms = (esp_timer_get_time() / 1000) + (int64_t)timeout_ms;
+    while (true) {
+        uint32_t inflight;
+        portENTER_CRITICAL(&s_server_comm_lock);
+        inflight = s_non_voice_inflight;
+        portEXIT_CRITICAL(&s_server_comm_lock);
+        if (inflight == 0U) {
+            return ESP_OK;
+        }
+        if ((esp_timer_get_time() / 1000) >= deadline_ms) {
+            ESP_LOGW(TAG,
+                     "non-voice HTTP quiesce timeout inflight=%lu timeout_ms=%u",
+                     (unsigned long)inflight,
+                     (unsigned int)timeout_ms);
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 static bool server_comm_voice_request_is_active_for_current_task(void)
@@ -122,6 +149,51 @@ static bool server_comm_non_voice_paused(void)
     portEXIT_CRITICAL(&s_server_comm_lock);
 
     return paused;
+}
+
+static void server_comm_end_non_voice_admission(bool admitted)
+{
+    if (!admitted) {
+        return;
+    }
+    portENTER_CRITICAL(&s_server_comm_lock);
+    if (s_non_voice_inflight > 0U) {
+        s_non_voice_inflight--;
+    }
+    portEXIT_CRITICAL(&s_server_comm_lock);
+}
+
+static esp_err_t server_comm_begin_non_voice_admission(const char *label,
+                                                        const char *endpoint,
+                                                        bool *out_admitted)
+{
+    if (out_admitted == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_admitted = false;
+
+    const bool voice_request = server_comm_voice_request_is_active_for_current_task();
+    const bool wake_prompt_request =
+        server_comm_wake_prompt_request_is_active_for_current_task() &&
+        server_comm_endpoint_is_wake_prompt(endpoint);
+    const bool voice_turn_endpoint = server_comm_endpoint_is_voice_turn(endpoint);
+    if (voice_request || wake_prompt_request || voice_turn_endpoint) {
+        return ESP_OK;
+    }
+
+    bool paused = false;
+    portENTER_CRITICAL(&s_server_comm_lock);
+    paused = s_non_voice_paused;
+    if (!paused) {
+        s_non_voice_inflight++;
+        *out_admitted = true;
+    }
+    portEXIT_CRITICAL(&s_server_comm_lock);
+    if (paused) {
+        server_comm_log_voice_busy_skip(label, endpoint);
+        return SERVER_COMM_ERR_BLOCKED_BY_VOICE_BUSY;
+    }
+    return ESP_OK;
 }
 
 static bool server_comm_request_is_reconnect_for_current_task(void)
@@ -294,7 +366,7 @@ static esp_err_t server_comm_check_ready(const char *label, const char *endpoint
         server_comm_endpoint_is_wake_prompt(endpoint);
     bool voice_turn_endpoint = server_comm_endpoint_is_voice_turn(endpoint);
 
-    if (!voice_request && !reconnect_request && !wake_prompt_request &&
+    if (!voice_request && !wake_prompt_request &&
         !voice_turn_endpoint && server_comm_non_voice_paused()) {
         server_comm_log_voice_busy_skip(label, endpoint);
         return SERVER_COMM_ERR_BLOCKED_BY_VOICE_BUSY;
@@ -540,8 +612,16 @@ static esp_err_t server_comm_perform(esp_http_client_method_t method,
 
     bool voice_request = server_comm_voice_request_is_active_for_current_task();
     bool reconnect_request = server_comm_request_is_reconnect_for_current_task();
-    esp_err_t ret = server_comm_check_ready("http request", endpoint);
+    bool non_voice_admitted = false;
+    esp_err_t ret = server_comm_begin_non_voice_admission("http request",
+                                                           endpoint,
+                                                           &non_voice_admitted);
     if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = server_comm_check_ready("http request", endpoint);
+    if (ret != ESP_OK) {
+        server_comm_end_non_voice_admission(non_voice_admitted);
         return ret;
     }
 
@@ -552,6 +632,7 @@ static esp_err_t server_comm_perform(esp_http_client_method_t method,
                  endpoint,
                  (unsigned int)SERVER_COMM_URL_BUFFER_SIZE);
         gateway_link_record_http_result(ESP_ERR_NO_MEM, voice_request, reconnect_request);
+        server_comm_end_non_voice_admission(non_voice_admitted);
         return ESP_ERR_NO_MEM;
     }
 
@@ -560,6 +641,7 @@ static esp_err_t server_comm_perform(esp_http_client_method_t method,
         ESP_LOGE(TAG, "build URL failed endpoint=%s ret=%s", endpoint, esp_err_to_name(ret));
         heap_caps_free(url);
         gateway_link_record_http_result(ret, voice_request, reconnect_request);
+        server_comm_end_non_voice_admission(non_voice_admitted);
         return ret;
     }
 
@@ -592,6 +674,7 @@ static esp_err_t server_comm_perform(esp_http_client_method_t method,
         ESP_LOGE(TAG, "http init failed url=%s", url);
         heap_caps_free(url);
         gateway_link_record_http_result(ESP_ERR_NO_MEM, voice_request, reconnect_request);
+        server_comm_end_non_voice_admission(non_voice_admitted);
         return ESP_ERR_NO_MEM;
     }
 
@@ -617,6 +700,7 @@ static esp_err_t server_comm_perform(esp_http_client_method_t method,
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     heap_caps_free(url);
+    server_comm_end_non_voice_admission(non_voice_admitted);
 
     if (ret != ESP_OK) {
         if (!gateway_link_in_reconnect_mode()) {
@@ -1395,5 +1479,13 @@ void server_comm_http_post_raw_stream_request_abort(server_comm_raw_stream_t *st
 {
     if (stream != NULL) {
         stream->abort_requested = true;
+        if (stream->client != NULL) {
+            esp_err_t ret = esp_http_client_cancel_request(stream->client);
+            if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG,
+                         "stream cancel request failed ret=%s",
+                         esp_err_to_name(ret));
+            }
+        }
     }
 }

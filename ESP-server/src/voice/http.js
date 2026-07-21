@@ -164,6 +164,122 @@ function sendVoiceTurnPcm(res, pcmBuffer) {
     res.end(pcmBuffer);
 }
 
+function createResponseAbortError(message, cause) {
+    const error = new Error(message);
+    error.name = "AbortError";
+    error.cause = cause;
+    return error;
+}
+
+function attachVoiceStreamWriteState(error, started, bytesWritten, chunksWritten) {
+    const state = {
+        started,
+        bytesWritten,
+        chunksWritten
+    };
+    if (error && typeof error === "object") {
+        error.voiceStreamWrite = state;
+        return error;
+    }
+
+    const wrapped = new Error(String(error || "Voice stream write failed"));
+    wrapped.cause = error;
+    wrapped.voiceStreamWrite = state;
+    return wrapped;
+}
+
+function waitForResponseDrain(res, signal) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+            res.off("drain", onDrain);
+            res.off("close", onClose);
+            res.off("error", onError);
+            signal?.removeEventListener("abort", onAbort);
+        };
+        const finish = error => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            cleanup();
+            if (error) {
+                reject(error);
+                return;
+            }
+            resolve();
+        };
+        const onDrain = () => finish();
+        const onClose = () => finish(createResponseAbortError("Voice response closed before drain"));
+        const onError = error => finish(error);
+        const onAbort = () => finish(createResponseAbortError("Voice response aborted before drain"));
+
+        if (res.destroyed || res.writableEnded) {
+            finish(createResponseAbortError("Voice response closed before drain"));
+            return;
+        }
+        if (signal?.aborted) {
+            finish(createResponseAbortError("Voice response aborted before drain"));
+            return;
+        }
+
+        res.once("drain", onDrain);
+        res.once("close", onClose);
+        res.once("error", onError);
+        signal?.addEventListener("abort", onAbort, { once: true });
+    });
+}
+
+async function sendVoiceTurnPcmStream(res, stream, signal) {
+    let bytesWritten = 0;
+    let chunksWritten = 0;
+    let started = false;
+
+    try {
+        for await (const chunk of stream) {
+            if (!Buffer.isBuffer(chunk) || chunk.length === 0 || chunk.length % 2 !== 0) {
+                const error = new Error("Voice stream yielded invalid PCM16 chunk");
+                error.code = "VOICE_TTS_FAILED";
+                error.status = 502;
+                throw error;
+            }
+            if (signal?.aborted || res.destroyed || res.writableEnded) {
+                throw createResponseAbortError("Voice response aborted before write");
+            }
+
+            if (!started) {
+                writeVoiceTurnHeaders(res);
+                started = true;
+            }
+
+            const accepted = res.write(chunk);
+            bytesWritten += chunk.length;
+            chunksWritten += 1;
+            if (!accepted) {
+                await waitForResponseDrain(res, signal);
+            }
+        }
+
+        if (!started) {
+            const error = new Error("TTS stream completed without PCM audio");
+            error.code = "VOICE_TTS_EMPTY_AUDIO";
+            error.status = 502;
+            throw error;
+        }
+
+        if (!res.writableEnded && !res.destroyed) {
+            res.end();
+        }
+        return {
+            bytesWritten,
+            chunksWritten,
+            started
+        };
+    } catch (error) {
+        throw attachVoiceStreamWriteState(error, started, bytesWritten, chunksWritten);
+    }
+}
+
 module.exports = {
     VOICE_TURN_AUDIO_FORMAT,
     VOICE_TURN_CONTENT_TYPE,
@@ -173,5 +289,7 @@ module.exports = {
     readVoiceRequestId,
     sendVoiceError,
     sendVoiceTurnPcm,
+    sendVoiceTurnPcmStream,
+    writeVoiceTurnHeaders,
     validateVoiceTurnRequest
 };

@@ -124,6 +124,14 @@ function parseTtsRealtimeEvent(message) {
         "data"
     ]);
 
+    const isAudioDone = lowerName === "response.audio.done" ||
+        lowerName === "audio.done" ||
+        lowerName.endsWith(".audio.done") ||
+        lowerName === "response.completed" ||
+        lowerName === "response.done" ||
+        (lowerName.includes("audio") && lowerName.includes("completed")) ||
+        (lowerName.startsWith("response.") && lowerName.endsWith(".completed"));
+
     return {
         eventName,
         delta,
@@ -131,9 +139,7 @@ function parseTtsRealtimeEvent(message) {
         errorMessage: extractRealtimeErrorMessage(payload),
         isSessionUpdated: lowerName === "tts_session.updated",
         isAudioDelta: lowerName === "response.audio.delta" || lowerName.includes("audio.delta"),
-        isAudioDone: lowerName === "response.audio.done" ||
-            lowerName.includes("audio.done") ||
-            lowerName.includes("completed")
+        isAudioDone
     };
 }
 

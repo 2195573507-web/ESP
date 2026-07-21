@@ -61,6 +61,9 @@ void server_comm_http_set_wake_prompt_request_active(bool active);
 /** @brief 由 app_runtime 设置语音独占 gate；普通 local_gateway_comm 请求会被安静跳过。 */
 void server_comm_http_set_non_voice_paused(bool paused);
 
+/** @brief Wait for normal HTTP requests admitted before a voice lease to finish. */
+esp_err_t server_comm_http_wait_for_non_voice_idle(uint32_t timeout_ms);
+
 /**
  * @brief 向 S3 local gateway 发起 GET JSON 请求。
  *

@@ -479,10 +479,21 @@ static void update_device_from_envelope_locked(const protocol_adapter_envelope_t
                 sizeof(history->algorithm_version));
         s_history_cursor = (s_history_cursor + 1U) % SENSOR_AGGREGATOR_HISTORY_SIZE;
         ESP_LOGI(TAG,
-                 "BME_RX_V2 device=%s score=%d samples=%d",
+                 "BME_RX device=%s temp=%.2fC humidity=%.2f%% pressure=%.2fhPa "
+                 "gas=%.0fOhm baseline=%.0fOhm ratio=%.3f aq=%d level=%s confidence=%s "
+                 "samples=%d algo=%s",
                  device->device_id,
+                 device->temperature,
+                 device->humidity,
+                 device->pressure,
+                 device->gas_resistance,
+                 device->gas_baseline,
+                 device->gas_ratio,
                  device->air_quality_score,
-                 device->sample_count > 0 ? device->sample_count : 1);
+                 device->air_quality_level,
+                 device->air_quality_confidence,
+                 device->sample_count > 0 ? device->sample_count : 1,
+                 device->algorithm_version);
     }
 
 }

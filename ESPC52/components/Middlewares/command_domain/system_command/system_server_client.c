@@ -20,6 +20,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "c5_memory.h"
 #include "device_protocol_metadata.h"
 #include "esp111_protocol_common.h"
 #include "screen_service.h"
@@ -95,9 +96,10 @@ static esp_err_t system_server_client_ensure_scratch(void)
 
     if (s_scratch == NULL) {
         system_server_client_scratch_t *scratch =
-            (system_server_client_scratch_t *)heap_caps_calloc(1,
-                                                               sizeof(*scratch),
-                                                               MALLOC_CAP_8BIT);
+            (system_server_client_scratch_t *)c5_mem_calloc(1,
+                                                            sizeof(*scratch),
+                                                            C5_MEM_PSRAM,
+                                                            "system_command_json_scratch");
         if (scratch == NULL) {
             ESP_LOGW(TAG,
                      "system command scratch alloc failed bytes=%u",
@@ -107,7 +109,7 @@ static esp_err_t system_server_client_ensure_scratch(void)
         if (s_scratch == NULL) {
             s_scratch = scratch;
         } else {
-            heap_caps_free(scratch);
+            c5_mem_free(scratch, "system_command_json_scratch");
         }
     }
 

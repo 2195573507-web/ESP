@@ -142,8 +142,12 @@ async function getDeviceContext(dbAll, deviceId = "", options = {}) {
     return {
         device: device || {
             device_id: inferredDeviceId,
-            online: false,
-            device_online: false,
+            online: null,
+            device_online: null,
+            status: "unknown",
+            status_source: "not_observed",
+            observed: false,
+            offline_reason: null,
             last_seen_age_ms: null,
             latest_upload_delay_ms: null,
             avg_upload_delay_ms: null,

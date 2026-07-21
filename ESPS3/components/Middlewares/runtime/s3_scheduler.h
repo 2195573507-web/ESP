@@ -120,6 +120,14 @@ typedef struct {
     uint32_t smart_home_interval_ms;
 } s3_scheduler_load_t;
 
+/** @brief HTTP ingress admission timings captured without taking the bus lock twice. */
+typedef struct {
+    uint32_t event_bus_lock_wait_ms;
+    uint32_t enqueue_duration_ms;
+    bool event_bus_stats_valid;
+    s3_event_bus_stats_t event_bus;
+} s3_scheduler_enqueue_diagnostics_t;
+
 /** scheduler 事件。入队后 payload/ingress 会被 scheduler 拷贝或接管，调用方不再持有。 */
 typedef struct s3_scheduler_event {
     s3_scheduler_event_type_t type;
@@ -152,6 +160,18 @@ esp_err_t s3_scheduler_enqueue_ingress(const s3_runtime_ingress_t *ingress,
 /** @brief 接管调用方分配的 ingress；无论成功失败，本函数都会释放或转移所有权。 */
 esp_err_t s3_scheduler_enqueue_ingress_owned(s3_runtime_ingress_t *ingress,
                                              s3_scheduler_priority_t priority);
+
+/**
+ * @brief Transfer ingress ownership with a bounded event-bus lock wait.
+ *
+ * This is intentionally limited to local HTTP admission. Other scheduler
+ * callers keep their established reliable retry semantics.
+ */
+esp_err_t s3_scheduler_enqueue_ingress_owned_timed(
+    s3_runtime_ingress_t *ingress,
+    s3_scheduler_priority_t priority,
+    uint32_t event_bus_lock_timeout_ms,
+    s3_scheduler_enqueue_diagnostics_t *out_diagnostics);
 
 /** @brief 入队网络状态变化；network_worker/gateway_wifi 事件路径调用。 */
 esp_err_t s3_scheduler_enqueue_network_state(s3_scheduler_network_state_t state);

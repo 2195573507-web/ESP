@@ -16,7 +16,8 @@
  *
  * 职责边界：
  * 1. IIS/PDM GPIO、PA、DMA 底层归 BSP/IIS 管理。
- * 2. 本模块只负责把 PCM 切成固定音频块，经环形缓冲区交给写入任务写 IIS。
+ * 2. 本模块把 PCM 切成固定音频块，经 PSRAM 固定槽环形缓冲区交给唯一 writer。
+ * 3. writer 在启动期准备的 internal DMA staging buffer 中复制每个槽后写 IIS。
  */
 
 /* 对外暴露的播放格式与 BSP/IIS 保持一致，避免上层重复包含 IIS 细节。 */
@@ -51,11 +52,15 @@
 #endif
 
 #ifndef AUDIO_PLAYER_RING_BUFFER_CHUNKS
-#define AUDIO_PLAYER_RING_BUFFER_CHUNKS 4U // 播放环形缓冲区可容纳的音频块数。
+#define AUDIO_PLAYER_RING_BUFFER_CHUNKS 4U // PSRAM 固定槽环形缓冲区可容纳的音频块数。
 #endif
 
 #ifndef AUDIO_PLAYER_RING_BUFFER_SEND_TIMEOUT_MS
-#define AUDIO_PLAYER_RING_BUFFER_SEND_TIMEOUT_MS 1000U // 投递 PCM 块等待 ringbuffer 的超时。
+#define AUDIO_PLAYER_RING_BUFFER_SEND_TIMEOUT_MS 1000U // HTTP worker 等待 ring 低水位的上限；超时中止本轮。
+#endif
+
+#ifndef AUDIO_PLAYER_DRAIN_TIMEOUT_MS
+#define AUDIO_PLAYER_DRAIN_TIMEOUT_MS 3000U // EOS drain and session release upper bound.
 #endif
 
 #ifndef AUDIO_PLAYER_I2S_WRITER_TASK_STACK_SIZE
@@ -83,9 +88,10 @@ extern "C" {
 #endif
 
 /**
- * @brief 初始化 speaker 播放器和底层 IIS。
+ * @brief Acquire speaker session resources on demand.
  *
- * 调用方法：系统启动或首次播放前调用；函数可重复调用。
+ * 调用方法：首次播放前调用；函数可重复调用。IIS/DMA、PSRAM ring/scratch and
+ * internal DMA staging are allocated only for the active voice session.
  */
 esp_err_t audio_player_init(void);
 
@@ -116,7 +122,8 @@ esp_err_t audio_player_play_16k_pcm(const int16_t *data,
  * @brief 打开一轮流式 PCM 播放。
  *
  * 调用方法：server_voice_client 收到本轮第一个 PCM chunk 前调用一次。
- * 本函数会创建 ringbuffer、启动 IIS 和写入任务；同一轮后续 chunk 不会重复初始化。
+ * 本函数只复位本轮统计/generation 并向常驻 writer 投递 START；writer 确认后才启用 IIS。
+ * 常驻 PSRAM ring 和 writer task 均由 audio_player_init() 所有。
  */
 esp_err_t audio_player_stream_open(void);
 
@@ -137,7 +144,8 @@ esp_err_t audio_player_write_pcm_chunk(const int16_t *data,
  * @brief 结束当前流式播放。
  *
  * 调用方法：server_voice_client 读完本轮 PCM 响应后调用；
- * 会等待 ringbuffer 内已入队 PCM 写完，再停止本轮 IIS 输出。
+ * 会等待 PSRAM ring 内已入队 PCM 写完，再由 writer 停止本轮 IIS 输出；常驻资源
+ * 保持就绪，供下一轮复用。
  */
 esp_err_t audio_player_stream_finish(void);
 
@@ -145,9 +153,18 @@ esp_err_t audio_player_stream_finish(void);
  * @brief 异常中止当前流式播放。
  *
  * 调用方法：gateway link 断开或 server voice 异常清理时调用；函数尽量停止 IIS、
- * 释放 ringbuffer/任务同步资源，未打开流时直接返回 ESP_OK。
+ * 仅发出 abort 并等待 writer 完成本轮 IIS 停止；不会跨任务释放常驻资源。
+ * 未打开流时直接返回 ESP_OK。
  */
 esp_err_t audio_player_stream_abort(void);
+
+/**
+ * @brief Release the inactive speaker session after a bounded receiver/drain shutdown.
+ *
+ * The persistent writer task and small synchronization objects may remain blocked,
+ * but I2S/DMA, PSRAM ring/scratch, and internal DMA staging are released.
+ */
+esp_err_t audio_player_release_session(uint32_t timeout_ms);
 
 /**
  * @brief 播放 1 kHz speaker 自检音。

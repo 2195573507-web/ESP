@@ -57,17 +57,27 @@ function encodeWebSocketFrame(opcode, payload = Buffer.alloc(0)) {
     return frame;
 }
 
+function readReceiveLimit(value) {
+    return Number.isSafeInteger(value) && value > 0 ? value : Number.MAX_SAFE_INTEGER;
+}
+
 class MinimalWebSocket {
-    constructor(socket, stage) {
+    constructor(socket, stage, receiveLimits = {}) {
         this.socket = socket;
         this.stage = stage;
         this.buffer = Buffer.alloc(0);
         this.messages = [];
+        this.queuedMessageBytes = 0;
         this.waiters = [];
         this.closed = false;
         this.closeError = null;
+        this.closeSent = false;
         this.fragmentOpcode = 0;
         this.fragmentBuffers = [];
+        this.fragmentBytes = 0;
+        this.maxMessageBytes = readReceiveLimit(receiveLimits.maxMessageBytes);
+        this.maxBufferedBytes = readReceiveLimit(receiveLimits.maxBufferedBytes);
+        this.maxBufferedMessages = readReceiveLimit(receiveLimits.maxBufferedMessages);
 
         socket.on("data", chunk => this.onData(chunk));
         socket.on("error", error => this.fail(error));
@@ -83,9 +93,36 @@ class MinimalWebSocket {
     }
 
     sendClose() {
-        if (!this.closed) {
+        if (!this.closed && !this.closeSent) {
+            this.closeSent = true;
             this.socket.end(encodeWebSocketFrame(0x8));
         }
+    }
+
+    abort(error) {
+        if (this.closed) {
+            return false;
+        }
+
+        this.closeError = error?.code
+            ? error
+            : createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_FAILED`, error?.message || "Realtime WebSocket aborted", 502, {
+                cause: error
+            });
+        this.closed = true;
+        this.messages = [];
+        this.queuedMessageBytes = 0;
+        this.buffer = Buffer.alloc(0);
+        this.fragmentOpcode = 0;
+        this.fragmentBuffers = [];
+        this.fragmentBytes = 0;
+        for (const waiter of this.waiters.splice(0)) {
+            waiter.reject(this.closeError);
+        }
+        if (!this.socket.destroyed && typeof this.socket.destroy === "function") {
+            this.socket.destroy();
+        }
+        return true;
     }
 
     close() {
@@ -109,6 +146,20 @@ class MinimalWebSocket {
     }
 
     pushMessage(message) {
+        if (this.closed) {
+            return;
+        }
+
+        const messageBytes = Buffer.byteLength(message);
+        if (messageBytes > this.maxMessageBytes ||
+            this.messages.length >= this.maxBufferedMessages ||
+            this.queuedMessageBytes + messageBytes > this.maxBufferedBytes) {
+            this.abort(createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_BACKLOG_OVERFLOW`, "Realtime WebSocket receive backlog exceeded its limit", 502, {
+                bytes: messageBytes
+            }));
+            return;
+        }
+
         const waiter = this.waiters.shift();
         if (waiter) {
             waiter.resolve(message);
@@ -116,10 +167,20 @@ class MinimalWebSocket {
         }
 
         this.messages.push(message);
+        this.queuedMessageBytes += messageBytes;
     }
 
     onData(chunk) {
+        if (this.closed) {
+            return;
+        }
         this.buffer = Buffer.concat([this.buffer, chunk]);
+        if (this.buffer.length > this.maxBufferedBytes) {
+            this.abort(createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_BACKLOG_OVERFLOW`, "Realtime WebSocket frame buffer exceeded its limit", 502, {
+                bytes: this.buffer.length
+            }));
+            return;
+        }
 
         while (this.buffer.length >= 2) {
             const first = this.buffer[0];
@@ -147,6 +208,13 @@ class MinimalWebSocket {
                 }
                 payloadLength = Number(bigLength);
                 offset += 8;
+            }
+
+            if (payloadLength > this.maxMessageBytes) {
+                this.abort(createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_BACKLOG_OVERFLOW`, "Realtime WebSocket frame exceeded its limit", 502, {
+                    bytes: payloadLength
+                }));
+                return;
             }
 
             let maskKey = null;
@@ -178,6 +246,9 @@ class MinimalWebSocket {
     }
 
     handleFrame(opcode, fin, payload) {
+        if (this.closed) {
+            return;
+        }
         if (opcode === 0x8) {
             this.sendClose();
             this.close();
@@ -200,15 +271,24 @@ class MinimalWebSocket {
             }
             this.fragmentOpcode = opcode;
             this.fragmentBuffers = [payload];
+            this.fragmentBytes = payload.length;
             return;
         }
 
         if (opcode === 0x0 && this.fragmentOpcode !== 0) {
             this.fragmentBuffers.push(payload);
+            this.fragmentBytes += payload.length;
+            if (this.fragmentBytes > this.maxMessageBytes) {
+                this.abort(createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_BACKLOG_OVERFLOW`, "Realtime WebSocket fragmented message exceeded its limit", 502, {
+                    bytes: this.fragmentBytes
+                }));
+                return;
+            }
             if (fin) {
                 const message = Buffer.concat(this.fragmentBuffers).toString("utf8");
                 this.fragmentOpcode = 0;
                 this.fragmentBuffers = [];
+                this.fragmentBytes = 0;
                 this.pushMessage(message);
             }
             return;
@@ -219,7 +299,9 @@ class MinimalWebSocket {
 
     nextMessage(signal) {
         if (this.messages.length > 0) {
-            return Promise.resolve(this.messages.shift());
+            const message = this.messages.shift();
+            this.queuedMessageBytes -= Buffer.byteLength(message);
+            return Promise.resolve(message);
         }
 
         if (this.closed) {
@@ -262,7 +344,7 @@ class MinimalWebSocket {
     }
 }
 
-function openRealtimeWebSocket(url, headers, signal, stage) {
+function openRealtimeWebSocket(url, headers, signal, stage, options = {}) {
     return new Promise((resolve, reject) => {
         let settled = false;
         let request = null;
@@ -336,7 +418,7 @@ function openRealtimeWebSocket(url, headers, signal, stage) {
                 return;
             }
 
-            const ws = new MinimalWebSocket(socket, stage);
+            const ws = new MinimalWebSocket(socket, stage, options.receiveLimits);
             if (head && head.length > 0) {
                 ws.onData(head);
             }

@@ -32,6 +32,7 @@ typedef enum {
     LINK_WIFI_CONNECTED,
     LINK_REGISTERING,
     LINK_READY,
+    LINK_DEGRADED,
     LINK_LOST,
 } gateway_link_state_t;
 
@@ -82,7 +83,7 @@ void gateway_link_record_http_result(esp_err_t ret, bool voice_request, bool rec
 /** @brief 判断错误是否属于本地 S3 HTTP 连接类失败。 */
 bool gateway_link_http_error_is_link_failure(esp_err_t ret);
 
-/** @brief 标记当前 task 是 reconnect probe/register，允许绕过 READY gate。 */
+/** @brief 标记当前 task 是 reconnect probe/register，允许绕过 READY gate，但不绕过语音 HTTP gate。 */
 void gateway_link_set_reconnect_request_active(bool active);
 
 /** @brief 查询当前 task 是否为 reconnect probe/register。 */

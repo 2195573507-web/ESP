@@ -42,6 +42,13 @@ esp_err_t csi_service_tick(void);
 /** @brief 暂停 CSI 摘要上报；不影响 register、heartbeat、BME690、voice、command。 */
 void csi_service_pause(void);
 
+/**
+ * @brief Mask CSI ingress, clear pending work, and wait for active worker processing.
+ *
+ * This is the voice-lease ACK path. It does not alter CSI algorithms or payloads.
+ */
+esp_err_t csi_service_pause_and_wait(uint32_t timeout_ms);
+
 /** @brief 恢复 CSI 摘要上报；只有服务已启动时才生效。 */
 void csi_service_resume(void);
 

@@ -87,6 +87,18 @@ void s3_event_bus_reset(void);
  */
 esp_err_t s3_event_bus_push_owned(struct s3_scheduler_event *event);
 
+/**
+ * @brief Push one owned event while bounding only the event-bus mutex wait.
+ *
+ * A non-OK result leaves ownership with the caller. This is for local HTTP
+ * admission paths that must fail promptly; normal scheduler callers retain
+ * the existing unbounded/reliable behavior through s3_event_bus_push_owned().
+ */
+esp_err_t s3_event_bus_push_owned_timed(struct s3_scheduler_event *event,
+                                        uint32_t lock_timeout_ms,
+                                        uint32_t *out_lock_wait_ms,
+                                        s3_event_bus_stats_t *out_stats);
+
 /** @brief 等待 event bus 有可消费事件；timeout_ms 为最长等待时间。 */
 bool s3_event_bus_wait(uint32_t timeout_ms);
 

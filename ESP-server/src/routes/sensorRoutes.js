@@ -5,12 +5,8 @@ const {
 } = require("../../server-time-sync/timeSync");
 const {
     mapDeviceStatus,
-    mapModuleStatus,
-    refreshDeviceActivity
+    mapModuleStatus
 } = require("../services/deviceStatusService");
-const {
-    readDeviceMetadata
-} = require("../services/deviceMetadata");
 const {
     recordEvent
 } = require("../services/eventLogService");
@@ -18,7 +14,7 @@ const {
     resolveDeviceId
 } = require("../services/deviceIdResolver");
 
-const LEGACY_SENSOR_FALLBACK_DEVICE_ID = "unknown_device";
+const LEGACY_SENSOR_FALLBACK_DEVICE_ID = "legacy_unassigned";
 
 function toFiniteSensorNumber(value) {
     if (value === undefined || value === null || value === "") {
@@ -90,8 +86,11 @@ function enrichLatestSensorRow(row, deviceStatusRow, moduleStatusRow) {
 
     return {
         ...enriched,
-        online: Boolean(deviceStatus?.online),
-        device_online: Boolean(deviceStatus?.online),
+        online: deviceStatus ? Boolean(deviceStatus.online) : null,
+        device_online: deviceStatus ? Boolean(deviceStatus.online) : null,
+        status: deviceStatus?.status || "unknown",
+        status_source: deviceStatus?.status_source || "not_observed",
+        offline_reason: deviceStatus?.offline_reason ?? null,
         sensor_online: Boolean(moduleStatus?.online),
         latest_upload_delay_ms: deviceStatus?.latest_upload_delay_ms ?? row.upload_delay_ms ?? null,
         avg_upload_delay_ms: deviceStatus?.avg_upload_delay_ms ?? null,
@@ -164,35 +163,27 @@ function createSensorRouter(options) {
                     return sendSensorDbError(res, err, true);
                 }
 
-                if (typeof dbRun === "function" && typeof dbAll === "function") {
+                // Legacy telemetry is retained for compatibility, but it never
+                // authors C5 device_status. S3 child_registry remains the only
+                // source of formal C5 online/offline state.
+                if (usedFallbackDeviceId && typeof dbRun === "function") {
                     try {
-                        await refreshDeviceActivity(dbRun, dbAll, readDeviceMetadata({
-                            body: {
-                                ...normalizedBody,
-                                device_id: deviceId,
-                                payload_type: payloadType
+                        await recordEvent(dbRun, {
+                            event_type: "system",
+                            event_name: "system_log_created",
+                            device_id: deviceId,
+                            severity: "warning",
+                            message: "legacy /sensor upload missing device_id; stored as legacy_unassigned",
+                            payload: {
+                                payload_type: payloadType,
+                                route: "/sensor",
+                                identity_scope: "legacy_unassigned"
                             },
-                            headers: req.headers,
-                            payloadType,
-                            serverRecvMs
-                        }), payloadType);
-                        if (usedFallbackDeviceId) {
-                            await recordEvent(dbRun, {
-                                event_type: "system",
-                                event_name: "system_log_created",
-                                device_id: deviceId,
-                                severity: "warning",
-                                message: "legacy /sensor upload missing device_id; using unknown_device",
-                                payload: {
-                                    payload_type: payloadType,
-                                    route: "/sensor"
-                                },
-                                source: "legacy_sensor",
-                                server_recv_ms: serverRecvMs
-                            });
-                        }
+                            source: "legacy_sensor",
+                            server_recv_ms: serverRecvMs
+                        });
                     } catch (error) {
-                        logger.warn(`[sensor] legacy status refresh failed device_id=${deviceId || "-"} message=${JSON.stringify(error?.message || "-")}`);
+                        logger.warn(`[sensor] legacy identity event failed device_id=${deviceId || "-"} message=${JSON.stringify(error?.message || "-")}`);
                     }
                 }
 

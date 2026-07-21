@@ -203,6 +203,9 @@ static s3_scheduler_event_t *event_alloc(s3_scheduler_event_type_t type,
 static void event_release(s3_scheduler_event_t *event);
 static esp_err_t queue_push_owned(s3_scheduler_event_t *event);
 static esp_err_t queue_push_reliable_owned(s3_scheduler_event_t *event);
+static esp_err_t queue_push_timed_owned(s3_scheduler_event_t *event,
+                                        uint32_t event_bus_lock_timeout_ms,
+                                        s3_scheduler_enqueue_diagnostics_t *diagnostics);
 
 /* scheduler 使用本机 uptime 驱动 cadence；Server 时间只作为业务 payload 字段。 */
 static int64_t now_ms(void)
@@ -1456,6 +1459,26 @@ static esp_err_t queue_push_reliable_owned(s3_scheduler_event_t *event)
     }
 }
 
+static esp_err_t queue_push_timed_owned(s3_scheduler_event_t *event,
+                                        uint32_t event_bus_lock_timeout_ms,
+                                        s3_scheduler_enqueue_diagnostics_t *diagnostics)
+{
+    if (event == NULL || event->type == S3_SCHEDULER_EVENT_NONE ||
+        event->priority > S3_SCHEDULER_PRIORITY_LOW) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    stamp_event_bus_policy(event);
+    esp_err_t ret = s3_event_bus_push_owned_timed(
+        event,
+        event_bus_lock_timeout_ms,
+        diagnostics != NULL ? &diagnostics->event_bus_lock_wait_ms : NULL,
+        diagnostics != NULL ? &diagnostics->event_bus : NULL);
+    if (diagnostics != NULL) {
+        diagnostics->event_bus_stats_valid = ret == ESP_OK;
+    }
+    return ret;
+}
+
 static size_t queue_depth(void)
 {
     return s3_event_bus_get_stats().queue_depth;
@@ -2033,22 +2056,35 @@ esp_err_t s3_scheduler_enqueue_ingress(const s3_runtime_ingress_t *ingress,
     return s3_scheduler_enqueue_ingress_owned(owned_ingress, priority);
 }
 
-esp_err_t s3_scheduler_enqueue_ingress_owned(s3_runtime_ingress_t *ingress,
-                                             s3_scheduler_priority_t priority)
+static esp_err_t enqueue_ingress_owned_internal(
+    s3_runtime_ingress_t *ingress,
+    s3_scheduler_priority_t priority,
+    bool bounded_event_bus_lock,
+    uint32_t event_bus_lock_timeout_ms,
+    s3_scheduler_enqueue_diagnostics_t *out_diagnostics)
 {
+    const int64_t enqueue_started_us = esp_timer_get_time();
+    if (out_diagnostics != NULL) {
+        memset(out_diagnostics, 0, sizeof(*out_diagnostics));
+    }
+    esp_err_t ret = ESP_OK;
+    s3_scheduler_event_t *event = NULL;
     if (ingress == NULL) {
-        return ESP_ERR_INVALID_ARG;
+        ret = ESP_ERR_INVALID_ARG;
+        goto done;
     }
     if (priority > S3_SCHEDULER_PRIORITY_LOW ||
         ingress->kind == S3_RUNTIME_MSG_UNKNOWN ||
         ingress->body_len > S3_RUNTIME_BUS_BODY_MAX) {
         heap_caps_free(ingress);
-        return ESP_ERR_INVALID_ARG;
+        ret = ESP_ERR_INVALID_ARG;
+        goto done;
     }
     if (ingress_is_deprecated_stream_csi(ingress)) {
         log_deprecated_stream_csi_reject(ingress, "enqueue_ingress_owned");
         heap_caps_free(ingress);
-        return ESP_ERR_NOT_SUPPORTED;
+        ret = ESP_ERR_NOT_SUPPORTED;
+        goto done;
     }
 
     /* ingress 已由调用方分配；本函数负责补终止符并接管生命周期。 */
@@ -2062,19 +2098,45 @@ esp_err_t s3_scheduler_enqueue_ingress_owned(s3_runtime_ingress_t *ingress,
                           kind_name(ingress->kind));
     }
 
-    s3_scheduler_event_t *event =
-        event_alloc(S3_SCHEDULER_EVENT_INGRESS, priority);
+    event = event_alloc(S3_SCHEDULER_EVENT_INGRESS, priority);
     if (event == NULL) {
         heap_caps_free(ingress);
-        return ESP_ERR_NO_MEM;
+        ret = ESP_ERR_NO_MEM;
+        goto done;
     }
     event->ingress = ingress;
 
-    esp_err_t ret = queue_push_reliable_owned(event);
+    ret = bounded_event_bus_lock ?
+              queue_push_timed_owned(event, event_bus_lock_timeout_ms, out_diagnostics) :
+              queue_push_reliable_owned(event);
     if (ret != ESP_OK) {
         event_release(event);
     }
+done:
+    if (out_diagnostics != NULL) {
+        out_diagnostics->enqueue_duration_ms =
+            (uint32_t)((esp_timer_get_time() - enqueue_started_us) / 1000);
+    }
     return ret;
+}
+
+esp_err_t s3_scheduler_enqueue_ingress_owned(s3_runtime_ingress_t *ingress,
+                                             s3_scheduler_priority_t priority)
+{
+    return enqueue_ingress_owned_internal(ingress, priority, false, 0U, NULL);
+}
+
+esp_err_t s3_scheduler_enqueue_ingress_owned_timed(
+    s3_runtime_ingress_t *ingress,
+    s3_scheduler_priority_t priority,
+    uint32_t event_bus_lock_timeout_ms,
+    s3_scheduler_enqueue_diagnostics_t *out_diagnostics)
+{
+    return enqueue_ingress_owned_internal(ingress,
+                                          priority,
+                                          true,
+                                          event_bus_lock_timeout_ms,
+                                          out_diagnostics);
 }
 
 esp_err_t s3_scheduler_enqueue_network_state(s3_scheduler_network_state_t state)

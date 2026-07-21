@@ -34,6 +34,7 @@ const {
     apiError
 } = require("../utils/apiEnvelope");
 const {
+    isSupportedC5DeviceId,
     resolveDeviceId
 } = require("../services/deviceIdResolver");
 const {
@@ -140,6 +141,18 @@ function createDeviceRouter(options) {
             }));
         }
 
+        const requestedDeviceId = resolveDeviceId(req.body?.device_id);
+        if (!isSupportedC5DeviceId(requestedDeviceId)) {
+            return res.status(400).json(makeDeviceEnvelope({
+                ok: false,
+                serverRecvMs,
+                error: {
+                    code: "DEVICE_ID_NOT_ALLOWED",
+                    message: "device_id must be sensair_shuttle_01 or sensair_shuttle_02"
+                }
+            }));
+        }
+
         const boundDevice = await requireBoundDevice(req, res, gatewayContext, {
             source: payloadType,
             deviceId: req.body?.device_id,
@@ -156,7 +169,8 @@ function createDeviceRouter(options) {
                 query: req.query,
                 serverRecvMs,
                 trustedGatewayId: boundDevice.gateway_id,
-                trustedDeviceId: boundDevice.device_id
+                trustedDeviceId: boundDevice.device_id,
+                requireSupportedC5DeviceId: true
             });
             if (!result.ok) {
                 return res.status(result.status || 400).json(makeDeviceEnvelope({
@@ -169,21 +183,18 @@ function createDeviceRouter(options) {
                 }));
             }
 
+            const persisted = await persistBme690Ingest(dbRun, dbAll, result, {
+                transactional: true
+            });
             runtimeCache?.updateBmeSensor?.(result, {
                 serverRecvMs
             });
-            const queued = enqueuePersistenceJob({
-                type: "sensor.bme690",
-                priority: result.hasAlarm ? PRIORITY_HIGH : PRIORITY_MEDIUM,
-                run: () => persistBme690Ingest(dbRun, dbAll, result)
-            });
-            persistenceWorker?.scheduleImmediateFlushIfNeeded?.();
 
             logger.log(
-                `[device-v1] ingest queued payload_type=${result.data.payload_type} device_id=${result.data.device_id || "-"} job_id=${queued.job_id} priority=${queued.priority} upload_delay_ms=${result.data.upload_delay_ms ?? "null"}`
+                `[device-v1] ingest persisted payload_type=${result.data.payload_type} device_id=${result.data.device_id || "-"} upload_delay_ms=${result.data.upload_delay_ms ?? "null"}`
             );
 
-            return res.status(result.status).json(makeDeviceEnvelope({
+            return res.status(persisted.status).json(makeDeviceEnvelope({
                 ok: true,
                 serverRecvMs,
                 data: {
@@ -315,6 +326,7 @@ function createDeviceRouter(options) {
             const queued = enqueuePersistenceJob({
                 type: "gateway.dashboard_snapshot",
                 priority: PRIORITY_HIGH,
+                snapshot_id: result.snapshotId,
                 run: async () => {
                     await persistDashboardSnapshot(dbRun, dbAll, result);
                     for (const deviceId of result.data.bound_device_ids || []) {

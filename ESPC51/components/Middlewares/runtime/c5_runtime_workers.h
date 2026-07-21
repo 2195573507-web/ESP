@@ -1,6 +1,8 @@
 #ifndef C5_RUNTIME_WORKERS_H
 #define C5_RUNTIME_WORKERS_H
 
+#include <stdint.h>
+
 /**
  * @file c5_runtime_workers.h
  * @brief C5 runtime worker 任务启动入口。
@@ -31,6 +33,12 @@ extern "C" {
 
 /** @brief 创建 worker 队列、注册 event bus handler，并启动 CSI/BME/system worker。 */
 esp_err_t c5_runtime_workers_start(void);
+
+/** @brief Stop new worker dispatch, clear queued work, and wait for current work to finish. */
+esp_err_t c5_runtime_workers_quiesce(uint32_t timeout_ms);
+
+/** @brief Reopen worker dispatch after the voice lease has released audio resources. */
+void c5_runtime_workers_resume(void);
 
 #ifdef __cplusplus
 }

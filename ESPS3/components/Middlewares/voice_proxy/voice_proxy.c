@@ -18,7 +18,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "gateway_config.h"
 #include "offline_policy.h"
 #include "protocol_adapter.h"
@@ -36,12 +38,28 @@ enum {
 
 static SemaphoreHandle_t s_voice_lock;
 static char s_active_device_id[CHILD_REGISTRY_DEVICE_ID_LEN];
+static QueueHandle_t s_voice_queue;
+static TaskHandle_t s_voice_worker;
+static bool s_voice_pending;
+
+#define VOICE_PROXY_QUEUE_DEPTH 1U
+#define VOICE_PROXY_WORKER_STACK 8192U
+#define VOICE_PROXY_WORKER_PRIORITY 5U
+
+typedef struct {
+    httpd_req_t *req;
+    char device_id[CHILD_REGISTRY_DEVICE_ID_LEN];
+    int64_t queued_at_ms;
+} voice_proxy_job_t;
+
+static void voice_proxy_worker_task(void *arg);
 
 typedef struct {
     httpd_req_t *req;
     const char *device_id;
     size_t expected_bytes;
     size_t bytes_sent;
+    size_t chunks_sent;
     esp_err_t send_error;
     int send_errno;
     bool disconnected;
@@ -177,11 +195,12 @@ static void voice_proxy_log_child_send_disconnect(voice_proxy_stream_ctx_t *ctx,
     ctx->send_error = ret;
     ctx->send_errno = errno;
     ESP_LOGW(TAG,
-             "child disconnected while sending voice response device_id=%s errno=%d esp_err=%s sent_bytes=%u expected_bytes=%u",
+             "child disconnected while sending voice response device_id=%s errno=%d esp_err=%s sent_bytes=%u sent_chunks=%u expected_bytes=%u",
              ctx->device_id != NULL ? ctx->device_id : "<unknown>",
              ctx->send_errno,
              esp_err_to_name(ret),
              (unsigned int)ctx->bytes_sent,
+             (unsigned int)ctx->chunks_sent,
              (unsigned int)ctx->expected_bytes);
 }
 
@@ -198,6 +217,7 @@ static esp_err_t stream_to_httpd(const uint8_t *data, size_t len, void *user_ctx
     esp_err_t ret = httpd_resp_send_chunk(ctx->req, (const char *)data, len);
     if (ret == ESP_OK) {
         ctx->bytes_sent += len;
+        ctx->chunks_sent++;
     } else {
         ctx->disconnected = true;
         voice_proxy_log_child_send_disconnect(ctx, ret);
@@ -241,9 +261,29 @@ esp_err_t voice_proxy_init(void)
     if (s_voice_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    s_voice_queue = xQueueCreate(VOICE_PROXY_QUEUE_DEPTH, sizeof(voice_proxy_job_t));
+    if (s_voice_queue == NULL) {
+        vSemaphoreDelete(s_voice_lock);
+        s_voice_lock = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreate(voice_proxy_worker_task,
+                    "voice_proxy",
+                    VOICE_PROXY_WORKER_STACK,
+                    NULL,
+                    VOICE_PROXY_WORKER_PRIORITY,
+                    &s_voice_worker) != pdPASS) {
+        vQueueDelete(s_voice_queue);
+        s_voice_queue = NULL;
+        vSemaphoreDelete(s_voice_lock);
+        s_voice_lock = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     s_active_device_id[0] = '\0';
+    s_voice_pending = false;
     s3_scheduler_set_voice_busy(false);
-    ESP_LOGI(TAG, "voice proxy initialized single_session=true max_bytes=%u",
+    ESP_LOGI(TAG, "voice proxy initialized single_session=true queue_depth=%u max_bytes=%u",
+             (unsigned int)VOICE_PROXY_QUEUE_DEPTH,
              (unsigned int)gateway_config_get()->voice_upload_max_bytes);
     return ESP_OK;
 }
@@ -255,50 +295,23 @@ bool voice_proxy_is_busy(void)
         return false;
     }
     xSemaphoreTake(s_voice_lock, portMAX_DELAY);
-    busy = s_active_device_id[0] != '\0';
+    busy = s_voice_pending || s_active_device_id[0] != '\0';
     xSemaphoreGive(s_voice_lock);
     return busy;
 }
 
-esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
+static esp_err_t voice_proxy_process_reserved_turn(httpd_req_t *req, const char *reserved_device_id)
 {
     if (req == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
     char device_id[CHILD_REGISTRY_DEVICE_ID_LEN] = {0};
-    /* voice_proxy 以完整 X-Device-Id 作为边界校验；C5 轻量 body 不承载 voice JSON envelope。 */
-    if (httpd_req_get_hdr_value_str(req, "X-Device-Id", device_id, sizeof(device_id)) != ESP_OK ||
-        device_id[0] == '\0') {
-        return send_json_error(req,
-                               "400 Bad Request",
-                               ESP111_PROTOCOL_ERROR_INVALID_DEVICE_ID,
+    strlcpy(device_id, reserved_device_id != NULL ? reserved_device_id : "", sizeof(device_id));
+    if (device_id[0] == '\0') {
+        return send_json_error(req, "400 Bad Request", ESP111_PROTOCOL_ERROR_INVALID_DEVICE_ID,
                                "X-Device-Id header is required");
     }
-
-    if (!child_registry_is_allowed(device_id)) {
-        return send_json_error(req,
-                               "403 Forbidden",
-                               ESP111_PROTOCOL_ERROR_INVALID_DEVICE_ID,
-                               "device_id is not in gateway allowlist");
-    }
-
-    if (xSemaphoreTake(s_voice_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
-        return send_json_error(req,
-                               "409 Conflict",
-                               ESP111_PROTOCOL_ERROR_VOICE_BUSY,
-                               "voice mutex is busy");
-    }
-
-    if (s_active_device_id[0] != '\0') {
-        xSemaphoreGive(s_voice_lock);
-        return send_json_error(req,
-                               "409 Conflict",
-                               ESP111_PROTOCOL_ERROR_VOICE_BUSY,
-                               "another device is speaking");
-    }
-    strlcpy(s_active_device_id, device_id, sizeof(s_active_device_id));
-    xSemaphoreGive(s_voice_lock);
     child_registry_set_voice_busy(device_id, true);
     s3_scheduler_set_voice_busy(true);
     apply_voice_socket_timeout(req, device_id);
@@ -349,6 +362,11 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
 
     if (stream_ctx.disconnected) {
         offline_policy_record_server_result(ESP_OK, status);
+        ESP_LOGI(TAG,
+                 "voice downstream aborted device_id=%s response_bytes=%u response_chunks=%u",
+                 device_id,
+                 (unsigned int)stream_ctx.bytes_sent,
+                 (unsigned int)stream_ctx.chunks_sent);
         voice_proxy_release_active_device(device_id);
         return stream_ctx.send_error != ESP_OK ? stream_ctx.send_error : ESP_FAIL;
     }
@@ -366,9 +384,10 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
         int64_t duration_ms = esp_timer_get_time() / 1000 - turn_start_ms;
         sensor_aggregator_record_voice_event(device_id, pcm_len, (uint32_t)duration_ms);
         ESP_LOGI(TAG,
-                 "voice response sent to child device_id=%s response_bytes=%u duration_ms=%lld",
+                 "voice response sent to child device_id=%s response_bytes=%u response_chunks=%u duration_ms=%lld",
                  device_id,
                  (unsigned int)stream_ctx.bytes_sent,
+                 (unsigned int)stream_ctx.chunks_sent,
                  (long long)duration_ms);
         ESP_LOGI(TAG, "voice turn proxied device_id=%s bytes=%u", device_id, (unsigned int)pcm_len);
         voice_proxy_release_active_device(device_id);
@@ -382,10 +401,11 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
              status,
              esp_err_to_name(ret));
     if (stream_ctx.bytes_sent > 0) {
-        esp_err_t end_ret = httpd_resp_send_chunk(req, NULL, 0);
-        if (end_ret != ESP_OK) {
-            voice_proxy_log_child_send_disconnect(&stream_ctx, end_ret);
-        }
+        ESP_LOGW(TAG,
+                 "voice partial response aborted device_id=%s response_bytes=%u response_chunks=%u terminator_sent=0",
+                 device_id,
+                 (unsigned int)stream_ctx.bytes_sent,
+                 (unsigned int)stream_ctx.chunks_sent);
         voice_proxy_release_active_device(device_id);
         return ESP_FAIL;
     }
@@ -399,4 +419,90 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
     esp_err_t error_ret = send_json_error(req, http_status, error_code, esp_err_to_name(ret));
     voice_proxy_release_active_device(device_id);
     return error_ret;
+}
+
+static void voice_proxy_worker_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        voice_proxy_job_t job = {0};
+        if (xQueueReceive(s_voice_queue, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        const int64_t started_ms = esp_timer_get_time() / 1000;
+        const int64_t queue_wait_ms = job.queued_at_ms > 0 ? started_ms - job.queued_at_ms : 0;
+        xSemaphoreTake(s_voice_lock, portMAX_DELAY);
+        s_voice_pending = false;
+        strlcpy(s_active_device_id, job.device_id, sizeof(s_active_device_id));
+        xSemaphoreGive(s_voice_lock);
+
+        ESP_LOGI(TAG,
+                 "local_http_active_count=1 handler=voice handler_latency=0 voice_http_active=1 telemetry_http_active=0 queue_wait_time=%lld",
+                 (long long)queue_wait_ms);
+        esp_err_t ret = voice_proxy_process_reserved_turn(job.req, job.device_id);
+        const int64_t latency_ms = esp_timer_get_time() / 1000 - started_ms;
+        ESP_LOGI(TAG,
+                 "local_http_active_count=0 handler=voice handler_latency=%lld voice_http_active=0 telemetry_http_active=0 queue_wait_time=%lld result=%s",
+                 (long long)latency_ms,
+                 (long long)queue_wait_ms,
+                 esp_err_to_name(ret));
+        (void)httpd_req_async_handler_complete(job.req);
+    }
+}
+
+esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
+{
+    if (req == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char device_id[CHILD_REGISTRY_DEVICE_ID_LEN] = {0};
+    if (httpd_req_get_hdr_value_str(req, "X-Device-Id", device_id, sizeof(device_id)) != ESP_OK ||
+        device_id[0] == '\0') {
+        return send_json_error(req, "400 Bad Request", ESP111_PROTOCOL_ERROR_INVALID_DEVICE_ID,
+                               "X-Device-Id header is required");
+    }
+    if (!child_registry_is_allowed(device_id)) {
+        return send_json_error(req, "403 Forbidden", ESP111_PROTOCOL_ERROR_INVALID_DEVICE_ID,
+                               "device_id is not in gateway allowlist");
+    }
+    if (s_voice_queue == NULL || s_voice_lock == NULL) {
+        return send_json_error(req, "503 Service Unavailable", ESP111_PROTOCOL_ERROR_VOICE_BUSY,
+                               "voice proxy is not ready");
+    }
+
+    xSemaphoreTake(s_voice_lock, portMAX_DELAY);
+    const bool busy = s_voice_pending || s_active_device_id[0] != '\0';
+    if (!busy) {
+        s_voice_pending = true;
+    }
+    xSemaphoreGive(s_voice_lock);
+    if (busy) {
+        return send_json_error(req, "409 Conflict", ESP111_PROTOCOL_ERROR_VOICE_BUSY,
+                               "another device is speaking");
+    }
+
+    httpd_req_t *async_req = NULL;
+    esp_err_t ret = httpd_req_async_handler_begin(req, &async_req);
+    if (ret != ESP_OK) {
+        xSemaphoreTake(s_voice_lock, portMAX_DELAY);
+        s_voice_pending = false;
+        xSemaphoreGive(s_voice_lock);
+        return ret;
+    }
+    voice_proxy_job_t job = {
+        .req = async_req,
+        .queued_at_ms = esp_timer_get_time() / 1000,
+    };
+    strlcpy(job.device_id, device_id, sizeof(job.device_id));
+    if (xQueueSend(s_voice_queue, &job, 0) != pdTRUE) {
+        xSemaphoreTake(s_voice_lock, portMAX_DELAY);
+        s_voice_pending = false;
+        xSemaphoreGive(s_voice_lock);
+        (void)send_json_error(async_req, "409 Conflict", ESP111_PROTOCOL_ERROR_VOICE_BUSY,
+                              "voice queue is busy");
+        (void)httpd_req_async_handler_complete(async_req);
+        return ESP_OK;
+    }
+    return ESP_OK;
 }

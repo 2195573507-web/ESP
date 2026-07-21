@@ -32,7 +32,11 @@ set(runtime_srcs
             runtime/app_runtime.c
             runtime/c5_backpressure_controller.c
             runtime/c5_event_bus.c
+            runtime/c5_resource_manager.c
             runtime/c5_runtime_workers.c)
+
+set(memory_srcs
+            memory/c5_memory.c)
 
 set(device_protocol_srcs
             device_protocol/envelope_builder.c
@@ -65,6 +69,7 @@ set(srcs
             ${speaker_srcs}
             ${voice_srcs}
             ${runtime_srcs}
+            ${memory_srcs}
             ${device_protocol_srcs}
             ${sensor_srcs}
             ${system_srcs})
@@ -81,6 +86,7 @@ set(priv_include_dirs
             speaker
             voice_domain
             runtime
+            memory
             device_protocol
             sensor_domain/bme690/driver
             sensor_domain/bme690/service

@@ -23,6 +23,7 @@
 #include "app_stack_monitor.h"
 #include "bme_sensor_service.h"
 #include "c5_backpressure_controller.h"
+#include "c5_memory.h"
 #include "gateway_link.h"
 #if MAIN_ENABLE_CSI_SERVICE
 #include "csi_service.h"
@@ -40,6 +41,7 @@ void app_orchestrator_start(void)
     char connected_ssid[33] = {0};
 
     app_stack_monitor_log(TAG, "app_startup_task", "orchestrator_enter");
+    c5_mem_log("startup");
 
     /*
      * 启动流程边界：
@@ -70,6 +72,7 @@ void app_orchestrator_start(void)
         ESP_LOGI(TAG, "WiFi connected");
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_wifi_connect");
+    c5_mem_log("after_wifi_connect");
 
     // 等待 WiFi 连续稳定后再探测 S3 local HTTP，避免刚拿到 IP 时就发起业务请求。
     while (!wifi_is_stable()) {
@@ -106,6 +109,8 @@ void app_orchestrator_start(void)
     }
     if (csi_ret != ESP_OK) {
         ESP_LOGW(TAG, "CSI service start skipped: %s", esp_err_to_name(csi_ret));
+    } else {
+        c5_mem_log("after_csi_start");
     }
 #else
     ESP_LOGI(TAG, "CSI service disabled by MAIN_ENABLE_CSI_SERVICE");
@@ -124,6 +129,13 @@ void app_orchestrator_start(void)
         } else {
             ESP_LOGI(TAG, "Speaker self-test done");
         }
+        esp_err_t speaker_release_ret =
+            audio_player_release_session(AUDIO_PLAYER_DRAIN_TIMEOUT_MS);
+        if (speaker_release_ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "Speaker self-test session release failed: %s",
+                     esp_err_to_name(speaker_release_ret));
+        }
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_speaker_self_test_gate");
 
@@ -135,6 +147,8 @@ void app_orchestrator_start(void)
         esp_err_t bme_ret = bme_sensor_service_start();
         if (bme_ret != ESP_OK) {
             ESP_LOGE(TAG, "BME service start failed: %s", esp_err_to_name(bme_ret));
+        } else {
+            c5_mem_log("after_bme_start");
         }
     } else {
         ESP_LOGI(TAG, "BME service disabled by MAIN_ENABLE_BME_SERVICE");

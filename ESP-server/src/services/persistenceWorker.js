@@ -30,6 +30,15 @@ function logCsiQueue(logger, csi) {
     logger.warn(`[CSI_PERSIST_QUEUE] length=${csi.length} dropped=${csi.dropped} coalesced=${csi.coalesced}`);
 }
 
+function describeBatch(batch) {
+    return batch.map(job => ({
+        id: job?.id,
+        type: job?.type || "unknown",
+        attempts: Math.max(0, Number(job?.attempts) || 0),
+        snapshot_id: job?.snapshot_id || undefined
+    }));
+}
+
 function createPersistenceWorker(options = {}) {
     const dbRun = options.dbRun;
     const logger = options.logger || console;
@@ -40,6 +49,7 @@ function createPersistenceWorker(options = {}) {
     let flushing = false;
     let stopped = false;
     let immediateScheduled = false;
+    let lastFailure = null;
 
     async function runBatch(batch) {
         if (batch.length === 0) {
@@ -67,6 +77,7 @@ function createPersistenceWorker(options = {}) {
 
             logger.info(`[persistence_worker] persisted=${batch.length} queue=${JSON.stringify(getPersistenceQueueStats())}`);
             logCsiDbWrite(logger, csiJobs, startNs, false);
+            lastFailure = null;
             return {
                 persisted: batch.length
             };
@@ -82,7 +93,12 @@ function createPersistenceWorker(options = {}) {
             const requeued = requeuePersistenceBatch(batch);
             logCsiQueue(logger, requeued.csi);
             logCsiDbWrite(logger, csiJobs, startNs, true);
-            logger.error(`[persistence_worker] batch failed requeued=${batch.length} error=${error?.message || error}`);
+            lastFailure = {
+                at_ms: Date.now(),
+                error: error?.message || String(error),
+                jobs: describeBatch(batch)
+            };
+            logger.error(`[PERSISTENCE_JOB_FAILED] requeued=${batch.length} jobs=${JSON.stringify(lastFailure.jobs)} error=${lastFailure.error}`);
             return {
                 persisted: 0,
                 error
@@ -159,11 +175,32 @@ function createPersistenceWorker(options = {}) {
         logger.info("[persistence_worker] stopped after drain");
     }
 
+    async function waitForIdle(options = {}) {
+        const maxBatches = Math.max(1, Math.trunc(Number(options.maxBatches) || 100));
+        let batches = 0;
+        while (getPersistenceQueueStats().total > 0) {
+            if (batches >= maxBatches) {
+                throw new Error(`[persistence_worker] waitForIdle exceeded max_batches=${maxBatches} queue=${JSON.stringify(getPersistenceQueueStats())}`);
+            }
+            const result = await flushOnce();
+            batches += 1;
+            if (result?.error) {
+                throw new Error(`[persistence_worker] persistence failed while waiting for idle: ${result.error?.message || result.error}`);
+            }
+        }
+        return {
+            batches,
+            queue: getPersistenceQueueStats()
+        };
+    }
+
     return {
         flushOnce,
+        getLastFailure: () => lastFailure,
         scheduleImmediateFlushIfNeeded,
         start,
-        stop
+        stop,
+        waitForIdle
     };
 }
 

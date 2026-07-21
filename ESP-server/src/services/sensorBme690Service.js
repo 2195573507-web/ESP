@@ -10,6 +10,10 @@ const {
 const {
     recordEvent
 } = require("./eventLogService");
+const {
+    isSupportedC5DeviceId,
+    resolveDeviceId
+} = require("./deviceIdResolver");
 
 const SENSOR_ID_MAX_LENGTH = 80;
 const AIR_QUALITY_LEVELS = new Set(["excellent", "good", "moderate", "poor", "bad", "unknown"]);
@@ -307,17 +311,19 @@ function validateBmeEnvelope(body) {
 function prepareBme690Ingest(body, options = {}) {
     const validation = validateBmeEnvelope(body);
     const serverRecvMs = Number.isFinite(options.serverRecvMs) ? options.serverRecvMs : Date.now();
+    const requestedDeviceId = resolveDeviceId(body?.device_id);
+    const trustedDeviceId = resolveDeviceId(options.trustedDeviceId);
     const metadata = readDeviceMetadata({
         body,
         headers: options.headers,
         query: options.query,
-        deviceId: options.trustedDeviceId,
+        deviceId: trustedDeviceId,
         payloadType: "sensor.bme690",
         serverRecvMs
     });
     metadata.gateway_id = trimText(options.trustedGatewayId, 128);
-    if (options.trustedDeviceId) {
-        metadata.device_id = trimText(options.trustedDeviceId, 128);
+    if (trustedDeviceId) {
+        metadata.device_id = trustedDeviceId;
     }
 
     if (!validation.ok) {
@@ -326,6 +332,26 @@ function prepareBme690Ingest(body, options = {}) {
             status: 400,
             code: validation.code,
             error: validation.error,
+            metadata
+        };
+    }
+
+    if (trustedDeviceId && requestedDeviceId !== trustedDeviceId) {
+        return {
+            ok: false,
+            status: 400,
+            code: "DEVICE_ID_MISMATCH",
+            error: "device_id must match authenticated gateway metadata",
+            metadata
+        };
+    }
+
+    if (options.requireSupportedC5DeviceId === true && !isSupportedC5DeviceId(metadata.device_id)) {
+        return {
+            ok: false,
+            status: 400,
+            code: "DEVICE_ID_NOT_ALLOWED",
+            error: "device_id must be sensair_shuttle_01 or sensair_shuttle_02",
             metadata
         };
     }
@@ -374,13 +400,22 @@ function prepareBme690Ingest(body, options = {}) {
     };
 }
 
-async function persistBme690Ingest(dbRun, dbAll, prepared) {
+async function persistBme690Ingest(dbRun, dbAll, prepared, options = {}) {
     if (!prepared?.ok) {
         return null;
     }
 
     const metadata = prepared.metadata;
-    const result = await dbRun(
+    const useTransaction = options.transactional === true;
+    let transactionStarted = false;
+
+    try {
+        if (useTransaction) {
+            await dbRun("BEGIN IMMEDIATE TRANSACTION");
+            transactionStarted = true;
+        }
+
+        const result = await dbRun(
         `INSERT INTO sensor_records
         (timestamp,temperature,humidity,pressure,gas_resistance,device_id,esp_time_ms,esp_uptime_ms,server_recv_ms,server_time_iso,upload_delay_ms,schema_version,device_type,firmware_version,request_seq,time_synced,payload_type,sensor_id,metadata_json,raw_json,air_quality_json,air_quality_score,air_quality_level,air_quality_confidence,air_quality_algo_version,air_quality_source,gas_baseline_ohm,gas_ratio,gas_score,humidity_score)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -416,12 +451,12 @@ async function persistBme690Ingest(dbRun, dbAll, prepared) {
             prepared.airQualityCompatibility.gas_score,
             prepared.airQualityCompatibility.humidity_score
         ]
-    );
+        );
 
-    await refreshDeviceActivity(dbRun, dbAll, metadata, "sensor.bme690");
-    if (prepared.hasAlarm) {
-        const body = prepared.body;
-        await recordEvent(dbRun, {
+        await refreshDeviceActivity(dbRun, dbAll, metadata, "sensor.bme690");
+        if (prepared.hasAlarm) {
+            const body = prepared.body;
+            await recordEvent(dbRun, {
             event_type: "alarm",
             event_name: "alarm_created",
             device_id: metadata.device_id,
@@ -430,16 +465,31 @@ async function persistBme690Ingest(dbRun, dbAll, prepared) {
             payload: body.payload?.alarm || body.alarm || body.payload || {},
             source: "device_ingest",
             server_recv_ms: metadata.server_recv_ms
-        });
-    }
+            });
+        }
 
-    prepared.data.id = result.lastID;
-    return {
-        ok: true,
-        status: 201,
-        metadata,
-        data: prepared.data
-    };
+        if (transactionStarted) {
+            await dbRun("COMMIT");
+            transactionStarted = false;
+        }
+
+        prepared.data.id = result.lastID;
+        return {
+            ok: true,
+            status: 201,
+            metadata,
+            data: prepared.data
+        };
+    } catch (error) {
+        if (transactionStarted) {
+            try {
+                await dbRun("ROLLBACK");
+            } catch (rollbackError) {
+                throw new Error(`[device-v1] BME transaction failed: ${error?.message || error}; rollback failed: ${rollbackError?.message || rollbackError}`);
+            }
+        }
+        throw error;
+    }
 }
 
 async function ingestBme690(dbRun, dbAll, body, options = {}) {

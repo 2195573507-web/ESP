@@ -164,7 +164,8 @@ function computeOnlineState(row, nowMs = Date.now()) {
     // C5 online state is authored by S3 child_registry. The timestamp remains
     // observable for API compatibility, but must never turn an S3 child offline.
     if (statusSource === STATUS_SOURCE_S3) {
-        const online = booleanValue(row?.online, false);
+        // A voice turn is an active child-registry state, not an offline C5.
+        const online = booleanValue(row?.online, false) || booleanValue(row?.voice_busy, false);
         return {
             online,
             age_ms: ageMs,
@@ -663,11 +664,17 @@ function mapStableDeviceStatus(row, nowMs = Date.now(), fallbackDeviceId = "") {
             device_type: "unknown",
             room_id: "",
             room_name: "",
-            online: false,
+            online: null,
+            device_online: null,
+            status: "unknown",
+            status_source: "not_observed",
+            observed: false,
             lastSeen: null,
             last_seen_ms: null,
             age_ms: null,
-            offline_reason: "never_seen",
+            offline_reason: null,
+            link_lost: null,
+            voice_busy: null,
             last_payload_type: ""
         };
     }

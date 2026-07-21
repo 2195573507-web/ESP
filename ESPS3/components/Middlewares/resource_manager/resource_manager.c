@@ -1267,15 +1267,22 @@ size_t resource_manager_snapshot_live(
     return count;
 }
 
-bool resource_manager_get_session(const char *device_id,
-                                  resource_manager_session_view_t *out_view)
+static esp_err_t get_session_with_timeout(const char *device_id,
+                                          resource_manager_session_view_t *out_view,
+                                          TickType_t lock_timeout_ticks,
+                                          bool *out_found)
 {
-    if (out_view == NULL || s_lock == NULL) {
-        return false;
+    if (out_view == NULL || out_found == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_found = false;
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
     }
     memset(out_view, 0, sizeof(*out_view));
-    bool found = false;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (xSemaphoreTake(s_lock, lock_timeout_ticks) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     resource_session_t *session = find_locked(device_id);
     if (session != NULL) {
         strlcpy(out_view->device_id, session->device_id, sizeof(out_view->device_id));
@@ -1283,10 +1290,29 @@ bool resource_manager_get_session(const char *device_id,
         out_view->state_since_ms = session->state_since_ms;
         out_view->grace_started_ms = session->grace_started_ms;
         out_view->generation = session->generation;
-        found = true;
+        *out_found = true;
     }
     xSemaphoreGive(s_lock);
-    return found;
+    return ESP_OK;
+}
+
+bool resource_manager_get_session(const char *device_id,
+                                  resource_manager_session_view_t *out_view)
+{
+    bool found = false;
+    return get_session_with_timeout(device_id, out_view, portMAX_DELAY, &found) == ESP_OK && found;
+}
+
+esp_err_t resource_manager_get_session_timed(const char *device_id,
+                                             resource_manager_session_view_t *out_view,
+                                             uint32_t lock_timeout_ms,
+                                             bool *out_found)
+{
+    TickType_t timeout_ticks = pdMS_TO_TICKS(lock_timeout_ms);
+    if (lock_timeout_ms > 0U && timeout_ticks == 0U) {
+        timeout_ticks = 1U;
+    }
+    return get_session_with_timeout(device_id, out_view, timeout_ticks, out_found);
 }
 
 void resource_manager_log_session_diagnostic(const char *device_id,

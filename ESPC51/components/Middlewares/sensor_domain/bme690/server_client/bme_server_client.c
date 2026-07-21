@@ -17,10 +17,38 @@
 #include "esp111_protocol_common.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "server_comm_http.h"
 #include "terminal_config.h"
 
 static const char *TAG = "bme_server_client";
+static TickType_t s_bme_retry_not_before;
+static uint32_t s_bme_failure_count;
+
+static bool bme_server_client_retry_ready(void)
+{
+    return s_bme_retry_not_before == 0 ||
+           (int32_t)(xTaskGetTickCount() - s_bme_retry_not_before) >= 0;
+}
+
+static void bme_server_client_note_upload_result(esp_err_t ret)
+{
+    if (ret == ESP_OK) {
+        s_bme_failure_count = 0;
+        s_bme_retry_not_before = 0;
+        return;
+    }
+    if (s_bme_failure_count < 6U) {
+        ++s_bme_failure_count;
+    }
+    const uint32_t delay_ms = 1000U << (s_bme_failure_count > 4U ? 4U : s_bme_failure_count);
+    s_bme_retry_not_before = xTaskGetTickCount() + pdMS_TO_TICKS(delay_ms > 30000U ? 30000U : delay_ms);
+    ESP_LOGW(TAG, "BME upload backoff failures=%lu retry_after_ms=%lu ret=%s",
+             (unsigned long)s_bme_failure_count,
+             (unsigned long)(delay_ms > 30000U ? 30000U : delay_ms),
+             esp_err_to_name(ret));
+}
 
 static uint32_t bme_server_client_boot_id(void)
 {
@@ -132,6 +160,9 @@ esp_err_t bme_server_client_upload_reading(const char *sensor_id,
 {
     if (sensor_id == NULL || sensor_id[0] == '\0' || data == NULL || air_quality == NULL) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (!bme_server_client_retry_ready()) {
+        return ESP_ERR_NOT_FINISHED;
     }
 
     char escaped_sensor_id[64];
@@ -303,5 +334,6 @@ esp_err_t bme_server_client_upload_reading(const char *sensor_id,
                  air_quality->air_quality_score,
                  (unsigned long)air_quality->sample_count);
     }
+    bme_server_client_note_upload_result(ret);
     return ret;
 }

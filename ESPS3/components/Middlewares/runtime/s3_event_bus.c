@@ -13,6 +13,7 @@
 
 #include "esp111_protocol_common.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "s3_scheduler.h"
@@ -115,6 +116,24 @@ static size_t queue_depth_locked(void)
 {
     return s_critical_queue.count + s_realtime_queue.count +
            state_depth_locked() + s_background_queue.count;
+}
+
+static void snapshot_stats_locked(s3_event_bus_stats_t *out_stats)
+{
+    if (out_stats == NULL) {
+        return;
+    }
+    out_stats->queue_depth = queue_depth_locked();
+    out_stats->critical_depth = s_critical_queue.count;
+    out_stats->realtime_depth = s_realtime_queue.count;
+    out_stats->state_depth = state_depth_locked();
+    out_stats->background_depth = s_background_queue.count;
+    out_stats->drop_count = s_drop_count;
+    out_stats->background_drop_count = s_background_drop_count;
+    out_stats->coalesce_count = s_coalesce_count;
+    out_stats->csi_ingress_drop_count = s_csi_ingress_drop_count;
+    out_stats->csi_ingress_coalesce_count = s_csi_ingress_coalesce_count;
+    out_stats->csi_latest = s_csi_latest;
 }
 
 static void release_event(s3_scheduler_event_t *event)
@@ -253,8 +272,17 @@ static bool event_is_valid_for_bus(const s3_scheduler_event_t *event)
     return true;
 }
 
-esp_err_t s3_event_bus_push_owned(s3_scheduler_event_t *event)
+static esp_err_t push_owned_with_timeout(s3_scheduler_event_t *event,
+                                         TickType_t lock_timeout_ticks,
+                                         uint32_t *out_lock_wait_ms,
+                                         s3_event_bus_stats_t *out_stats)
 {
+    if (out_lock_wait_ms != NULL) {
+        *out_lock_wait_ms = 0U;
+    }
+    if (out_stats != NULL) {
+        memset(out_stats, 0, sizeof(*out_stats));
+    }
     if (!event_is_valid_for_bus(event)) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -270,7 +298,16 @@ esp_err_t s3_event_bus_push_owned(s3_scheduler_event_t *event)
     esp_err_t ret = ESP_OK;
 
     /* 所有队列结构都在同一把 mutex 下更新；信号量只表示“有新事件可消费”。 */
-    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const int64_t lock_wait_started_us = esp_timer_get_time();
+    if (xSemaphoreTake(s_lock, lock_timeout_ticks) != pdTRUE) {
+        if (out_lock_wait_ms != NULL) {
+            *out_lock_wait_ms = (uint32_t)((esp_timer_get_time() - lock_wait_started_us) / 1000);
+        }
+        return ESP_ERR_TIMEOUT;
+    }
+    if (out_lock_wait_ms != NULL) {
+        *out_lock_wait_ms = (uint32_t)((esp_timer_get_time() - lock_wait_started_us) / 1000);
+    }
     switch (level) {
     case S3_EVENT_BUS_LEVEL_CRITICAL:
         ret = push_fifo_locked(s_critical_queue.items,
@@ -338,6 +375,7 @@ esp_err_t s3_event_bus_push_owned(s3_scheduler_event_t *event)
     const size_t background_depth = s_background_queue.count;
     const uint32_t drop_count = s_drop_count;
     const uint32_t coalesce_count = s_coalesce_count;
+    snapshot_stats_locked(out_stats);
     xSemaphoreGive(s_lock);
 
     if (accepted && signal_needed) {
@@ -357,6 +395,23 @@ esp_err_t s3_event_bus_push_owned(s3_scheduler_event_t *event)
                  (unsigned long)coalesce_count);
     }
     return ret;
+}
+
+esp_err_t s3_event_bus_push_owned(s3_scheduler_event_t *event)
+{
+    return push_owned_with_timeout(event, portMAX_DELAY, NULL, NULL);
+}
+
+esp_err_t s3_event_bus_push_owned_timed(s3_scheduler_event_t *event,
+                                        uint32_t lock_timeout_ms,
+                                        uint32_t *out_lock_wait_ms,
+                                        s3_event_bus_stats_t *out_stats)
+{
+    TickType_t timeout_ticks = pdMS_TO_TICKS(lock_timeout_ms);
+    if (lock_timeout_ms > 0U && timeout_ticks == 0U) {
+        timeout_ticks = 1U;
+    }
+    return push_owned_with_timeout(event, timeout_ticks, out_lock_wait_ms, out_stats);
 }
 
 bool s3_event_bus_wait(uint32_t timeout_ms)
@@ -505,17 +560,7 @@ s3_event_bus_stats_t s3_event_bus_get_stats(void)
     }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    stats.queue_depth = queue_depth_locked();
-    stats.critical_depth = s_critical_queue.count;
-    stats.realtime_depth = s_realtime_queue.count;
-    stats.state_depth = state_depth_locked();
-    stats.background_depth = s_background_queue.count;
-    stats.drop_count = s_drop_count;
-    stats.background_drop_count = s_background_drop_count;
-    stats.coalesce_count = s_coalesce_count;
-    stats.csi_ingress_drop_count = s_csi_ingress_drop_count;
-    stats.csi_ingress_coalesce_count = s_csi_ingress_coalesce_count;
-    stats.csi_latest = s_csi_latest;
+    snapshot_stats_locked(&stats);
     xSemaphoreGive(s_lock);
     return stats;
 }

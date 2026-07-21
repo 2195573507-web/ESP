@@ -25,6 +25,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
+#include "freertos/task.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "csi_service";
@@ -61,7 +62,39 @@ static csi_latest_feature_slot_t s_latest_feature_slots[2];
 static uint32_t s_pending_sample_overwrites;
 static uint8_t s_latest_feature_read_index;
 static uint8_t s_latest_feature_write_index;
+static uint32_t s_worker_active_count;
 static portMUX_TYPE s_feature_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void csi_service_clear_pending_locked(void)
+{
+    memset(&s_pending_sample, 0, sizeof(s_pending_sample));
+    memset(s_latest_feature_slots, 0, sizeof(s_latest_feature_slots));
+    s_pending_sample_valid = false;
+    s_pending_sample_overwrites = 0U;
+    s_latest_feature_read_index = 0U;
+    s_latest_feature_write_index = 0U;
+}
+
+static bool csi_service_worker_begin(void)
+{
+    bool active = false;
+    portENTER_CRITICAL(&s_feature_lock);
+    if (s_csi_started && !s_csi_paused) {
+        s_worker_active_count++;
+        active = true;
+    }
+    portEXIT_CRITICAL(&s_feature_lock);
+    return active;
+}
+
+static void csi_service_worker_end(void)
+{
+    portENTER_CRITICAL(&s_feature_lock);
+    if (s_worker_active_count > 0U) {
+        s_worker_active_count--;
+    }
+    portEXIT_CRITICAL(&s_feature_lock);
+}
 
 static envelope_state_hint_t csi_service_edge_state_to_local_hint(csi_edge_state_t state)
 {
@@ -83,6 +116,10 @@ static bool csi_service_store_pending_sample(const wifi_csi_info_t *data)
 
     size_t copied = 0;
     portENTER_CRITICAL(&s_feature_lock);
+    if (!s_csi_started || s_csi_paused) {
+        portEXIT_CRITICAL(&s_feature_lock);
+        return false;
+    }
     if (s_pending_sample_valid && s_pending_sample_overwrites < UINT32_MAX) {
         s_pending_sample_overwrites++;
     }
@@ -170,7 +207,7 @@ static void csi_service_process_frame(const csi_frame_sample_t *frame)
 static void csi_service_rx_cb(void *ctx, wifi_csi_info_t *data)
 {
     (void)ctx;
-    if (!s_csi_started || s_csi_paused || data == NULL) {
+    if (data == NULL) {
         return;
     }
 
@@ -226,16 +263,18 @@ esp_err_t csi_service_process_tick(void)
     if (!c5_should_run(C5_TASK_TYPE_CSI_PROCESS)) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!s_csi_started || s_csi_paused) {
+    if (!csi_service_worker_begin()) {
         return ESP_ERR_INVALID_STATE;
     }
 
     csi_frame_sample_t frame = {0};
     if (!csi_service_take_pending_frame(&frame)) {
+        csi_service_worker_end();
         return ESP_ERR_NOT_FOUND;
     }
 
     csi_service_process_frame(&frame);
+    csi_service_worker_end();
     return ESP_OK;
 }
 
@@ -244,7 +283,7 @@ esp_err_t csi_service_report_tick(void)
     if (!c5_should_run(C5_TASK_TYPE_CSI_REPORT)) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!s_csi_started || s_csi_paused) {
+    if (!csi_service_worker_begin()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -263,12 +302,15 @@ esp_err_t csi_service_report_tick(void)
         if (!csi_feature_processor_ready(&s_processor)) {
             ESP_LOGD(TAG, "CSI calibration in progress");
         }
+        csi_service_worker_end();
         return ESP_ERR_NOT_FOUND;
     }
 
-    return csi_server_client_publish_feature_result(&feature,
-                                                    CSI_OUTPUT_ENABLE_LOG != 0,
-                                                    CSI_OUTPUT_ENABLE_HTTP != 0);
+    esp_err_t ret = csi_server_client_publish_feature_result(&feature,
+                                                             CSI_OUTPUT_ENABLE_LOG != 0,
+                                                             CSI_OUTPUT_ENABLE_HTTP != 0);
+    csi_service_worker_end();
+    return ret;
 }
 
 esp_err_t csi_service_tick(void)
@@ -288,6 +330,7 @@ esp_err_t csi_service_init(void)
     s_latest_feature_write_index = 0;
     s_pending_sample_valid = false;
     s_pending_sample_overwrites = 0;
+    s_worker_active_count = 0U;
     s_csi_initialized = true;
 
     if (!MAIN_ENABLE_CSI_SERVICE) {
@@ -338,6 +381,7 @@ esp_err_t csi_service_start(void)
     s_latest_feature_write_index = 0;
     s_pending_sample_valid = false;
     s_pending_sample_overwrites = 0;
+    s_worker_active_count = 0U;
 
     esp_err_t ret = csi_service_configure_wifi_csi();
     if (ret != ESP_OK) {
@@ -358,14 +402,42 @@ esp_err_t csi_service_start(void)
 
 void csi_service_pause(void)
 {
+    portENTER_CRITICAL(&s_feature_lock);
     if (s_csi_started) {
         s_csi_paused = true;
+        csi_service_clear_pending_locked();
+    }
+    portEXIT_CRITICAL(&s_feature_lock);
+}
+
+esp_err_t csi_service_pause_and_wait(uint32_t timeout_ms)
+{
+    csi_service_pause();
+    const int64_t deadline_ms = (esp_timer_get_time() / 1000) + (int64_t)timeout_ms;
+    while (true) {
+        uint32_t active_count;
+        portENTER_CRITICAL(&s_feature_lock);
+        active_count = s_worker_active_count;
+        portEXIT_CRITICAL(&s_feature_lock);
+        if (active_count == 0U) {
+            return ESP_OK;
+        }
+        if ((esp_timer_get_time() / 1000) >= deadline_ms) {
+            ESP_LOGW(TAG,
+                     "CSI pause timeout active_workers=%lu timeout_ms=%u",
+                     (unsigned long)active_count,
+                     (unsigned int)timeout_ms);
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 void csi_service_resume(void)
 {
+    portENTER_CRITICAL(&s_feature_lock);
     if (s_csi_started) {
         s_csi_paused = false;
     }
+    portEXIT_CRITICAL(&s_feature_lock);
 }

@@ -156,12 +156,15 @@ esp_err_t iis_write(const void *data,
 esp_err_t iis_stop(void);
 
 /**
- * @brief 释放 I2S PDM TX channel 和本轮播放占用的 driver 资源。
+ * @brief 释放 I2S PDM TX channel 和常驻 driver 资源。
  *
- * 调用方法：speaker 播放结束或播放初始化失败后调用；下次播放会由 iis_start()
- * 重新 lazy init。释放 channel 可以避免 PCM 播放结束后继续占用连续 8-bit heap。
+ * 调用方法：仅用于播放器初始化回滚或明确的系统停机；正常播放轮次只能调用
+ * iis_stop()，下次播放直接复用已初始化的 channel/DMA。
  */
 esp_err_t iis_deinit(void);
+
+/** @brief Deinitialize IIS while bounding only the BSP state-mutex wait. */
+esp_err_t iis_deinit_timed(uint32_t lock_timeout_ms);
 
 /**
  * @brief 读取 I2S channel 当前信息，用于启动前后的 DMA/clock 诊断。

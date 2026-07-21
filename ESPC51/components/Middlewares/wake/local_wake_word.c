@@ -103,6 +103,15 @@ static esp_err_t local_wake_word_play_ack(void)
              "wake prompt cache fallback short_beep reason=%s",
              server_comm_err_to_name(cache_ret));
 
+    ESP_LOGI(TAG, "WAKE_ACK_FALLBACK_CLEANUP before_short_beep");
+    esp_err_t release_ret = audio_player_release_session(3000U);
+    if (release_ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "WAKE_ACK_FALLBACK_CLEANUP failed ret=%s",
+                 esp_err_to_name(release_ret));
+        return release_ret;
+    }
+
     if (!s_fallback_beep_ready) {
         for (uint32_t i = 0; i < LOCAL_WAKE_FALLBACK_BEEP_SAMPLES; i++) {
             bool high = ((i / LOCAL_WAKE_FALLBACK_BEEP_HALF_PERIOD_SAMPLES) % 2U) == 0;
@@ -300,16 +309,32 @@ bool local_wake_word_should_record_after_vad_start(void)
 esp_err_t local_wake_word_on_local_wake_detected(void)
 {
     portENTER_CRITICAL(&s_wake_lock);
-    s_recording_window_open = true;
+    s_recording_window_open = false;
     s_ack_active = true;
+    s_record_after_tick = 0;
     portEXIT_CRITICAL(&s_wake_lock);
-    ESP_LOGI(TAG, "local wake detected, recording window opens after prompt");
+    ESP_LOGI(TAG, "WAKE_ACK_PLAYBACK_START");
     esp_err_t ret = local_wake_word_play_ack();
     portENTER_CRITICAL(&s_wake_lock);
     s_ack_active = false;
-    s_record_after_tick = xTaskGetTickCount() + pdMS_TO_TICKS(LOCAL_WAKE_RECORD_DELAY_AFTER_ACK_MS);
     portEXIT_CRITICAL(&s_wake_lock);
+    ESP_LOGI(TAG, "WAKE_ACK_PLAYBACK_DONE ret=%s", esp_err_to_name(ret));
     return ret;
+}
+
+esp_err_t local_wake_word_open_recording_window(void)
+{
+    portENTER_CRITICAL(&s_wake_lock);
+    if (!s_initialized || s_ack_active) {
+        portEXIT_CRITICAL(&s_wake_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_recording_window_open = true;
+    s_record_after_tick = xTaskGetTickCount() +
+                          pdMS_TO_TICKS(LOCAL_WAKE_RECORD_DELAY_AFTER_ACK_MS);
+    portEXIT_CRITICAL(&s_wake_lock);
+    ESP_LOGI(TAG, "RECORDING_WINDOW_OPEN");
+    return ESP_OK;
 }
 
 esp_err_t local_wake_word_on_recording_finished(void)

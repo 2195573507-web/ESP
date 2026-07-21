@@ -42,8 +42,15 @@ void local_wake_word_reset_detector(void);
 /** 调用方法：Mic VAD 开始后判断提示音冷却是否结束，true 才允许开始上传录音。 */
 bool local_wake_word_should_record_after_vad_start(void);
 
-/** 调用方法：本地 WakeNet 触发后调用，会请求 S3 当前 wake prompt；失败则短 beep，然后打开录音窗口。 */
+/** 调用方法：本地 WakeNet 触发后调用，会请求 S3 当前 wake prompt；失败则短 beep。 */
 esp_err_t local_wake_word_on_local_wake_detected(void);
+
+/**
+ * @brief Mic ADC 已重建并开始采样后，正式打开本轮用户录音窗口。
+ *
+ * 调用方法：只由 voice_chain 在 MIC_RECORD_READY 后调用；提示音时间不计入录音窗口。
+ */
+esp_err_t local_wake_word_open_recording_window(void);
 
 /** 调用方法：一轮录音完成、服务器开始播放或异常恢复时调用，关闭录音窗口。 */
 esp_err_t local_wake_word_on_recording_finished(void);

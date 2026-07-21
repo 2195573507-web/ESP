@@ -19,6 +19,7 @@ const {
     readVoiceRequestId,
     sendVoiceError,
     sendVoiceTurnPcm,
+    sendVoiceTurnPcmStream,
     validateVoiceTurnRequest
 } = require("../voice/http");
 const {
@@ -59,7 +60,8 @@ const {
 } = require("../voice/ttsAudio");
 const {
     requestVoiceTts,
-    runVoiceTurnChain
+    runVoiceTurnChain,
+    runVoiceTurnStreamingChain
 } = require("../voice/chain");
 
 const VOICE_WAKE_PROMPT_TEXT = "我在，你说";
@@ -483,19 +485,29 @@ function createVoiceRouter(options) {
             ttsPcmBytes: 0
         };
         const controller = new AbortController();
+        let activeTtsStream = null;
+        let streamedResponseBytes = 0;
+        let streamedResponseStarted = false;
         let timedOut = false;
         const timeout = setTimeout(() => {
             timedOut = true;
             controller.abort();
+            activeTtsStream?.abort("Voice turn timed out");
         }, config.timeoutMs);
 
         const abortOnClientClose = () => {
             if (!res.writableEnded) {
                 controller.abort();
+                activeTtsStream?.abort("Voice response closed by client");
             }
         };
         req.on("aborted", abortOnClientClose);
         res.on("close", abortOnClientClose);
+        res.on("error", abortOnClientClose);
+
+        const streamingEligible = !config.mockEnabled &&
+            config.streamingEnabled &&
+            ["ws:", "wss:"].includes(new URL(gatewayConfig.tts.url).protocol);
 
         logger.log(
             `[voice-turn] start device_id=${maskLogValue(deviceId)} input_bytes=${requestBytes} active=${activeVoiceTurns}/${config.maxConcurrent} mode=${config.mockEnabled ? "mock" : "chain"} asr_ws_url=${maskUrlForLog(gatewayConfig.asr.url)} timeout_ms=${config.timeoutMs} key_${gatewayConfig.keySummary}`
@@ -505,6 +517,35 @@ function createVoiceRouter(options) {
             let result;
             if (config.mockEnabled) {
                 result = await streamMockVoiceTurn(req.body, res);
+            } else if (streamingEligible) {
+                result = await runVoiceTurnStreamingChain(
+                    req.body,
+                    deviceId,
+                    config,
+                    gatewayConfig,
+                    controller.signal,
+                    metrics,
+                    logger,
+                    { dbAll }
+                );
+                activeTtsStream = result.ttsStream;
+                const streamed = await sendVoiceTurnPcmStream(res, activeTtsStream.stream, controller.signal);
+                streamedResponseBytes = streamed.bytesWritten;
+                streamedResponseStarted = streamed.started;
+                const completion = await activeTtsStream.completion;
+                if (completion.status !== "completed") {
+                    throw completion.error || createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS streaming did not complete", 502);
+                }
+                metrics.ttsMs = Date.now() - result.ttsStartedAt;
+                metrics.ttsPcmBytes = completion.bytesGenerated;
+                result = {
+                    ...result,
+                    bytes: streamed.bytesWritten,
+                    ttsMs: metrics.ttsMs,
+                    ttsPcmBytes: completion.bytesGenerated,
+                    responseAlreadySent: true,
+                    streamingQueuePeakBytes: completion.queue.peakQueuedBytes
+                };
             } else {
                 result = await runVoiceTurnChain(
                     req.body,
@@ -538,12 +579,32 @@ function createVoiceRouter(options) {
                 timeoutMs: config.timeoutMs,
                 activeLimit: config.maxConcurrent
             }, logger);
-            sendVoiceTurnPcm(res, result.pcm);
+            if (!result.responseAlreadySent) {
+                sendVoiceTurnPcm(res, result.pcm);
+            }
 
             logger.log(
-                `[voice-turn] success device_id=${maskLogValue(deviceId)} mode=${result.mode} input_bytes=${requestBytes} asr_ws_url=${maskUrlForLog(gatewayConfig.asr.url)} asr_text_length=${result.asrTextLength} asr_text=${JSON.stringify(result.asrTextPreview || "")} llm_reply_length=${result.llmReplyLength} tts_pcm_bytes=${result.ttsPcmBytes} response_bytes=${result.bytes} elapsed_ms=${elapsedMs}`
+                `[voice-turn] success device_id=${maskLogValue(deviceId)} mode=${result.mode} strategy=${result.responseAlreadySent ? "streaming" : "buffered"} input_bytes=${requestBytes} asr_ws_url=${maskUrlForLog(gatewayConfig.asr.url)} asr_text_length=${result.asrTextLength} asr_text=${JSON.stringify(result.asrTextPreview || "")} llm_reply_length=${result.llmReplyLength} tts_pcm_bytes=${result.ttsPcmBytes} response_bytes=${result.bytes} elapsed_ms=${elapsedMs}`
             );
         } catch (error) {
+            const streamWrite = error?.voiceStreamWrite;
+            if (streamWrite) {
+                streamedResponseStarted = streamedResponseStarted || streamWrite.started;
+                streamedResponseBytes = Math.max(streamedResponseBytes, streamWrite.bytesWritten || 0);
+            }
+            const responseStarted = streamedResponseStarted || res.headersSent;
+            activeTtsStream?.abort("Voice turn route failed");
+            if (responseStarted && !res.writableEnded && !res.destroyed) {
+                try {
+                    res.end();
+                } catch (_) {
+                    // The client may have closed while the response was being terminated.
+                }
+            }
+            if (activeTtsStream) {
+                const completion = await activeTtsStream.completion;
+                metrics.ttsPcmBytes = Math.max(metrics.ttsPcmBytes, completion.bytesGenerated || 0);
+            }
             const elapsedMs = Date.now() - startedAt;
             const normalizedError = timedOut
                 ? createVoiceStageError(error?.stage || "voice_turn", "VOICE_TURN_TIMEOUT", "Voice turn timed out", 504, {
@@ -561,13 +622,13 @@ function createVoiceRouter(options) {
             await logVoiceTurnRecord(dbRun, {
                 requestId,
                 deviceId,
-                mode: config.mockEnabled ? "mock" : "chain",
-                status: "failed",
-                statusCode: status,
+                mode: config.mockEnabled ? "mock" : (streamingEligible ? "chain_streaming" : "chain"),
+                status: responseStarted ? "partial" : "failed",
+                statusCode: responseStarted ? 200 : status,
                 errorCode: code,
                 errorMessage: message,
                 inputBytes: requestBytes,
-                responseBytes: 0,
+                responseBytes: streamedResponseBytes,
                 asrMs: metrics.asrMs,
                 llmMs: metrics.llmMs,
                 ttsMs: metrics.ttsMs,
@@ -582,13 +643,16 @@ function createVoiceRouter(options) {
                 upstreamStatus: normalizedError.upstreamStatus
             }, logger);
 
-            sendVoiceError(res, status, code, message, {
-                upstreamStatus: normalizedError.upstreamStatus
-            });
+            if (!responseStarted && !res.writableEnded && !res.destroyed) {
+                sendVoiceError(res, status, code, message, {
+                    upstreamStatus: normalizedError.upstreamStatus
+                });
+            }
         } finally {
             clearTimeout(timeout);
             req.off("aborted", abortOnClientClose);
             res.off("close", abortOnClientClose);
+            res.off("error", abortOnClientClose);
             releaseVoiceTurn(deviceId);
         }
     }

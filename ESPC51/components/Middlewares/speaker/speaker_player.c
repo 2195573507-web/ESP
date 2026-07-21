@@ -24,9 +24,9 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "c5_memory.h"
 #include "iis.h"
 
 static const char *TAG = "speaker_player";
@@ -45,6 +45,7 @@ static void speaker_player_log_writer_task_alloc_check(void)
 /* 环形缓冲区内部条目类型，仅供本实现的 writer task 识别。 */
 #define AUDIO_PLAYER_RING_ITEM_TYPE_PCM 1U
 #define AUDIO_PLAYER_RING_ITEM_TYPE_END 2U
+#define AUDIO_PLAYER_RING_ITEM_TYPE_START 3U
 
 #ifndef AUDIO_PLAYER_ABORT_WAIT_MS
 #define AUDIO_PLAYER_ABORT_WAIT_MS 2000U // 断联中止播放时等待 writer 退出的保护超时。
@@ -56,6 +57,17 @@ static void speaker_player_log_writer_task_alloc_check(void)
 
 /* 播放互斥锁：同一时刻只允许一个 PCM 流占用 IIS/PDM 输出。 */
 static SemaphoreHandle_t s_play_mutex = NULL;
+static StaticSemaphore_t s_play_mutex_storage;
+static StaticSemaphore_t s_ring_items_storage;
+static StaticSemaphore_t s_ring_space_storage;
+static StaticSemaphore_t s_stream_done_storage;
+static StaticSemaphore_t s_stream_started_storage;
+#define AUDIO_PLAYER_I2S_WRITER_STACK_WORDS \
+    ((AUDIO_PLAYER_I2S_WRITER_TASK_STACK_SIZE + sizeof(StackType_t) - 1U) / sizeof(StackType_t))
+static StackType_t s_writer_task_stack[AUDIO_PLAYER_I2S_WRITER_STACK_WORDS];
+static StaticTask_t s_writer_task_storage;
+static portMUX_TYPE s_ring_lock = portMUX_INITIALIZER_UNLOCKED;
+static int16_t s_self_test_chunk[AUDIO_PLAYER_PCM_CHUNK_SAMPLES];
 
 /* 播放期间可选 heap 周期诊断，默认由 APP_DEBUG_SPEAKER_PLAYER_LOG 关闭。 */
 static esp_timer_handle_t s_heap_monitor_timer = NULL;
@@ -79,30 +91,93 @@ static audio_player_dma_diag_t s_dma_diag = {0};
 /* 环形缓冲区中传递的固定大小条目。最后一个不足 512 个采样点的音频块会补 0。 */
 typedef struct {
     uint32_t type;
+    uint32_t generation;
     uint32_t sequence;
     uint32_t valid_samples;
     int16_t samples[AUDIO_PLAYER_PCM_CHUNK_SAMPLES];
 } audio_player_ring_item_t;
 
-/* 单次播放流的上下文，只在 audio_player_play_pcm() 生命周期内有效。 */
+typedef enum {
+    AUDIO_PLAYER_STATE_UNINITIALIZED = 0,
+    AUDIO_PLAYER_STATE_READY_DISABLED,
+    AUDIO_PLAYER_STATE_OPENING,
+    AUDIO_PLAYER_STATE_PLAYING,
+    AUDIO_PLAYER_STATE_DRAINING,
+    AUDIO_PLAYER_STATE_ABORTING,
+} audio_player_state_t;
+
+/* 播放资源常驻于 C5 生命周期；每一轮只复位 generation 和统计项。 */
 typedef struct {
-    RingbufHandle_t ringbuf;
+    audio_player_ring_item_t *ring_slots;
+    uint32_t ring_capacity;
+    uint32_t ring_read_index;
+    uint32_t ring_write_index;
+    uint32_t ring_used;
+    SemaphoreHandle_t ring_items;
+    SemaphoreHandle_t ring_space;
     SemaphoreHandle_t done;
+    SemaphoreHandle_t started;
     volatile bool writer_done;
     volatile bool abort_requested;
+    volatile bool writer_start_done;
+    volatile uint32_t generation;
     esp_err_t result;
+    esp_err_t writer_start_result;
     UBaseType_t writer_stack_high_water_bytes;
     audio_player_ring_item_t *scratch_item;
+    uint8_t *dma_staging;
+    TaskHandle_t writer_task;
     uint64_t valid_samples_written;
     uint64_t dma_samples_written;
     uint64_t dma_bytes_written;
     uint32_t pcm_chunks_written;
+    uint32_t ring_high_water;
+    uint32_t ring_backpressure_count;
 } audio_player_stream_ctx_t;
 
+typedef struct {
+    volatile uint32_t callback_calls;
+    volatile uint32_t deferred_notify_count;
+    volatile uint32_t illegal_context_count;
+    volatile uint32_t writer_start_notify_count;
+    volatile uint32_t writer_end_notify_count;
+    uint32_t logged_generation;
+} audio_player_deferred_diag_t;
+
 static audio_player_stream_ctx_t s_pcm_stream_ctx = {0};
+static audio_player_deferred_diag_t s_deferred_diag = {0};
 static bool s_pcm_stream_open;
 static TaskHandle_t s_pcm_stream_owner_task;
 static uint32_t s_pcm_stream_sequence;
+static audio_player_state_t s_pcm_player_state = AUDIO_PLAYER_STATE_UNINITIALIZED;
+
+static bool speaker_player_called_from_isr(void)
+{
+    if (!xPortInIsrContext()) {
+        return false;
+    }
+
+    __atomic_fetch_add(&s_deferred_diag.illegal_context_count, 1U, __ATOMIC_RELAXED);
+    return true;
+}
+
+static void speaker_player_log_deferred_diag(const audio_player_stream_ctx_t *ctx)
+{
+    if (ctx == NULL || s_deferred_diag.logged_generation == ctx->generation) {
+        return;
+    }
+
+    s_deferred_diag.logged_generation = ctx->generation;
+    ESP_LOGI(TAG,
+             "SPEAKER_DEFERRED_DIAG generation=%lu callback_calls=%lu deferred_notifies=%lu "
+             "illegal_context=%lu writer_start_notifies=%lu writer_end_notifies=%lu",
+             (unsigned long)ctx->generation,
+             (unsigned long)__atomic_load_n(&s_deferred_diag.callback_calls, __ATOMIC_RELAXED),
+             (unsigned long)__atomic_load_n(&s_deferred_diag.deferred_notify_count, __ATOMIC_RELAXED),
+             (unsigned long)__atomic_load_n(&s_deferred_diag.illegal_context_count, __ATOMIC_RELAXED),
+             (unsigned long)__atomic_load_n(&s_deferred_diag.writer_start_notify_count, __ATOMIC_RELAXED),
+             (unsigned long)__atomic_load_n(&s_deferred_diag.writer_end_notify_count, __ATOMIC_RELAXED));
+}
 
 static void speaker_player_log_values(const char *message,
                                       int64_t value0,
@@ -141,6 +216,16 @@ static UBaseType_t speaker_player_current_stack_high_water(void)
     return app_stack_monitor_high_water();
 }
 #endif
+
+static UBaseType_t speaker_player_writer_stack_high_water(void)
+{
+#if (INCLUDE_uxTaskGetStackHighWaterMark == 1)
+    return s_pcm_stream_ctx.writer_task == NULL ? 0 :
+           uxTaskGetStackHighWaterMark(s_pcm_stream_ctx.writer_task);
+#else
+    return 0;
+#endif
+}
 
 static void speaker_player_heap_monitor_timer_cb(void *arg)
 {
@@ -249,7 +334,7 @@ static esp_err_t speaker_player_ensure_mutex(void)
     if (s_play_mutex != NULL) {
         return ESP_OK;
     }
-    s_play_mutex = xSemaphoreCreateMutex();
+    s_play_mutex = xSemaphoreCreateMutexStatic(&s_play_mutex_storage);
     return s_play_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK;
 }
 
@@ -366,42 +451,58 @@ static TickType_t speaker_player_ms_to_ticks(uint32_t timeout_ms)
     return ticks;
 }
 
-static esp_err_t speaker_player_ring_send(const audio_player_stream_ctx_t *ctx,
+static esp_err_t speaker_player_ring_send(audio_player_stream_ctx_t *ctx,
                                           const audio_player_ring_item_t *item)
 {
     /*
      * 生产侧向环形缓冲区投递 PCM 音频块。
      * 如果写入任务已经报错退出，这里直接把错误返回给播放主流程。
      */
-    if (ctx == NULL || ctx->ringbuf == NULL || item == NULL) {
+    if (ctx == NULL || ctx->ring_slots == NULL || ctx->ring_space == NULL ||
+        ctx->ring_items == NULL || item == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    while (true) {
-        if (ctx->abort_requested) {
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        if (ctx->writer_done && ctx->result != ESP_OK) {
-            return ctx->result;
-        }
-
-        BaseType_t sent = xRingbufferSend(ctx->ringbuf,
-                                          item,
-                                          sizeof(*item),
-                                          speaker_player_ms_to_ticks(AUDIO_PLAYER_RING_BUFFER_SEND_TIMEOUT_MS));
-        if (sent == pdTRUE) {
-            return ESP_OK;
-        }
-
-#if APP_DEBUG_SPEAKER_PLAYER_LOG
-        ESP_LOGW(TAG,
-                 "speaker ringbuffer waiting: type=%lu seq=%lu samples=%lu",
-                 (unsigned long)item->type,
-                 (unsigned long)item->sequence,
-                 (unsigned long)item->valid_samples);
-#endif
+    if (ctx->abort_requested) {
+        return ESP_ERR_INVALID_STATE;
     }
+    if (ctx->writer_done && ctx->result != ESP_OK) {
+        return ctx->result;
+    }
+
+    if (xSemaphoreTake(ctx->ring_space,
+                       speaker_player_ms_to_ticks(AUDIO_PLAYER_RING_BUFFER_SEND_TIMEOUT_MS)) != pdTRUE) {
+        ctx->ring_backpressure_count++;
+        ESP_LOGW(TAG,
+                 "SPEAKER_RING_BACKPRESSURE action=abort_turn timeout_ms=%u waits=%lu",
+                 (unsigned int)AUDIO_PLAYER_RING_BUFFER_SEND_TIMEOUT_MS,
+                 (unsigned long)ctx->ring_backpressure_count);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    bool high_water_changed = false;
+    uint32_t ring_high_water = 0;
+    uint32_t ring_capacity = 0;
+
+    portENTER_CRITICAL(&s_ring_lock);
+    uint32_t slot_index = ctx->ring_write_index;
+    ctx->ring_write_index = (ctx->ring_write_index + 1U) % ctx->ring_capacity;
+    ctx->ring_used++;
+    if (ctx->ring_used > ctx->ring_high_water) {
+        ctx->ring_high_water = ctx->ring_used;
+        high_water_changed = true;
+        ring_high_water = ctx->ring_high_water;
+        ring_capacity = ctx->ring_capacity;
+    }
+    portEXIT_CRITICAL(&s_ring_lock);
+
+    if (high_water_changed) {
+        ESP_LOGI(TAG, "SPEAKER_RING_WATERMARK used=%u capacity=%u",
+                 (unsigned int)ring_high_water, (unsigned int)ring_capacity);
+    }
+
+    memcpy(&ctx->ring_slots[slot_index], item, sizeof(*item));
+    xSemaphoreGive(ctx->ring_items);
+    return ESP_OK;
 }
 
 static esp_err_t speaker_player_ring_send_end(audio_player_stream_ctx_t *ctx,
@@ -413,9 +514,73 @@ static esp_err_t speaker_player_ring_send_end(audio_player_stream_ctx_t *ctx,
 
     audio_player_ring_item_t *item = ctx->scratch_item;
     item->type = AUDIO_PLAYER_RING_ITEM_TYPE_END;
+    item->generation = ctx->generation;
     item->sequence = sequence;
     item->valid_samples = 0;
     return speaker_player_ring_send(ctx, item);
+}
+
+static esp_err_t speaker_player_ring_send_start(audio_player_stream_ctx_t *ctx)
+{
+    if (ctx == NULL || ctx->scratch_item == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    audio_player_ring_item_t *item = ctx->scratch_item;
+    item->type = AUDIO_PLAYER_RING_ITEM_TYPE_START;
+    item->generation = ctx->generation;
+    item->sequence = 0U;
+    item->valid_samples = 0U;
+    __atomic_fetch_add(&s_deferred_diag.deferred_notify_count, 1U, __ATOMIC_RELAXED);
+    return speaker_player_ring_send(ctx, item);
+}
+
+static void speaker_player_reset_session_semaphores(audio_player_stream_ctx_t *ctx)
+{
+    if (ctx == NULL || ctx->ring_items == NULL || ctx->ring_space == NULL ||
+        ctx->done == NULL || ctx->started == NULL) {
+        return;
+    }
+    while (xSemaphoreTake(ctx->ring_items, 0) == pdTRUE) {
+    }
+    while (xSemaphoreTake(ctx->ring_space, 0) == pdTRUE) {
+    }
+    for (uint32_t i = 0; i < ctx->ring_capacity; ++i) {
+        (void)xSemaphoreGive(ctx->ring_space);
+    }
+    while (xSemaphoreTake(ctx->done, 0) == pdTRUE) {
+    }
+    while (xSemaphoreTake(ctx->started, 0) == pdTRUE) {
+    }
+}
+
+static void speaker_player_writer_complete_turn(audio_player_stream_ctx_t *ctx,
+                                                esp_err_t result)
+{
+    if (ctx == NULL || ctx->writer_done) {
+        return;
+    }
+
+    /* The persistent writer owns the per-turn I2S disable transition. */
+    (void)iis_stop();
+    ctx->result = result;
+    ctx->writer_stack_high_water_bytes = app_stack_monitor_high_water();
+    ctx->writer_done = true;
+    xSemaphoreGive(ctx->done);
+}
+
+static void speaker_player_writer_signal_started(audio_player_stream_ctx_t *ctx,
+                                                 esp_err_t result)
+{
+    if (ctx == NULL || ctx->writer_start_done) {
+        return;
+    }
+
+    ctx->writer_start_result = result;
+    ctx->writer_start_done = true;
+    if (ctx->started != NULL) {
+        xSemaphoreGive(ctx->started);
+    }
 }
 
 static void speaker_player_iis_writer_task(void *arg)
@@ -425,42 +590,54 @@ static void speaker_player_iis_writer_task(void *arg)
      * 这样播放主流程只负责投递 PCM，IIS/PDM DMA 写入集中在一个任务中完成。
      */
     audio_player_stream_ctx_t *ctx = (audio_player_stream_ctx_t *)arg;
-    esp_err_t result = ESP_OK;
-
-    if (ctx == NULL || ctx->ringbuf == NULL || ctx->done == NULL) {
+    if (ctx == NULL || ctx->ring_slots == NULL || ctx->ring_items == NULL ||
+        ctx->ring_space == NULL || ctx->done == NULL || ctx->started == NULL ||
+        ctx->dma_staging == NULL) {
         vTaskDelete(NULL);
         return;
     }
     app_stack_monitor_log(TAG, "speaker_iis_writer", "entry");
 
     while (true) {
-        size_t item_size = 0;
-        audio_player_ring_item_t *item =
-            (audio_player_ring_item_t *)xRingbufferReceive(ctx->ringbuf,
-                                                           &item_size,
-                                                           pdMS_TO_TICKS(AUDIO_PLAYER_ABORT_POLL_MS));
-        if (item == NULL) {
-            if (ctx->abort_requested) {
-                result = ESP_ERR_INVALID_STATE;
-                break;
+        if (xSemaphoreTake(ctx->ring_items, pdMS_TO_TICKS(AUDIO_PLAYER_ABORT_POLL_MS)) != pdTRUE) {
+            if (ctx->abort_requested && !ctx->writer_done) {
+                speaker_player_writer_signal_started(ctx, ESP_ERR_INVALID_STATE);
+                speaker_player_log_deferred_diag(ctx);
+                speaker_player_writer_complete_turn(ctx, ESP_ERR_INVALID_STATE);
             }
             continue;
         }
 
-        bool end_of_stream = false;
+        portENTER_CRITICAL(&s_ring_lock);
+        uint32_t slot_index = ctx->ring_read_index;
+        ctx->ring_read_index = (ctx->ring_read_index + 1U) % ctx->ring_capacity;
+        if (ctx->ring_used > 0) {
+            ctx->ring_used--;
+        }
+        portEXIT_CRITICAL(&s_ring_lock);
+        audio_player_ring_item_t *item = &ctx->ring_slots[slot_index];
+
+        bool finish_turn = false;
         esp_err_t item_result = ESP_OK;
 
-        if (ctx->abort_requested) {
-            end_of_stream = true;
+        if (ctx->writer_done) {
+            /* Abort may leave old ring entries; the next generation drops them safely. */
+        } else if (item->generation != ctx->generation) {
+            /* Abort may leave old ring entries; the next generation drops them safely. */
+        } else if (ctx->abort_requested) {
+            speaker_player_writer_signal_started(ctx, ESP_ERR_INVALID_STATE);
+            finish_turn = true;
             item_result = ESP_ERR_INVALID_STATE;
-        } else if (item_size != sizeof(*item)) {
-            ESP_LOGE(TAG,
-                     "speaker ringbuffer item size mismatch: got=%zu expected=%zu",
-                     item_size,
-                     sizeof(*item));
-            item_result = ESP_ERR_INVALID_SIZE;
+        } else if (item->type == AUDIO_PLAYER_RING_ITEM_TYPE_START) {
+            __atomic_fetch_add(&s_deferred_diag.writer_start_notify_count, 1U, __ATOMIC_RELAXED);
+            item_result = iis_start();
+            speaker_player_writer_signal_started(ctx, item_result);
+            if (item_result != ESP_OK) {
+                finish_turn = true;
+            }
         } else if (item->type == AUDIO_PLAYER_RING_ITEM_TYPE_END) {
-            end_of_stream = true;
+            __atomic_fetch_add(&s_deferred_diag.writer_end_notify_count, 1U, __ATOMIC_RELAXED);
+            finish_turn = true;
             speaker_player_log_values("speaker writer end", item->sequence, 0, 0, 0);
         } else if (item->type != AUDIO_PLAYER_RING_ITEM_TYPE_PCM) {
             ESP_LOGE(TAG,
@@ -468,6 +645,7 @@ static void speaker_player_iis_writer_task(void *arg)
                      (unsigned long)item->type,
                      (unsigned long)item->sequence);
             item_result = ESP_ERR_INVALID_ARG;
+            finish_turn = true;
         } else if (item->valid_samples == 0 ||
                    item->valid_samples > AUDIO_PLAYER_PCM_CHUNK_SAMPLES) {
             ESP_LOGE(TAG,
@@ -475,46 +653,26 @@ static void speaker_player_iis_writer_task(void *arg)
                      (unsigned long)item->sequence,
                      (unsigned long)item->valid_samples);
             item_result = ESP_ERR_INVALID_SIZE;
-        } else if (result == ESP_OK) {
+            finish_turn = true;
+        } else {
+            memcpy(ctx->dma_staging, item->samples, AUDIO_PLAYER_PCM_CHUNK_BYTES);
             item_result = speaker_player_write_bytes_dma_streaming(ctx,
-                                                                   item->samples,
+                                                                   ctx->dma_staging,
                                                                    AUDIO_PLAYER_PCM_CHUNK_BYTES,
                                                                    item->valid_samples,
                                                                    item->sequence);
+            if (item_result != ESP_OK) {
+                finish_turn = true;
+            }
         }
 
-        vRingbufferReturnItem(ctx->ringbuf, item);
+        xSemaphoreGive(ctx->ring_space);
 
-        if (result == ESP_OK && item_result != ESP_OK) {
-            result = item_result;
-        }
-        if (end_of_stream) {
-            break;
+        if (finish_turn) {
+            speaker_player_log_deferred_diag(ctx);
+            speaker_player_writer_complete_turn(ctx, item_result);
         }
     }
-
-    ctx->writer_stack_high_water_bytes = app_stack_monitor_log(TAG,
-                                                               "speaker_iis_writer",
-                                                               "exit");
-#if ENABLE_VERBOSE_AUDIO_LOG
-    ESP_LOGI(TAG,
-             "speaker IIS writer task summary result=%s pcm_chunks=%lu valid_samples=%llu "
-             "dma_samples=%llu dma_bytes=%llu stack_hwm=%u free_heap=%u min_free_heap=%u "
-             "largest_free_block=%u",
-             esp_err_to_name(result),
-             (unsigned long)ctx->pcm_chunks_written,
-             (unsigned long long)ctx->valid_samples_written,
-             (unsigned long long)ctx->dma_samples_written,
-             (unsigned long long)ctx->dma_bytes_written,
-             (unsigned int)ctx->writer_stack_high_water_bytes,
-             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-             (unsigned int)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
-             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-#endif
-    ctx->result = result;
-    ctx->writer_done = true;
-    xSemaphoreGive(ctx->done);
-    vTaskDelete(NULL);
 }
 
 static esp_err_t speaker_player_write_mono_pcm_to_ring_ex(audio_player_stream_ctx_t *ctx,
@@ -549,6 +707,7 @@ static esp_err_t speaker_player_write_mono_pcm_to_ring_ex(audio_player_stream_ct
 
         audio_player_ring_item_t *item = ctx->scratch_item;
         item->type = AUDIO_PLAYER_RING_ITEM_TYPE_PCM;
+        item->generation = ctx->generation;
         item->sequence = sequence;
         item->valid_samples = valid_samples;
 
@@ -589,69 +748,166 @@ static esp_err_t speaker_player_write_mono_pcm_to_ring_ex(audio_player_stream_ct
     return ESP_OK;
 }
 
-static esp_err_t speaker_player_write_mono_pcm_to_ring(audio_player_stream_ctx_t *ctx,
-                                                       const int16_t *data,
-                                                       uint32_t samples)
-{
-    uint32_t sequence = 0;
-    return speaker_player_write_mono_pcm_to_ring_ex(ctx, data, samples, &sequence, true);
-}
-
 esp_err_t audio_player_init(void)
 {
-    /* 只初始化播放器互斥锁；IIS/PDM channel 延迟到真正播放第一块 PCM 时再创建。 */
+    if (speaker_player_called_from_isr()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     esp_err_t err = speaker_player_ensure_mutex();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "create play mutex failed: %s", esp_err_to_name(err));
         return err;
     }
+    if (s_pcm_player_state != AUDIO_PLAYER_STATE_UNINITIALIZED) {
+        return ESP_OK;
+    }
+    if (xSemaphoreTake(s_play_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_pcm_player_state != AUDIO_PLAYER_STATE_UNINITIALIZED) {
+        xSemaphoreGive(s_play_mutex);
+        return ESP_OK;
+    }
+
+    err = iis_init();
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_play_mutex);
+        return err;
+    }
+
+    const size_t ring_item_size = sizeof(audio_player_ring_item_t);
+    const size_t ring_item_count = AUDIO_PLAYER_RING_BUFFER_CHUNKS < 2U ?
+                                   2U : AUDIO_PLAYER_RING_BUFFER_CHUNKS;
+    s_pcm_stream_ctx.ring_slots = (audio_player_ring_item_t *)c5_mem_calloc(ring_item_count,
+                                                                              ring_item_size,
+                                                                              C5_MEM_PSRAM,
+                                                                              "speaker_ring_slots");
+    if (s_pcm_stream_ctx.ring_slots == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto init_fail;
+    }
+    s_pcm_stream_ctx.ring_capacity = (uint32_t)ring_item_count;
+    if (s_pcm_stream_ctx.ring_items == NULL) {
+        s_pcm_stream_ctx.ring_items = xSemaphoreCreateCountingStatic(ring_item_count,
+                                                                       0,
+                                                                       &s_ring_items_storage);
+    }
+    if (s_pcm_stream_ctx.ring_space == NULL) {
+        s_pcm_stream_ctx.ring_space = xSemaphoreCreateCountingStatic(ring_item_count,
+                                                                       ring_item_count,
+                                                                       &s_ring_space_storage);
+    }
+    if (s_pcm_stream_ctx.done == NULL) {
+        s_pcm_stream_ctx.done = xSemaphoreCreateBinaryStatic(&s_stream_done_storage);
+    }
+    if (s_pcm_stream_ctx.started == NULL) {
+        s_pcm_stream_ctx.started = xSemaphoreCreateBinaryStatic(&s_stream_started_storage);
+    }
+    if (s_pcm_stream_ctx.ring_items == NULL || s_pcm_stream_ctx.ring_space == NULL ||
+        s_pcm_stream_ctx.done == NULL || s_pcm_stream_ctx.started == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto init_fail;
+    }
+    speaker_player_reset_session_semaphores(&s_pcm_stream_ctx);
+    s_pcm_stream_ctx.scratch_item =
+        (audio_player_ring_item_t *)c5_mem_calloc(1,
+                                                  sizeof(*s_pcm_stream_ctx.scratch_item),
+                                                  C5_MEM_PSRAM,
+                                                  "speaker_ring_scratch");
+    if (s_pcm_stream_ctx.scratch_item == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto init_fail;
+    }
+    s_pcm_stream_ctx.dma_staging = (uint8_t *)c5_mem_alloc(AUDIO_PLAYER_PCM_CHUNK_BYTES,
+                                                             C5_MEM_INTERNAL_DMA,
+                                                             "speaker_i2s_dma_staging");
+    if (s_pcm_stream_ctx.dma_staging == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto init_fail;
+    }
+
+    if (s_pcm_stream_ctx.writer_task == NULL) {
+        speaker_player_log_writer_task_alloc_check();
+        s_pcm_stream_ctx.writer_task = xTaskCreateStatic(speaker_player_iis_writer_task,
+                                                           "speaker_iis_writer",
+                                                           AUDIO_PLAYER_I2S_WRITER_STACK_WORDS,
+                                                           &s_pcm_stream_ctx,
+                                                           AUDIO_PLAYER_I2S_WRITER_TASK_PRIORITY,
+                                                           s_writer_task_stack,
+                                                           &s_writer_task_storage);
+        if (s_pcm_stream_ctx.writer_task == NULL) {
+            err = ESP_ERR_NO_MEM;
+            goto init_fail;
+        }
+    }
+
+    i2s_chan_info_t channel_info = {};
+    uint32_t dma_bytes = iis_get_info(&channel_info) == ESP_OK ?
+                         channel_info.total_dma_buf_size : 0;
+    s_pcm_player_state = AUDIO_PLAYER_STATE_READY_DISABLED;
+    ESP_LOGI(TAG,
+             "SPEAKER_PLAYER_READY internal_free=%u internal_min=%u internal_largest=%u "
+             "dma_free=%u dma_largest=%u dma_total=%u ring_item_bytes=%u ring_items=%u ring_domain=psram writer_hwm=%u",
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned int)dma_bytes,
+             (unsigned int)ring_item_size,
+             (unsigned int)ring_item_count,
+             (unsigned int)speaker_player_writer_stack_high_water());
+    xSemaphoreGive(s_play_mutex);
+    c5_mem_log("speaker_ready");
     return ESP_OK;
+
+init_fail:
+    if (s_pcm_stream_ctx.scratch_item != NULL) {
+        c5_mem_free(s_pcm_stream_ctx.scratch_item, "speaker_ring_scratch");
+        s_pcm_stream_ctx.scratch_item = NULL;
+    }
+    if (s_pcm_stream_ctx.dma_staging != NULL) {
+        c5_mem_free(s_pcm_stream_ctx.dma_staging, "speaker_i2s_dma_staging");
+        s_pcm_stream_ctx.dma_staging = NULL;
+    }
+    if (s_pcm_stream_ctx.ring_slots != NULL) {
+        c5_mem_free(s_pcm_stream_ctx.ring_slots, "speaker_ring_slots");
+        s_pcm_stream_ctx.ring_slots = NULL;
+    }
+    (void)iis_deinit();
+    xSemaphoreGive(s_play_mutex);
+    return err;
 }
 
-static void speaker_player_stream_cleanup_locked(audio_player_stream_ctx_t *ctx,
-                                                 bool destroy_buffers)
+static void speaker_player_reset_turn_locked(audio_player_stream_ctx_t *ctx)
 {
-    if (ctx == NULL) {
-        return;
-    }
-
-    (void)iis_stop();
-
-    if (destroy_buffers && ctx->ringbuf != NULL) {
-        vRingbufferDelete(ctx->ringbuf);
-        ctx->ringbuf = NULL;
-    }
-    if (destroy_buffers && ctx->done != NULL) {
-        vSemaphoreDelete(ctx->done);
-        ctx->done = NULL;
-    }
-    if (destroy_buffers && ctx->scratch_item != NULL) {
-        heap_caps_free(ctx->scratch_item);
-        ctx->scratch_item = NULL;
-    }
-    ctx->writer_done = false;
-    ctx->abort_requested = false;
-    ctx->result = ESP_OK;
     speaker_player_dma_diag_log_summary();
     speaker_player_heap_monitor_stop();
-    if (destroy_buffers) {
-        esp_err_t deinit_ret = iis_deinit();
-        if (deinit_ret != ESP_OK) {
-            ESP_LOGW(TAG, "speaker IIS deinit failed: %s", esp_err_to_name(deinit_ret));
-        }
-#if ENABLE_VERBOSE_AUDIO_LOG
-        ESP_LOGI(TAG,
-                 "speaker stream cleanup done free_heap=%u min_free_heap=%u largest_free_block=%u",
-                 (unsigned int)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-                 (unsigned int)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
-                 (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-#endif
-    }
+    ctx->writer_done = false;
+    ctx->abort_requested = false;
+    ctx->writer_start_done = false;
+    ctx->result = ESP_OK;
+    ctx->writer_start_result = ESP_OK;
+    ctx->writer_stack_high_water_bytes = speaker_player_writer_stack_high_water();
+    ctx->valid_samples_written = 0;
+    ctx->dma_samples_written = 0;
+    ctx->dma_bytes_written = 0;
+    ctx->pcm_chunks_written = 0;
+    ctx->ring_high_water = 0;
+    ctx->ring_backpressure_count = 0;
+    s_pcm_stream_open = false;
+    s_pcm_stream_owner_task = NULL;
+    s_pcm_stream_sequence = 0;
+    s_pcm_player_state = AUDIO_PLAYER_STATE_READY_DISABLED;
 }
 
 esp_err_t audio_player_stream_open(void)
 {
-    if (s_pcm_stream_open) {
+    if (speaker_player_called_from_isr()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_pcm_stream_open &&
+        s_pcm_stream_owner_task == xTaskGetCurrentTaskHandle()) {
         return ESP_OK;
     }
 
@@ -662,118 +918,89 @@ esp_err_t audio_player_stream_open(void)
     if (xSemaphoreTake(s_play_mutex, portMAX_DELAY) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
+    if (s_pcm_stream_open) {
+        bool owner_task = s_pcm_stream_owner_task == xTaskGetCurrentTaskHandle();
+        xSemaphoreGive(s_play_mutex);
+        return owner_task ? ESP_OK : ESP_ERR_INVALID_STATE;
+    }
+    if (s_pcm_player_state != AUDIO_PLAYER_STATE_READY_DISABLED ||
+        s_pcm_stream_ctx.writer_task == NULL) {
+        xSemaphoreGive(s_play_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
 
+    s_pcm_player_state = AUDIO_PLAYER_STATE_OPENING;
+    while (xSemaphoreTake(s_pcm_stream_ctx.done, 0) == pdTRUE) {
+    }
+    while (xSemaphoreTake(s_pcm_stream_ctx.started, 0) == pdTRUE) {
+    }
     s_pcm_stream_ctx.writer_done = false;
     s_pcm_stream_ctx.abort_requested = false;
+    s_pcm_stream_ctx.writer_start_done = false;
     s_pcm_stream_ctx.result = ESP_OK;
-    s_pcm_stream_ctx.writer_stack_high_water_bytes = 0;
+    s_pcm_stream_ctx.writer_start_result = ESP_OK;
+    s_pcm_stream_ctx.generation++;
+    if (s_pcm_stream_ctx.generation == 0) {
+        s_pcm_stream_ctx.generation = 1;
+    }
+    s_pcm_stream_ctx.writer_stack_high_water_bytes = speaker_player_writer_stack_high_water();
     s_pcm_stream_ctx.valid_samples_written = 0;
     s_pcm_stream_ctx.dma_samples_written = 0;
     s_pcm_stream_ctx.dma_bytes_written = 0;
     s_pcm_stream_ctx.pcm_chunks_written = 0;
     s_pcm_stream_sequence = 0;
-
+    s_deferred_diag.callback_calls = 0U;
+    s_deferred_diag.deferred_notify_count = 0U;
+    s_deferred_diag.illegal_context_count = 0U;
+    s_deferred_diag.writer_start_notify_count = 0U;
+    s_deferred_diag.writer_end_notify_count = 0U;
+    s_deferred_diag.logged_generation = 0U;
     speaker_player_dma_diag_reset();
     speaker_player_heap_monitor_start();
+    c5_mem_log("before_pcm_play");
 
-    err = iis_init();
+    err = speaker_player_ring_send_start(&s_pcm_stream_ctx);
+    if (err == ESP_OK &&
+        xSemaphoreTake(s_pcm_stream_ctx.started,
+                       speaker_player_ms_to_ticks(AUDIO_PLAYER_ABORT_WAIT_MS)) != pdTRUE) {
+        s_pcm_stream_ctx.abort_requested = true;
+        err = ESP_ERR_TIMEOUT;
+    }
+    if (err == ESP_OK) {
+        err = s_pcm_stream_ctx.writer_start_result;
+    }
     if (err != ESP_OK) {
-        goto open_fail;
-    }
-
-    i2s_chan_info_t play_chan_info = {};
-    if (iis_get_info(&play_chan_info) == ESP_OK) {
-        speaker_player_log_values("stream_open DMA diagnostic",
-                                  IIS_EFFECTIVE_DMA_DESC_NUM,
-                                  IIS_EFFECTIVE_DMA_FRAME_NUM,
-                                  play_chan_info.total_dma_buf_size,
-                                  0);
-    }
-
-    const size_t ring_item_size = sizeof(audio_player_ring_item_t);
-    const size_t ring_item_count = AUDIO_PLAYER_RING_BUFFER_CHUNKS < 2U ?
-                                   2U : AUDIO_PLAYER_RING_BUFFER_CHUNKS;
-
-#if ENABLE_VERBOSE_AUDIO_LOG
-    bool reused_ringbuffer = s_pcm_stream_ctx.ringbuf != NULL;
-#endif
-    if (s_pcm_stream_ctx.ringbuf == NULL) {
-        s_pcm_stream_ctx.ringbuf = xRingbufferCreateNoSplit(ring_item_size, ring_item_count);
-        if (s_pcm_stream_ctx.ringbuf == NULL) {
-            ESP_LOGE(TAG,
-                     "create speaker ringbuffer failed: item_size=%zu item_count=%zu",
-                     ring_item_size,
-                     ring_item_count);
-            err = ESP_ERR_NO_MEM;
-            goto open_fail;
+        s_pcm_stream_ctx.abort_requested = true;
+        if (!s_pcm_stream_ctx.writer_done &&
+            (s_pcm_stream_ctx.done == NULL ||
+             xSemaphoreTake(s_pcm_stream_ctx.done,
+                            speaker_player_ms_to_ticks(AUDIO_PLAYER_ABORT_WAIT_MS)) != pdTRUE)) {
+            /* Keep this generation closed until the persistent writer observes the abort. */
+            s_pcm_player_state = AUDIO_PLAYER_STATE_ABORTING;
+            xSemaphoreGive(s_play_mutex);
+            return err;
         }
-    }
-
-    if (s_pcm_stream_ctx.done == NULL) {
-        s_pcm_stream_ctx.done = xSemaphoreCreateBinary();
-        if (s_pcm_stream_ctx.done == NULL) {
-            ESP_LOGE(TAG, "create speaker writer done semaphore failed");
-            err = ESP_ERR_NO_MEM;
-            goto open_fail;
-        }
-    }
-
-    if (s_pcm_stream_ctx.scratch_item == NULL) {
-        s_pcm_stream_ctx.scratch_item =
-            (audio_player_ring_item_t *)heap_caps_calloc(1,
-                                                         sizeof(*s_pcm_stream_ctx.scratch_item),
-                                                         MALLOC_CAP_8BIT);
-        if (s_pcm_stream_ctx.scratch_item == NULL) {
-            ESP_LOGE(TAG,
-                     "alloc speaker stream scratch item failed bytes=%u",
-                     (unsigned int)sizeof(*s_pcm_stream_ctx.scratch_item));
-            err = ESP_ERR_NO_MEM;
-            goto open_fail;
-        }
-    }
-
-    err = iis_start();
-    if (err != ESP_OK) {
-        goto open_fail;
-    }
-
-    speaker_player_log_writer_task_alloc_check();
-    BaseType_t task_created = xTaskCreate(speaker_player_iis_writer_task,
-                                          "speaker_iis_writer",
-                                          AUDIO_PLAYER_I2S_WRITER_TASK_STACK_SIZE,
-                                          &s_pcm_stream_ctx,
-                                          AUDIO_PLAYER_I2S_WRITER_TASK_PRIORITY,
-                                          NULL);
-    if (task_created != pdPASS) {
-        ESP_LOGE(TAG, "create speaker_iis_writer task failed");
-        err = ESP_ERR_NO_MEM;
-        goto open_fail;
+        speaker_player_reset_turn_locked(&s_pcm_stream_ctx);
+        xSemaphoreGive(s_play_mutex);
+        return err;
     }
 
     s_pcm_stream_open = true;
     s_pcm_stream_owner_task = xTaskGetCurrentTaskHandle();
-#if ENABLE_VERBOSE_AUDIO_LOG
-    ESP_LOGI(TAG,
-             "speaker stream open ok ring_item_size=%u item_count=%u reuse_ringbuffer=%d free_heap=%u largest_free_block=%u",
-             (unsigned int)ring_item_size,
-             (unsigned int)ring_item_count,
-             reused_ringbuffer ? 1 : 0,
-             (unsigned int)esp_get_free_heap_size(),
-             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-#endif
+    s_pcm_player_state = AUDIO_PLAYER_STATE_PLAYING;
     return ESP_OK;
-
-open_fail:
-    speaker_player_stream_cleanup_locked(&s_pcm_stream_ctx, true);
-    xSemaphoreGive(s_play_mutex);
-    return err;
 }
 
 esp_err_t audio_player_write_pcm_chunk(const int16_t *data,
                                        uint32_t samples,
                                        int sample_rate_hz)
 {
-    if (!s_pcm_stream_open || s_pcm_stream_ctx.ringbuf == NULL) {
+    if (speaker_player_called_from_isr()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    __atomic_fetch_add(&s_deferred_diag.callback_calls, 1U, __ATOMIC_RELAXED);
+    if (!s_pcm_stream_open || s_pcm_player_state != AUDIO_PLAYER_STATE_PLAYING ||
+        s_pcm_stream_ctx.ring_slots == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     if (samples == 0) {
@@ -798,11 +1025,18 @@ esp_err_t audio_player_write_pcm_chunk(const int16_t *data,
 
 esp_err_t audio_player_stream_finish(void)
 {
+    if (speaker_player_called_from_isr()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!s_pcm_stream_open) {
         return ESP_OK;
     }
 
+    s_pcm_player_state = AUDIO_PLAYER_STATE_DRAINING;
     esp_err_t err = speaker_player_ring_send_end(&s_pcm_stream_ctx, s_pcm_stream_sequence);
+    if (err == ESP_OK) {
+        __atomic_fetch_add(&s_deferred_diag.deferred_notify_count, 1U, __ATOMIC_RELAXED);
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG,
                  "send speaker stream EOS failed: %s",
@@ -810,7 +1044,16 @@ esp_err_t audio_player_stream_finish(void)
     }
 
     if (s_pcm_stream_ctx.done == NULL ||
-        xSemaphoreTake(s_pcm_stream_ctx.done, portMAX_DELAY) != pdTRUE) {
+        xSemaphoreTake(s_pcm_stream_ctx.done,
+                       speaker_player_ms_to_ticks(AUDIO_PLAYER_DRAIN_TIMEOUT_MS)) != pdTRUE) {
+        s_pcm_stream_ctx.abort_requested = true;
+        if (s_pcm_stream_ctx.done == NULL ||
+            xSemaphoreTake(s_pcm_stream_ctx.done,
+                           speaker_player_ms_to_ticks(AUDIO_PLAYER_ABORT_WAIT_MS)) != pdTRUE) {
+            ESP_LOGE(TAG, "speaker drain timeout; writer did not acknowledge abort");
+            xSemaphoreGive(s_play_mutex);
+            return ESP_ERR_TIMEOUT;
+        }
         err = err == ESP_OK ? ESP_ERR_TIMEOUT : err;
     } else if (err == ESP_OK && s_pcm_stream_ctx.result != ESP_OK) {
         err = s_pcm_stream_ctx.result;
@@ -831,10 +1074,9 @@ esp_err_t audio_player_stream_finish(void)
              (unsigned int)speaker_player_current_stack_high_water());
 #endif
 
-    speaker_player_stream_cleanup_locked(&s_pcm_stream_ctx, true);
-    s_pcm_stream_open = false;
-    s_pcm_stream_owner_task = NULL;
-    s_pcm_stream_sequence = 0;
+    s_pcm_stream_ctx.writer_stack_high_water_bytes = speaker_player_writer_stack_high_water();
+    c5_mem_log("after_pcm_play");
+    speaker_player_reset_turn_locked(&s_pcm_stream_ctx);
     xSemaphoreGive(s_play_mutex);
 
     if (err != ESP_OK) {
@@ -847,50 +1089,108 @@ esp_err_t audio_player_stream_finish(void)
 
 esp_err_t audio_player_stream_abort(void)
 {
+    if (speaker_player_called_from_isr()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!s_pcm_stream_open) {
         return ESP_OK;
     }
 
     ESP_LOGI(TAG, "speaker stream abort");
     s_pcm_stream_ctx.abort_requested = true;
-    (void)iis_stop();
+    s_pcm_player_state = AUDIO_PLAYER_STATE_ABORTING;
 
     bool owner_task = s_pcm_stream_owner_task == NULL ||
                       s_pcm_stream_owner_task == xTaskGetCurrentTaskHandle();
     if (!owner_task) {
         /*
          * 断联回调可能来自 voice_chain 任务，而流式播放资源由 server_voice_rx 打开。
-         * 非 owner 只发 abort 信号和停止 IIS，避免跨任务释放 ringbuffer/互斥锁导致悬挂引用。
+         * 非 owner 只发 abort 信号；persistent writer owns IIS disable and cleanup.
          */
         return ESP_OK;
     }
 
-    esp_err_t err = speaker_player_ring_send_end(&s_pcm_stream_ctx, s_pcm_stream_sequence);
+    esp_err_t err = ESP_OK;
     if (s_pcm_stream_ctx.done != NULL) {
         TickType_t wait_ticks = pdMS_TO_TICKS(AUDIO_PLAYER_ABORT_WAIT_MS);
         if (wait_ticks == 0) {
             wait_ticks = 1;
         }
-        if (xSemaphoreTake(s_pcm_stream_ctx.done, wait_ticks) != pdTRUE &&
-            err == ESP_OK) {
+        if (xSemaphoreTake(s_pcm_stream_ctx.done, wait_ticks) != pdTRUE) {
             err = ESP_ERR_TIMEOUT;
         }
     }
+    if (err != ESP_OK) {
+        /* Keep persistent objects intact and fail closed until the writer acknowledges abort. */
+        return err;
+    }
 
-    speaker_player_stream_cleanup_locked(&s_pcm_stream_ctx, true);
-    s_pcm_stream_open = false;
-    s_pcm_stream_owner_task = NULL;
-    s_pcm_stream_sequence = 0;
+    s_pcm_stream_ctx.writer_stack_high_water_bytes = speaker_player_writer_stack_high_water();
+    c5_mem_log("after_pcm_play_abort");
+    speaker_player_reset_turn_locked(&s_pcm_stream_ctx);
     xSemaphoreGive(s_play_mutex);
     return err;
 }
 
+esp_err_t audio_player_release_session(uint32_t timeout_ms)
+{
+    if (speaker_player_called_from_isr()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t err = speaker_player_ensure_mutex();
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (s_pcm_player_state == AUDIO_PLAYER_STATE_UNINITIALIZED) {
+        return ESP_OK;
+    }
+    if (xSemaphoreTake(s_play_mutex, speaker_player_ms_to_ticks(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_pcm_stream_open) {
+        xSemaphoreGive(s_play_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    speaker_player_heap_monitor_stop();
+    speaker_player_reset_session_semaphores(&s_pcm_stream_ctx);
+    err = iis_deinit_timed(timeout_ms);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_play_mutex);
+        return err;
+    }
+    if (s_pcm_stream_ctx.scratch_item != NULL) {
+        c5_mem_free(s_pcm_stream_ctx.scratch_item, "speaker_ring_scratch");
+        s_pcm_stream_ctx.scratch_item = NULL;
+    }
+    if (s_pcm_stream_ctx.dma_staging != NULL) {
+        c5_mem_free(s_pcm_stream_ctx.dma_staging, "speaker_i2s_dma_staging");
+        s_pcm_stream_ctx.dma_staging = NULL;
+    }
+    if (s_pcm_stream_ctx.ring_slots != NULL) {
+        c5_mem_free(s_pcm_stream_ctx.ring_slots, "speaker_ring_slots");
+        s_pcm_stream_ctx.ring_slots = NULL;
+    }
+    s_pcm_stream_ctx.ring_capacity = 0U;
+    s_pcm_stream_ctx.ring_read_index = 0U;
+    s_pcm_stream_ctx.ring_write_index = 0U;
+    s_pcm_stream_ctx.ring_used = 0U;
+    s_pcm_stream_ctx.writer_done = false;
+    s_pcm_stream_ctx.abort_requested = false;
+    s_pcm_stream_open = false;
+    s_pcm_stream_owner_task = NULL;
+    s_pcm_stream_sequence = 0U;
+    s_pcm_player_state = AUDIO_PLAYER_STATE_UNINITIALIZED;
+    c5_mem_log("after_i2s_deinit");
+    xSemaphoreGive(s_play_mutex);
+    return ESP_OK;
+}
+
 esp_err_t audio_player_play_pcm(const int16_t *data, uint32_t samples)
 {
-    /*
-     * 一次播放的完整生命周期：
-     * 建环形缓冲区 -> 启动 IIS -> 启动写入任务 -> 投递 PCM -> 等待写入任务收尾。
-     */
+    if (speaker_player_called_from_isr()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     speaker_player_log_values("audio_player_play_pcm", samples, 0, 0, 0);
 
     if (samples == 0) {
@@ -910,147 +1210,27 @@ esp_err_t audio_player_play_pcm(const int16_t *data, uint32_t samples)
                               ((int64_t)samples * 1000LL) / AUDIO_PLAYER_REQUIRED_SAMPLE_RATE_HZ,
                               0);
 
-    esp_err_t err = audio_player_init();
+    esp_err_t err = audio_player_stream_open();
+    if (err == ESP_OK) {
+        err = audio_player_write_pcm_chunk(data,
+                                           samples,
+                                           AUDIO_PLAYER_REQUIRED_SAMPLE_RATE_HZ);
+    }
     if (err != ESP_OK) {
-        return err;
-    }
-    if (xSemaphoreTake(s_play_mutex, portMAX_DELAY) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    audio_player_stream_ctx_t stream_ctx = {
-        .ringbuf = NULL,
-        .done = NULL,
-        .writer_done = false,
-        .result = ESP_OK,
-        .scratch_item = NULL,
-    };
-
-    speaker_player_dma_diag_reset();
-    speaker_player_heap_monitor_start();
-
-    err = iis_init();
-    if (err != ESP_OK) {
-        goto play_cleanup;
-    }
-
-    i2s_chan_info_t play_chan_info = {};
-    if (iis_get_info(&play_chan_info) == ESP_OK) {
-        speaker_player_log_values("play_start DMA diagnostic",
-                                  IIS_EFFECTIVE_DMA_DESC_NUM,
-                                  IIS_EFFECTIVE_DMA_FRAME_NUM,
-                                  play_chan_info.total_dma_buf_size,
-                                  0);
-    }
-    const size_t ring_item_size = sizeof(audio_player_ring_item_t);
-    const size_t ring_item_count = AUDIO_PLAYER_RING_BUFFER_CHUNKS < 2U ?
-                                   2U : AUDIO_PLAYER_RING_BUFFER_CHUNKS;
-
-    stream_ctx.ringbuf = xRingbufferCreateNoSplit(ring_item_size, ring_item_count);
-    if (stream_ctx.ringbuf == NULL) {
-        ESP_LOGE(TAG,
-                 "create speaker ringbuffer failed: item_size=%zu item_count=%zu",
-                 ring_item_size,
-                 ring_item_count);
-        err = ESP_ERR_NO_MEM;
-        goto play_cleanup;
-    }
-
-    stream_ctx.done = xSemaphoreCreateBinary();
-    if (stream_ctx.done == NULL) {
-        ESP_LOGE(TAG, "create speaker writer done semaphore failed");
-        err = ESP_ERR_NO_MEM;
-        goto play_cleanup;
-    }
-
-    stream_ctx.scratch_item =
-        (audio_player_ring_item_t *)heap_caps_calloc(1,
-                                                     sizeof(*stream_ctx.scratch_item),
-                                                     MALLOC_CAP_8BIT);
-    if (stream_ctx.scratch_item == NULL) {
-        ESP_LOGE(TAG,
-                 "alloc speaker playback scratch item failed bytes=%u",
-                 (unsigned int)sizeof(*stream_ctx.scratch_item));
-        err = ESP_ERR_NO_MEM;
-        goto play_cleanup;
-    }
-
-    speaker_player_log_values("speaker ringbuffer ready",
-                              AUDIO_PLAYER_PCM_CHUNK_SAMPLES,
-                              (int64_t)ring_item_size,
-                              (int64_t)ring_item_count,
-                              0);
-
-    err = iis_start();
-    if (err != ESP_OK) {
-        goto play_cleanup;
-    }
-
-    speaker_player_log_writer_task_alloc_check();
-    BaseType_t task_created = xTaskCreate(speaker_player_iis_writer_task,
-                                          "speaker_iis_writer",
-                                          AUDIO_PLAYER_I2S_WRITER_TASK_STACK_SIZE,
-                                          &stream_ctx,
-                                          AUDIO_PLAYER_I2S_WRITER_TASK_PRIORITY,
-                                          NULL);
-    if (task_created != pdPASS) {
-        ESP_LOGE(TAG, "create speaker_iis_writer task failed");
-        err = ESP_ERR_NO_MEM;
-        goto play_cleanup;
-    }
-
-    err = speaker_player_write_mono_pcm_to_ring(&stream_ctx, data, samples);
-    if (err != ESP_OK) {
-        (void)speaker_player_ring_send_end(&stream_ctx, 0);
-    }
-
-    if (xSemaphoreTake(stream_ctx.done, portMAX_DELAY) != pdTRUE) {
-        err = err == ESP_OK ? ESP_ERR_TIMEOUT : err;
-    } else if (err == ESP_OK && stream_ctx.result != ESP_OK) {
-        err = stream_ctx.result;
-    }
-
-play_cleanup:
-    esp_err_t stop_err = iis_stop();
-    if (err == ESP_OK && stop_err != ESP_OK) {
-        err = stop_err;
-    }
-    esp_err_t deinit_err = iis_deinit();
-    if (err == ESP_OK && deinit_err != ESP_OK) {
-        err = deinit_err;
-    }
-
-    if (stream_ctx.ringbuf != NULL) {
-        vRingbufferDelete(stream_ctx.ringbuf);
-    }
-    if (stream_ctx.done != NULL) {
-        vSemaphoreDelete(stream_ctx.done);
-    }
-    if (stream_ctx.scratch_item != NULL) {
-        heap_caps_free(stream_ctx.scratch_item);
-    }
-
-    speaker_player_dma_diag_log_summary();
-    speaker_player_heap_monitor_stop();
-    xSemaphoreGive(s_play_mutex);
-
-    if (err != ESP_OK) {
+        (void)audio_player_stream_abort();
         ESP_LOGE(TAG, "PCM playback failed: %s", esp_err_to_name(err));
         return err;
     }
-    ESP_LOGI(TAG,
-             "PCM playback complete input_samples=%lu valid_samples=%llu dma_samples=%llu dma_bytes=%llu",
-             (unsigned long)samples,
-             (unsigned long long)stream_ctx.valid_samples_written,
-             (unsigned long long)stream_ctx.dma_samples_written,
-             (unsigned long long)stream_ctx.dma_bytes_written);
-    return ESP_OK;
+    return audio_player_stream_finish();
 }
 
 esp_err_t audio_player_play_16k_pcm(const int16_t *data,
                                     uint32_t samples,
                                     int sample_rate_hz)
 {
+    if (speaker_player_called_from_isr()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     speaker_player_log_values("audio_player_play_16k_pcm",
                               sample_rate_hz,
                               samples,
@@ -1076,6 +1256,9 @@ esp_err_t audio_player_play_16k_pcm(const int16_t *data,
 
 esp_err_t audio_player_self_test_1khz(uint32_t duration_ms)
 {
+    if (speaker_player_called_from_isr()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (duration_ms == 0) {
         duration_ms = 1000;
     }
@@ -1102,14 +1285,7 @@ esp_err_t audio_player_self_test_1khz(uint32_t duration_ms)
     }
 
     uint32_t generated = 0;
-    int16_t *chunk = (int16_t *)heap_caps_malloc(AUDIO_PLAYER_PCM_CHUNK_BYTES, MALLOC_CAP_8BIT);
-    if (chunk == NULL) {
-        (void)audio_player_stream_finish();
-        ESP_LOGE(TAG,
-                 "speaker self-test chunk alloc failed bytes=%u",
-                 (unsigned int)AUDIO_PLAYER_PCM_CHUNK_BYTES);
-        return ESP_ERR_NO_MEM;
-    }
+    int16_t *chunk = s_self_test_chunk;
     const uint32_t samples_per_period = sample_rate_hz / frequency_hz;
     const uint32_t half_period = samples_per_period / 2U;
 
@@ -1142,8 +1318,6 @@ esp_err_t audio_player_self_test_1khz(uint32_t duration_ms)
     if (ret == ESP_OK && finish_ret != ESP_OK) {
         ret = finish_ret;
     }
-    heap_caps_free(chunk);
-
     ESP_LOGI(TAG,
              "speaker self-test done ret=%s generated_samples=%lu total_samples=%lu",
              esp_err_to_name(ret),
