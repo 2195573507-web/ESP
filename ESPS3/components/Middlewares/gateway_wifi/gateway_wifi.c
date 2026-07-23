@@ -13,10 +13,12 @@
 
 #include "esp_event.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_wifi_ap_get_sta_list.h"
+#include "esp_wifi_default.h"
 #include "freertos/FreeRTOS.h"
 #include "gateway_config.h"
 #include "lwip/ip4_addr.h"
@@ -30,6 +32,13 @@ volatile bool g_net_ready = false;
 static esp_netif_t *s_ap_netif;
 static esp_netif_t *s_sta_netif;
 static bool s_started;
+static bool s_netif_initialized_by_module;
+static bool s_event_loop_created_by_module;
+static bool s_wifi_initialized_by_module;
+static bool s_wifi_started_by_module;
+static esp_event_handler_instance_t s_wifi_event_handler;
+static esp_event_handler_instance_t s_sta_got_ip_handler;
+static esp_event_handler_instance_t s_sta_lost_ip_handler;
 static bool s_softap_ready;
 static bool s_sta_started;
 static bool s_sta_connected;
@@ -51,6 +60,28 @@ static size_t s_sta_scan_candidate_slots;
 static size_t s_sta_scan_candidate_count;
 static sta_scan_candidate_t s_sta_selected_candidate;
 static bool s_sta_selected_candidate_valid;
+
+static void gateway_wifi_unregister_handlers(void)
+{
+    if (s_wifi_event_handler != NULL) {
+        (void)esp_event_handler_instance_unregister(WIFI_EVENT,
+                                                    ESP_EVENT_ANY_ID,
+                                                    s_wifi_event_handler);
+        s_wifi_event_handler = NULL;
+    }
+    if (s_sta_got_ip_handler != NULL) {
+        (void)esp_event_handler_instance_unregister(IP_EVENT,
+                                                    IP_EVENT_STA_GOT_IP,
+                                                    s_sta_got_ip_handler);
+        s_sta_got_ip_handler = NULL;
+    }
+    if (s_sta_lost_ip_handler != NULL) {
+        (void)esp_event_handler_instance_unregister(IP_EVENT,
+                                                    IP_EVENT_STA_LOST_IP,
+                                                    s_sta_lost_ip_handler);
+        s_sta_lost_ip_handler = NULL;
+    }
+}
 
 static bool station_mac_is_valid(const uint8_t mac[6])
 {
@@ -207,7 +238,13 @@ static esp_err_t ensure_nvs(void)
 {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
+        /* NVS recovery is part of the optional uplink path.  Do not turn an
+         * erase failure into a startup panic while AP/local HTTP can still run. */
+        ret = nvs_flash_erase();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "nvs erase failed during recovery ret=%s", esp_err_to_name(ret));
+            return ret;
+        }
         ret = nvs_flash_init();
     }
     return ret;
@@ -574,7 +611,11 @@ esp_err_t gateway_wifi_collect_sta_scan_candidates(size_t *out_scan_count)
         return ESP_ERR_NOT_FOUND;
     }
 
-    wifi_ap_record_t *records = calloc(ap_count, sizeof(*records));
+    /* A scan can return dozens of records.  Keep this burst allocation out of
+     * the scarce internal heap used by WiFi/event tasks during startup. */
+    wifi_ap_record_t *records = heap_caps_calloc(ap_count,
+                                                 sizeof(*records),
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (records == NULL) {
         ESP_LOGW(TAG, "WIFI_SCAN_DONE count=%u ret=ESP_ERR_NO_MEM", (unsigned int)ap_count);
         return ESP_ERR_NO_MEM;
@@ -583,7 +624,7 @@ esp_err_t gateway_wifi_collect_sta_scan_candidates(size_t *out_scan_count)
     uint16_t record_count = ap_count;
     ret = esp_wifi_scan_get_ap_records(&record_count, records);
     if (ret != ESP_OK) {
-        free(records);
+        heap_caps_free(records);
         ESP_LOGW(TAG, "WIFI_SCAN_DONE count=%u ret=%s", (unsigned int)ap_count, esp_err_to_name(ret));
         return ret;
     }
@@ -626,7 +667,7 @@ esp_err_t gateway_wifi_collect_sta_scan_candidates(size_t *out_scan_count)
                 (sta_scan_candidate_t){.ap = *ap, .credential_index = credential_index};
         }
     }
-    free(records);
+    heap_caps_free(records);
 
     if (s_sta_scan_candidate_count > 1U) {
         qsort(s_sta_scan_candidates,
@@ -761,46 +802,66 @@ esp_err_t gateway_wifi_start(void)
         return ESP_OK;
     }
 
-    ESP_RETURN_ON_ERROR(ensure_nvs(), TAG, "nvs init failed");
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "esp_netif_init failed");
-
-    esp_err_t ret = esp_event_loop_create_default();
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "event loop create failed: %s", esp_err_to_name(ret));
+    esp_err_t ret = ensure_nvs();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "nvs init failed: %s", esp_err_to_name(ret));
         return ret;
+    }
+    /* NVS, netif and the default loop are process-wide. NVS is never
+     * deinitialized here; netif/event-loop teardown is limited to objects
+     * this module created in this invocation. */
+    ret = esp_netif_init();
+    if (ret == ESP_OK) {
+        s_netif_initialized_by_module = true;
+    } else if (ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(ret));
+        goto fail;
+    }
+
+    ret = esp_event_loop_create_default();
+    if (ret == ESP_OK) {
+        s_event_loop_created_by_module = true;
+    } else if (ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "event loop create failed: %s", esp_err_to_name(ret));
+        goto fail;
     }
 
     s_ap_netif = esp_netif_create_default_wifi_ap();
     s_sta_netif = esp_netif_create_default_wifi_sta();
     if (s_ap_netif == NULL || s_sta_netif == NULL) {
-        return ESP_ERR_NO_MEM;
+        ret = ESP_ERR_NO_MEM;
+        goto fail;
     }
 
-    ESP_RETURN_ON_ERROR(set_softap_ip(), TAG, "set SoftAP IP failed");
+    ret = set_softap_ip();
+    if (ret != ESP_OK) goto fail;
 
     wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), TAG, "wifi init failed");
-    ESP_RETURN_ON_ERROR(esp_event_handler_instance_register(WIFI_EVENT,
-                                                            ESP_EVENT_ANY_ID,
-                                                            wifi_event_handler,
-                                                            NULL,
-                                                            NULL),
-                        TAG,
-                        "register wifi handler failed");
-    ESP_RETURN_ON_ERROR(esp_event_handler_instance_register(IP_EVENT,
-                                                            IP_EVENT_STA_GOT_IP,
-                                                            wifi_event_handler,
-                                                            NULL,
-                                                            NULL),
-                        TAG,
-                        "register ip handler failed");
-    ESP_RETURN_ON_ERROR(esp_event_handler_instance_register(IP_EVENT,
-                                                            IP_EVENT_STA_LOST_IP,
-                                                            wifi_event_handler,
-                                                            NULL,
-                                                            NULL),
-                        TAG,
-                        "register lost ip handler failed");
+    ret = esp_wifi_init(&init_config);
+    if (ret == ESP_OK) {
+        s_wifi_initialized_by_module = true;
+    } else {
+        ESP_LOGE(TAG, "wifi init failed: %s", esp_err_to_name(ret));
+        goto fail;
+    }
+    ret = esp_event_handler_instance_register(WIFI_EVENT,
+                                              ESP_EVENT_ANY_ID,
+                                              wifi_event_handler,
+                                              NULL,
+                                              &s_wifi_event_handler);
+    if (ret != ESP_OK) goto fail;
+    ret = esp_event_handler_instance_register(IP_EVENT,
+                                              IP_EVENT_STA_GOT_IP,
+                                              wifi_event_handler,
+                                              NULL,
+                                              &s_sta_got_ip_handler);
+    if (ret != ESP_OK) goto fail;
+    ret = esp_event_handler_instance_register(IP_EVENT,
+                                              IP_EVENT_STA_LOST_IP,
+                                              wifi_event_handler,
+                                              NULL,
+                                              &s_sta_lost_ip_handler);
+    if (ret != ESP_OK) goto fail;
 
     const gateway_runtime_config_t *config = gateway_config_get();
     if (config->sta_credentials_count > 0U && s_sta_credential_failures == NULL) {
@@ -830,7 +891,7 @@ esp_err_t gateway_wifi_start(void)
     strlcpy((char *)ap_config.ap.password,
             config->softap_password,
             sizeof(ap_config.ap.password));
-    ap_config.ap.ssid_len = strlen(config->softap_ssid);
+    ap_config.ap.ssid_len = strnlen(config->softap_ssid, sizeof(ap_config.ap.ssid));
     ap_config.ap.channel = config->softap_channel;
     ap_config.ap.max_connection = config->softap_max_connection;
     if (ap_config.ap.max_connection > GATEWAY_CONFIG_MAX_CHILDREN) {
@@ -839,13 +900,16 @@ esp_err_t gateway_wifi_start(void)
                  (unsigned int)ap_config.ap.max_connection,
                  (unsigned int)GATEWAY_CONFIG_MAX_CHILDREN);
     }
-    ap_config.ap.authmode = strlen(config->softap_password) > 0 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    ap_config.ap.authmode = config->softap_password[0] != '\0' ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     ap_config.ap.pmf_cfg.required = false;
 
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "set APSTA mode failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_config), TAG, "set AP config failed");
-
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
+    ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (ret != ESP_OK) goto fail;
+    ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (ret != ESP_OK) goto fail;
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) goto fail;
+    s_wifi_started_by_module = true;
 
     s_started = true;
     ESP_LOGI(TAG,
@@ -854,6 +918,56 @@ esp_err_t gateway_wifi_start(void)
              config->softap_ip,
              gateway_config_sta_credentials_configured() ? 1 : 0);
     return ESP_OK;
+
+fail:
+    ESP_LOGE(TAG, "gateway WiFi start rollback ret=%s", esp_err_to_name(ret));
+    gateway_wifi_stop();
+    return ret;
+}
+
+void gateway_wifi_stop(void)
+{
+    gateway_wifi_set_net_ready_gate(false, "wifi_stop");
+    s_softap_ready = false;
+    s_sta_started = false;
+    s_sta_connected = false;
+    s_sta_got_ip = false;
+    s_ap_sta_connected_count = 0U;
+
+    if (s_wifi_started_by_module) {
+        (void)esp_wifi_stop();
+        s_wifi_started_by_module = false;
+    }
+    gateway_wifi_unregister_handlers();
+    if (s_wifi_initialized_by_module) {
+        (void)esp_wifi_deinit();
+        s_wifi_initialized_by_module = false;
+    }
+    if (s_sta_netif != NULL) {
+        esp_netif_destroy_default_wifi(s_sta_netif);
+        s_sta_netif = NULL;
+    }
+    if (s_ap_netif != NULL) {
+        esp_netif_destroy_default_wifi(s_ap_netif);
+        s_ap_netif = NULL;
+    }
+    if (s_event_loop_created_by_module) {
+        (void)esp_event_loop_delete_default();
+        s_event_loop_created_by_module = false;
+    }
+    if (s_netif_initialized_by_module) {
+        (void)esp_netif_deinit();
+        s_netif_initialized_by_module = false;
+    }
+    free(s_sta_credential_failures);
+    s_sta_credential_failures = NULL;
+    s_sta_credential_failure_slots = 0U;
+    free(s_sta_scan_candidates);
+    s_sta_scan_candidates = NULL;
+    s_sta_scan_candidate_slots = 0U;
+    s_sta_scan_candidate_count = 0U;
+    s_sta_selected_candidate_valid = false;
+    s_started = false;
 }
 
 bool gateway_wifi_is_softap_ready(void)

@@ -45,6 +45,10 @@ typedef struct {
     bool valid;
     float temperature_c;
     float humidity_percent;
+    float pressure_hpa;
+    uint32_t gas_resistance_ohm;
+    bool gas_valid;
+    bool air_quality_valid;
     uint16_t air_quality_score;
     uint32_t generation;
 } bme_sensor_service_reading_t;

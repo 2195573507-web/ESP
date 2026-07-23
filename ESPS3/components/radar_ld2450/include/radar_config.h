@@ -60,6 +60,7 @@
 #define RADAR_CONFIG_UART_IDLE_DELAY_MS 20
 #define RADAR_CONFIG_UART_RECOVERY_DELAY_CAP_MS 100
 #define RADAR_CONFIG_UART_DIAGNOSTICS_LOG_MS 1000
+#define RADAR_CONFIG_UART_MEMORY_LOG_MS 10000U
 #ifndef RADAR_UART_RAW_DEBUG
 #define RADAR_UART_RAW_DEBUG 0
 #endif
@@ -74,8 +75,8 @@
 #define RADAR_CONFIG_TASK_STOP_TIMEOUT_MS 500U
 /* UART driver owns an internal RX ring/event queue.  Reject a new driver
  * instance when fragmentation cannot leave a safe bounded control margin. */
-#define RADAR_CONFIG_UART_INTERNAL_MIN_FREE_BYTES 12288U
-#define RADAR_CONFIG_UART_INTERNAL_MIN_LARGEST_BYTES 4096U
+#define RADAR_CONFIG_UART_INTERNAL_RESERVE_BYTES 12288U
+#define RADAR_CONFIG_UART_DRIVER_CONTROL_BYTES 2048U
 
 /* --------------------------- UART 恢复策略 --------------------------- */
 
@@ -84,8 +85,8 @@
 /* 连续完全没有 RX 字节达到该时长后认为链路静默并进入退避重连。 */
 #define RADAR_CONFIG_UART_SILENT_TIMEOUT_MS 3000U
 /* 第一次重试等待时间，以及指数退避上限。 */
-#define RADAR_CONFIG_UART_BACKOFF_INITIAL_MS 250U
-#define RADAR_CONFIG_UART_BACKOFF_MAX_MS 8000U
+#define RADAR_CONFIG_UART_BACKOFF_INITIAL_MS 1000U
+#define RADAR_CONFIG_UART_BACKOFF_MAX_MS 30000U
 /* 重连后需要连续收到的有效帧数，达到后才恢复 VALID。 */
 #define RADAR_CONFIG_UART_VALID_FRAMES_REQUIRED 3U
 

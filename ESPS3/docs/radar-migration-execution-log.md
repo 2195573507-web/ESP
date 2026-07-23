@@ -8,6 +8,12 @@ Software implementation: COMPLETE
 
 Hardware acceptance: BLOCKED pending confirmed UART wiring, three radars, and real-device execution of HW-P1 through HW-P4.
 
+## 2026-07-21 follow-up index
+
+- [S3 LD2450 UART internal-memory recovery fix](development_logs/s3_radar_uart_internal_memory_fix.md): source-level repair log for bounded UART recovery, internal-memory probes, HTTP request delta probes, and PSRAM placement context. Its `idf.py build` result and hardware acceptance status are recorded independently in that log.
+- [S3 DMA/network/alarm stability repair](development_logs/s3_dma_network_alarm_stability_fix.md): source-level record for capability-specific memory admission, asynchronous and coalesced external HTTP, network-worker watchdog responsiveness, environment-alarm stack remediation, and low-cost local-radar idle behavior. Build and hardware acceptance are tracked separately in that record.
+- [S3 HTTP backoff/dedup follow-up](development_logs/s3_dma_network_alarm_stability_fix.md): 2026-07-22 endpoint-level monotonic overview backoff, pending/deferred/active deduplication, structured transition/completion logs, and HTTP/TLS lifecycle audit. Build-only evidence; hardware and end-to-end acceptance remain unverified.
+
 ## Implemented phases
 
 - C5-P0/S3-P0: live-source, dirty-worktree, build, and resource baseline.

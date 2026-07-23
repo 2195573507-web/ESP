@@ -28,8 +28,9 @@
  *
  * 调用方法：app_main() 启动早期调用一次，再调用 wifi_connect_to_ap()。
  *
- * 此函数负责初始化NVS、TCP/IP适配器、事件循环和Wi-Fi。
- * @return 成功返回 ESP_OK，失败返回对应错误码。
+ * 此函数负责初始化NVS、TCP/IP适配器、事件循环和Wi-Fi。若 Wi-Fi 驱动暂时因
+ * 内存不足无法启动，函数仍返回 ESP_OK 以保留后续 wifi_connect_to_ap() 的后台重试。
+ * @return 管理器可用返回 ESP_OK；事件组等恢复基础设施无法创建时返回对应错误码。
  */
 esp_err_t wifi_manager_init(void);
 
@@ -38,7 +39,8 @@ esp_err_t wifi_manager_init(void);
  *
  * 调用方法：wifi_manager_init() 成功后调用；本函数会等待首次连接成功。
  *
- * 本函数会启动后台重连任务，并阻塞等待首次连接成功。后台任务只使用
+ * 本函数会启动后台重连任务，并在 WIFI_CONNECT_TIMEOUT_MS 内等待首次连接。超时后
+ * 返回 ESP_ERR_TIMEOUT，后台重连任务仍继续运行。后台任务只使用
  * terminal_config 中的 gateway_ssid/gateway_password，不连接家庭 WiFi。
  * @return 首次连接成功返回 ESP_OK；初始化状态异常或任务创建失败时返回错误码。
  */

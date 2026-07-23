@@ -17,6 +17,7 @@ set(gateway_srcs
             environment_alarm_reporter/environment_alarm_reporter.c
             sensor_aggregator/sensor_aggregator.c
             smart_home_gateway/smart_home_gateway.c
+            audio_wake_gateway/audio_wake_gateway.c
             voice_proxy/voice_proxy.c
             wake_prompt_cache_gateway/wake_prompt_cache_gateway.c
             command_router/command_router.c
@@ -63,6 +64,7 @@ set(priv_include_dirs
             environment_alarm_reporter
             sensor_aggregator
             smart_home_gateway
+            audio_wake_gateway
             voice_proxy
             wake_prompt_cache_gateway
             command_router
@@ -75,6 +77,7 @@ set(priv_include_dirs
 
 set(requires
             app_config
+            espressif__esp-sr
             environment_alarm_engine
             habit_rule_engine
             esp_event

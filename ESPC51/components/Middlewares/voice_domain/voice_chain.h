@@ -18,7 +18,7 @@
 #endif
 
 #ifndef VOICE_CHAIN_TASK_STACK
-#define VOICE_CHAIN_TASK_STACK 4096U // high_water=7952 bytes on 8 KiB; retain 3.8 KiB headroom.
+#define VOICE_CHAIN_TASK_STACK 4096U // PSRAM task stack; high_water~7952 on 8 KiB; retain headroom.
 #endif
 
 #ifndef VOICE_CHAIN_TASK_PRIORITY

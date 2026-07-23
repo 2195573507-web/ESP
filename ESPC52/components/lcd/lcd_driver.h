@@ -36,8 +36,13 @@ typedef struct {
     bool legacy_released;
 } lcd_driver_metrics_t;
 
+typedef esp_err_t (*lcd_driver_lvgl_prepare_fn)(void *user_ctx);
+typedef void (*lcd_driver_lvgl_release_fn)(void *user_ctx);
+
 esp_err_t lcd_driver_start(void);
-esp_err_t lcd_driver_register_lvgl(void);
+esp_err_t lcd_driver_register_lvgl(lcd_driver_lvgl_prepare_fn prepare,
+                                   lcd_driver_lvgl_release_fn release,
+                                   void *user_ctx);
 esp_err_t lcd_driver_stop(void);
 bool lcd_driver_is_ready(void);
 lcd_driver_state_t lcd_driver_get_state(void);

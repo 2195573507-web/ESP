@@ -39,13 +39,27 @@
 #define APP_VOICE_VAD_SPEECH_START_RMS              1800 // 起始 RMS 阈值，降低正常说话音量触发门槛。
 #define APP_VOICE_VAD_SPEECH_START_PEAK             4500 // 起始 peak 阈值，保留峰值过滤以减少环境噪声误触发。
 #define APP_VOICE_VAD_SPEECH_END_RMS                850  // 低于该 RMS 累计静音，认为接近说话结束。
-#define APP_VOICE_VAD_START_FRAMES                  4    // 连续 4 帧达到起始阈值才触发 VOICE_START。
+#define APP_VOICE_VAD_START_FRAMES                  2    // 200 ms 窗口下 400 ms 起始确认，落在 500 ms pre-roll 覆盖范围内。
 #define APP_VOICE_VAD_START_COOLDOWN_MS             1200 // local voice done 后 VAD 起始冷却，防止刚恢复就再次触发。
 #define APP_VOICE_VAD_SILENCE_END_MS                1500 // 静音累计 1500 ms 后结束本轮音频。
 #define APP_VOICE_VAD_MIN_RECORD_MS                 800  // 防止过短语音误触发结束。
-#define APP_VOICE_VAD_MAX_RECORD_MS                 8000 // 最长 8 s，避免异常时持续发送。
+#define APP_VOICE_VAD_MAX_RECORD_MS                15000 // 命令最长讲话 15 s；到期仍收尾提交有效 PCM。
 #define APP_VOICE_PRE_SPEECH_PACKETS                5    // 句首预缓存 5 个 100 ms local voice PCM 包。
 #define APP_VOICE_POST_ROLL_MS                      700  // VOICE_END 后继续发送 700 ms PCM，再 finalize。
+
+/* Command capture is already open before VAD detects speech.  These values
+ * only label speech and close it after silence; they never gate PCM TX. */
+#define APP_VOICE_COMMAND_VAD_SPEECH_START_RMS      350
+#define APP_VOICE_COMMAND_VAD_SPEECH_START_PEAK     900
+#define APP_VOICE_COMMAND_VAD_SPEECH_END_RMS        220
+#define APP_VOICE_COMMAND_VAD_START_FRAMES          1
+#define APP_VOICE_COMMAND_VAD_SILENCE_END_MS        1500
+#define APP_VOICE_COMMAND_VAD_MAX_RECORD_MS       15000
+
+/* 唤醒确认后的命令采集分阶段预算；它们不改变 VAD 阈值或 PCM 链路。 */
+#define APP_VOICE_COMMAND_WAIT_SPEECH_TIMEOUT_MS    8000  // 仅限制等待用户开口。
+#define APP_VOICE_COMMAND_FINALIZE_TIMEOUT_MS       5000  // VAD 收尾、上传提交的本地上限。
+#define APP_VOICE_COMMAND_SERVER_RESPONSE_TIMEOUT_MS 90000 // 与当前 voice request 总预算一致。
 
 /* PCM 音质调试：默认关闭，排查静音或削波时再打开。 */
 #define APP_DEBUG_VOICE_PCM_PACKET_STATS_LOG         0  // pcm_min/max/avg/rms/zero_cross 等质量统计。
@@ -117,6 +131,21 @@
 
 #if APP_VOICE_POST_ROLL_MS < 0 || APP_VOICE_POST_ROLL_MS > 1000
 #error "APP_VOICE_POST_ROLL_MS must be between 0 and 1000"
+#endif
+
+#if APP_VOICE_COMMAND_WAIT_SPEECH_TIMEOUT_MS <= 0 || \
+    APP_VOICE_COMMAND_FINALIZE_TIMEOUT_MS <= 0 || \
+    APP_VOICE_COMMAND_SERVER_RESPONSE_TIMEOUT_MS <= 0
+#error "command capture phase timeouts must be greater than 0"
+#endif
+
+#if APP_VOICE_COMMAND_VAD_SPEECH_START_RMS <= 0 || \
+    APP_VOICE_COMMAND_VAD_SPEECH_START_PEAK <= 0 || \
+    APP_VOICE_COMMAND_VAD_SPEECH_END_RMS < 0 || \
+    APP_VOICE_COMMAND_VAD_START_FRAMES <= 0 || \
+    APP_VOICE_COMMAND_VAD_SILENCE_END_MS <= 0 || \
+    APP_VOICE_COMMAND_VAD_MAX_RECORD_MS <= 0
+#error "command VAD configuration must be valid"
 #endif
 
 /**

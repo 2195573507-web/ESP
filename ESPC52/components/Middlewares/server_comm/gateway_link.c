@@ -95,6 +95,7 @@ typedef struct {
     TaskHandle_t task;
     TaskHandle_t reconnect_request_task;
     gateway_link_voice_abort_cb_t voice_abort_cb;
+    gateway_link_voice_network_cb_t voice_network_cb;
     uint32_t consecutive_failures;
     uint32_t reconnect_failures;
     int64_t last_skip_log_ms;
@@ -154,6 +155,16 @@ static gateway_link_voice_abort_cb_t gateway_link_snapshot_abort_cb(void)
     return callback;
 }
 
+static gateway_link_voice_network_cb_t gateway_link_snapshot_network_cb(void)
+{
+    gateway_link_voice_network_cb_t callback = NULL;
+
+    portENTER_CRITICAL(&s_link_lock);
+    callback = s_link.voice_network_cb;
+    portEXIT_CRITICAL(&s_link_lock);
+    return callback;
+}
+
 static void gateway_link_request_reconnect(void)
 {
     EventGroupHandle_t events = NULL;
@@ -171,6 +182,7 @@ static void gateway_link_set_state(gateway_link_state_t state, const char *reaso
 {
     gateway_link_state_t old_state = LINK_DOWN;
     bool changed = false;
+    bool entered_ready = false;
     bool left_ready = false;
     EventGroupHandle_t events = NULL;
 
@@ -179,6 +191,7 @@ static void gateway_link_set_state(gateway_link_state_t state, const char *reaso
     if (s_link.state != state) {
         s_link.state = state;
         changed = true;
+        entered_ready = old_state != LINK_READY && state == LINK_READY;
         left_ready = old_state == LINK_READY && state != LINK_READY;
     }
     if (state == LINK_READY) {
@@ -206,7 +219,25 @@ static void gateway_link_set_state(gateway_link_state_t state, const char *reaso
                  reason != NULL && reason[0] != '\0' ? reason : "");
     }
 
+    if (entered_ready) {
+        ESP_LOGI(TAG,
+                 "NETWORK_READY source=gateway_link reason=%s",
+                 reason != NULL && reason[0] != '\0' ? reason : "gateway_ready");
+        gateway_link_voice_network_cb_t callback = gateway_link_snapshot_network_cb();
+        if (callback != NULL) {
+            callback(true, reason != NULL && reason[0] != '\0' ? reason : "gateway_ready");
+        }
+    }
+
     if (left_ready) {
+        ESP_LOGW(TAG,
+                 "OFFLINE_MODE source=gateway_link reason=%s",
+                 reason != NULL && reason[0] != '\0' ? reason : "gateway_link_lost");
+        gateway_link_voice_network_cb_t network_callback = gateway_link_snapshot_network_cb();
+        if (network_callback != NULL) {
+            network_callback(false,
+                             reason != NULL && reason[0] != '\0' ? reason : "gateway_link_lost");
+        }
         gateway_link_voice_abort_cb_t callback = gateway_link_snapshot_abort_cb();
         if (callback != NULL) {
             callback(reason != NULL && reason[0] != '\0' ? reason : "gateway_link_lost");
@@ -218,6 +249,13 @@ void gateway_link_set_voice_abort_callback(gateway_link_voice_abort_cb_t callbac
 {
     portENTER_CRITICAL(&s_link_lock);
     s_link.voice_abort_cb = callback;
+    portEXIT_CRITICAL(&s_link_lock);
+}
+
+void gateway_link_set_voice_network_callback(gateway_link_voice_network_cb_t callback)
+{
+    portENTER_CRITICAL(&s_link_lock);
+    s_link.voice_network_cb = callback;
     portEXIT_CRITICAL(&s_link_lock);
 }
 
@@ -235,6 +273,12 @@ gateway_link_state_t gateway_link_get_state(void)
 bool gateway_link_is_ready(void)
 {
     return gateway_link_get_state() == LINK_READY;
+}
+
+bool gateway_link_is_local_ready(void)
+{
+    const gateway_link_state_t state = gateway_link_get_state();
+    return state == LINK_READY || state == LINK_DEGRADED;
 }
 
 bool gateway_link_in_reconnect_mode(void)

@@ -10,7 +10,6 @@
 #include "freertos/task.h"
 #include "gateway_link.h"
 #include "radar_board_config.h"
-#include "radar_edge_filter.h"
 #include "radar_service.h"
 #include "radar_state_codec.h"
 #include "server_comm_http.h"
@@ -26,7 +25,6 @@
 static const char *TAG = "radar_client";
 static TaskHandle_t s_task;
 static radar_state_client_stats_t s_stats;
-static radar_edge_filter_t s_filter;
 
 static uint32_t now_ms(void)
 {
@@ -75,16 +73,6 @@ static uint32_t next_sequence(uint32_t value)
     return value == 0U ? 1U : value;
 }
 
-static void make_status_only(radar_target_sample_t *sample)
-{
-    if (sample == NULL) {
-        return;
-    }
-    sample->sample_valid = false;
-    sample->target_count = 0U;
-    memset(sample->targets, 0, sizeof(sample->targets));
-}
-
 static void radar_client_task(void *arg)
 {
     (void)arg;
@@ -102,15 +90,10 @@ static void radar_client_task(void *arg)
         const uint32_t timestamp_ms = now_ms();
         radar_target_sample_t current;
         radar_service_get_target_sample(&current);
-        radar_edge_filter_apply(&s_filter, &current);
 
         if (!has_pending && report_due(&current, &last_sent, has_last_sent,
                                        timestamp_ms, last_sent_ms)) {
             pending = current;
-            if (has_last_sent && pending.sample_valid && last_sent.sample_valid &&
-                pending.frame_seq == last_sent.frame_seq) {
-                make_status_only(&pending);
-            }
             pending_request_sequence = next_request_sequence;
             next_request_sequence = next_sequence(next_request_sequence);
             has_pending = true;
@@ -185,7 +168,6 @@ esp_err_t radar_state_client_start(void)
     if (RADAR_BOARD_LOCAL_ID < 1 || RADAR_BOARD_LOCAL_ID > 2) {
         return ESP_ERR_INVALID_STATE;
     }
-    radar_edge_filter_init(&s_filter);
     if (xTaskCreate(radar_client_task,
                     "radar_report",
                     RADAR_CLIENT_TASK_STACK,

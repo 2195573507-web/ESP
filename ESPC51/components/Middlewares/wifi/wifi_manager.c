@@ -243,12 +243,15 @@ esp_err_t wifi_connect_to_ap(void)
     xEventGroupSetBits(s_wifi_event_group, WIFI_RECONNECT_BIT);
     ESP_LOGI(TAG, "Waiting for S3 gateway SoftAP connection");
 
-    xEventGroupWaitBits(s_wifi_event_group,
-                        WIFI_CONNECTED_BIT,
-                        pdFALSE,
-                        pdTRUE,
-                        portMAX_DELAY);
-
+    const EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                                 WIFI_CONNECTED_BIT,
+                                                 pdFALSE,
+                                                 pdTRUE,
+                                                 pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+    if ((bits & WIFI_CONNECTED_BIT) == 0U) {
+        ESP_LOGW(TAG, "S3 gateway SoftAP connection timed out; reconnect task remains active");
+        return ESP_ERR_TIMEOUT;
+    }
     return ESP_OK;
 }
 

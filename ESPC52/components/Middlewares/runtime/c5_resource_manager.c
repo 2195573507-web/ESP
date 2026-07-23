@@ -201,8 +201,10 @@ static bool c5_resource_audio_phase_transition_allowed(c5_audio_phase_t from,
 
     switch (from) {
     case C5_AUDIO_PHASE_MIC_LISTENING_ACTIVE:
-    case C5_AUDIO_PHASE_MIC_RECORD_READY:
         return to == C5_AUDIO_PHASE_MIC_PAUSE_REQUESTED;
+    case C5_AUDIO_PHASE_MIC_RECORD_READY:
+        return to == C5_AUDIO_PHASE_MIC_PAUSE_REQUESTED ||
+               to == C5_AUDIO_PHASE_MIC_LISTENING_ACTIVE;
     case C5_AUDIO_PHASE_MIC_PAUSE_REQUESTED:
         return to == C5_AUDIO_PHASE_MIC_DMA_RELEASED;
     case C5_AUDIO_PHASE_MIC_DMA_RELEASED:
@@ -210,7 +212,8 @@ static bool c5_resource_audio_phase_transition_allowed(c5_audio_phase_t from,
     case C5_AUDIO_PHASE_SPEAKER_TX_OWNED:
         return to == C5_AUDIO_PHASE_SPEAKER_TX_RELEASED;
     case C5_AUDIO_PHASE_SPEAKER_TX_RELEASED:
-        return to == C5_AUDIO_PHASE_MIC_RECORD_READY;
+        return to == C5_AUDIO_PHASE_MIC_RECORD_READY ||
+               to == C5_AUDIO_PHASE_MIC_LISTENING_ACTIVE;
     default:
         return false;
     }
@@ -384,9 +387,13 @@ esp_err_t c5_resource_manager_set_audio_phase(c5_voice_lease_t lease,
     c5_resource_state_t state;
     bool valid;
     c5_audio_phase_t old_phase;
+    uint32_t active_generation;
+    char owner[sizeof(s_resource.owner)] = {0};
     portENTER_CRITICAL(&s_resource_lock);
     state = s_resource.state;
     old_phase = s_resource.audio_phase;
+    active_generation = s_resource.generation;
+    strlcpy(owner, s_resource.owner, sizeof(owner));
     valid = s_resource.lease_valid && lease.generation != 0U &&
             lease.generation == s_resource.generation &&
             (state == C5_RESOURCE_STATE_VOICE_EXCLUSIVE ||
@@ -398,19 +405,31 @@ esp_err_t c5_resource_manager_set_audio_phase(c5_voice_lease_t lease,
     }
     portEXIT_CRITICAL(&s_resource_lock);
     if (!valid) {
+        if (lease.generation == 0U || lease.generation != active_generation) {
+            ESP_LOGW(TAG,
+                     "AUDIO_PHASE_EVENT_STALE event=transition event_generation=%lu active_generation=%lu",
+                     (unsigned long)lease.generation,
+                     (unsigned long)active_generation);
+        }
         ESP_LOGW(TAG,
-                 "reject audio phase generation=%lu from=%s to=%s state=%s",
+                 "AUDIO_PHASE_TRANSITION generation=%lu from=%s to=%s owner=%s reason=%s result=%s state=%s",
                  (unsigned long)lease.generation,
                  c5_resource_manager_audio_phase_name(old_phase),
                  c5_resource_manager_audio_phase_name(phase),
+                 owner[0] != '\0' ? owner : "none",
+                 reason != NULL ? reason : "none",
+                 esp_err_to_name(ESP_ERR_INVALID_STATE),
                  c5_resource_manager_state_name(state));
         return ESP_ERR_INVALID_STATE;
     }
     ESP_LOGI(TAG,
-             "C5_AUDIO_PHASE generation=%lu phase=%s reason=%s state=%s dma_free=%u dma_largest=%u",
+             "AUDIO_PHASE_TRANSITION generation=%lu from=%s to=%s owner=%s reason=%s result=%s state=%s dma_free=%u dma_largest=%u",
              (unsigned long)lease.generation,
+             c5_resource_manager_audio_phase_name(old_phase),
              c5_resource_manager_audio_phase_name(phase),
+             owner[0] != '\0' ? owner : "none",
              reason != NULL ? reason : "none",
+             esp_err_to_name(ESP_OK),
              c5_resource_manager_state_name(state),
              (unsigned int)heap_caps_get_free_size(MALLOC_CAP_DMA),
              (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));

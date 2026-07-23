@@ -34,6 +34,7 @@ typedef enum {
     COMMAND_STATE_QUEUED,
     COMMAND_STATE_DISPATCHED,
     COMMAND_STATE_ACKED,
+    COMMAND_STATE_FAILED,
     COMMAND_STATE_TIMEOUT,
 } command_state_t;
 
@@ -46,6 +47,8 @@ typedef struct {
     command_state_t state;
     uint32_t seq;
     uint32_t ttl_ms;
+    uint32_t voice_generation;
+    uint32_t wake_stream_id;
     int64_t created_ms;
     int64_t dispatched_ms;
 } command_entry_t;
@@ -112,6 +115,7 @@ static command_entry_t *allocate_locked(void)
     for (size_t i = 0; i < GATEWAY_CONFIG_COMMAND_QUEUE_SIZE; i++) {
         if (s_queue[i].state == COMMAND_STATE_EMPTY ||
             s_queue[i].state == COMMAND_STATE_ACKED ||
+            s_queue[i].state == COMMAND_STATE_FAILED ||
             s_queue[i].state == COMMAND_STATE_TIMEOUT) {
             return &s_queue[i];
         }
@@ -195,6 +199,9 @@ static unsigned int map_local_command_code(const char *command_type)
     }
     if (strcmp(command_type, "config.set") == 0) {
         return ESP111_PROTOCOL_LOCAL_COMMAND_CONFIG_SET;
+    }
+    if (strcmp(command_type, "voice.start_command_capture") == 0) {
+        return ESP111_PROTOCOL_LOCAL_COMMAND_START_COMMAND_CAPTURE;
     }
     return ESP111_PROTOCOL_LOCAL_COMMAND_UNSUPPORTED;
 }
@@ -386,13 +393,39 @@ esp_err_t command_router_enqueue(const char *target_device_id,
                                  const char *params_json,
                                  const char *source)
 {
+    return command_router_enqueue_with_id(target_device_id,
+                                          command_type,
+                                          params_json,
+                                          source,
+                                          NULL,
+                                          0U);
+}
+
+esp_err_t command_router_enqueue_with_id(const char *target_device_id,
+                                         const char *command_type,
+                                         const char *params_json,
+                                         const char *source,
+                                         char *out_command_id,
+                                         size_t out_command_id_size)
+{
     if (!child_registry_is_allowed(target_device_id) || command_type == NULL ||
-        command_type[0] == '\0') {
+        command_type[0] == '\0' ||
+        (out_command_id != NULL &&
+         out_command_id_size < sizeof("local-4294967295"))) {
         return ESP_ERR_INVALID_ARG;
     }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t ret = enqueue_locked(NULL, target_device_id, command_type, params_json, source, 30000U);
+    if (ret == ESP_OK && out_command_id != NULL) {
+        const int written = snprintf(out_command_id,
+                                     out_command_id_size,
+                                     "local-%u",
+                                     (unsigned int)s_command_seq);
+        if (written <= 0 || written >= (int)out_command_id_size) {
+            ret = ESP_ERR_INVALID_SIZE;
+        }
+    }
     xSemaphoreGive(s_lock);
     if (ret != ESP_OK) {
         return ret;
@@ -400,6 +433,94 @@ esp_err_t command_router_enqueue(const char *target_device_id,
 
     ESP_LOGI(TAG, "queued local command target=%s type=%s", target_device_id, command_type);
     return ESP_OK;
+}
+
+esp_err_t command_router_enqueue_voice_command_capture(const char *target_device_id,
+                                                        const char *command_id,
+                                                        uint32_t generation,
+                                                        uint32_t wake_stream_id,
+                                                        uint32_t timeout_ms)
+{
+    if (!child_registry_is_allowed(target_device_id) || command_id == NULL ||
+        command_id[0] == '\0' || generation == 0U || wake_stream_id == 0U ||
+        timeout_ms == 0U || s_lock == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    esp_err_t ret = enqueue_locked(command_id,
+                                   target_device_id,
+                                   "voice.start_command_capture",
+                                   "{}",
+                                   "wake_event",
+                                   timeout_ms);
+    command_entry_t *entry = ret == ESP_OK ? find_locked(command_id) : NULL;
+    if (entry == NULL && ret == ESP_OK) {
+        ret = ESP_ERR_NOT_FOUND;
+    }
+    if (ret == ESP_OK) {
+        entry->voice_generation = generation;
+        entry->wake_stream_id = wake_stream_id;
+        const int written = snprintf(entry->params_json,
+                                     sizeof(entry->params_json),
+                                     "{\"command_id\":\"%s\",\"generation\":%lu,"
+                                     "\"wake_stream_id\":%lu,\"state\":\"CREATE\","
+                                     "\"command_generation\":%lu,\"command_timeout_ms\":%lu}",
+                                     entry->command_id,
+                                     (unsigned long)generation,
+                                     (unsigned long)wake_stream_id,
+                                     (unsigned long)generation,
+                                     (unsigned long)timeout_ms);
+        if (written <= 0 || written >= (int)sizeof(entry->params_json)) {
+            memset(entry, 0, sizeof(*entry));
+            ret = ESP_ERR_INVALID_SIZE;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "VOICE_COMMAND_SESSION state=CREATE command_id=%s generation=%lu wake_stream_id=%lu target=%s",
+                 command_id,
+                 (unsigned long)generation,
+                 (unsigned long)wake_stream_id,
+                 target_device_id);
+    }
+    return ret;
+}
+
+esp_err_t command_router_ack_local_voice(const char *command_id,
+                                         const char *device_id,
+                                         uint32_t generation,
+                                         bool accepted)
+{
+    if (command_id == NULL || command_id[0] == '\0' || device_id == NULL ||
+        device_id[0] == '\0' || generation == 0U || s_lock == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    command_entry_t *entry = find_locked(command_id);
+    if (entry != NULL && strcmp(entry->command_type, "voice.start_command_capture") == 0) {
+        if (entry->state != COMMAND_STATE_DISPATCHED ||
+            strcmp(entry->target_device_id, device_id) != 0 ||
+            entry->voice_generation != generation) {
+            ret = ESP_ERR_NOT_ALLOWED;
+        } else {
+            entry->state = accepted ? COMMAND_STATE_ACKED : COMMAND_STATE_FAILED;
+            ret = ESP_OK;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "VOICE_COMMAND_SESSION state=%s reason=command_ack command_id=%s generation=%lu target=%s",
+                 accepted ? "CAPTURE_READY" : "FAILED",
+                 command_id,
+                 (unsigned long)generation,
+                 device_id);
+    }
+    return ret;
 }
 
 static void command_router_poll_server_pending_for_device(const char *device_id)
@@ -517,6 +638,14 @@ esp_err_t command_router_build_pending_json(const char *device_id, char *out, si
             first = false;
             entry->state = COMMAND_STATE_DISPATCHED;
             entry->dispatched_ms = now_ms();
+            if (strcmp(entry->command_type, "voice.start_command_capture") == 0) {
+                ESP_LOGI(TAG,
+                         "VOICE_COMMAND_SESSION state=WAIT_ACK command_id=%s generation=%lu wake_stream_id=%lu target=%s",
+                         entry->command_id,
+                         (unsigned long)entry->voice_generation,
+                         (unsigned long)entry->wake_stream_id,
+                         entry->target_device_id);
+            }
         }
     }
     xSemaphoreGive(s_lock);

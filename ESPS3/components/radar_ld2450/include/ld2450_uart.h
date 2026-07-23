@@ -18,6 +18,7 @@ typedef struct {
     bool line_error;
 } ld2450_uart_events_t;
 
+size_t ld2450_uart_internal_requirement_bytes(void);
 esp_err_t ld2450_uart_init(void);
 esp_err_t ld2450_uart_deinit(void);
 esp_err_t ld2450_uart_flush(void);

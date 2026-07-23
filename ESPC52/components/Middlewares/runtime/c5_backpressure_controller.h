@@ -54,6 +54,7 @@ typedef enum {
     C5_TASK_TYPE_SYSTEM_STATUS,
     C5_TASK_TYPE_SYSTEM_COMMAND_POLL,
     C5_TASK_TYPE_BME_SENSOR,
+    C5_TASK_TYPE_RADAR_HOME_SNAPSHOT,
 } c5_task_type_t;
 
 typedef enum {
@@ -90,6 +91,9 @@ uint32_t c5_get_interval(c5_task_type_t task_type);
 
 /** @brief 启动 event bus、handlers 和 dispatcher（启动阶段 1）；可重复调用。 */
 esp_err_t c5_scheduler_start(void);
+
+/** @brief Return true only after the phase-1 dispatcher task exists. */
+bool c5_scheduler_is_dispatcher_ready(void);
 
 /** @brief 创建 BME/system workers（启动阶段 2）；必须在 startup task 释放后调用。 */
 esp_err_t c5_scheduler_start_deferred_workers(void);

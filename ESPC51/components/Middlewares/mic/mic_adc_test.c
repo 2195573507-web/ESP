@@ -8,20 +8,22 @@
 #include "app_stack_monitor.h"
 #include "c5_memory.h"
 #include "c5_task_lifecycle.h"
+#include "c5_audio_transport.h"
 #include "gateway_link.h"
 #include "local_wake_word.h"
 #include "mic_adc_pcm.h"
 #include "mic_vad.h"
+#include "terminal_config.h"
 #include "wifi_manager.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_adc/adc_continuous.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
-#include "freertos/idf_additions.h"
 #include "freertos/portmacro.h"
 #include "freertos/task.h"
 
@@ -32,35 +34,90 @@
 /* 日志标签仅供本模块内部使用，不作为后期调试参数暴露。 */
 static const char *TAG = "mic_adc_test";
 
+#define MIC_ADC_MIN_DMA_LARGEST_BLOCK 4096U
+
 /* ADC continuous 句柄：由 mic_adc_test_start() 初始化，采样任务只借用该句柄读取数据。 */
 static adc_continuous_handle_t s_adc_handle;
+
+typedef enum {
+    MIC_ADC_STATE_IDLE = 0,
+    MIC_ADC_STATE_INITING,
+    MIC_ADC_STATE_READY,
+    MIC_ADC_STATE_FAILED,
+} mic_adc_state_t;
+
+static mic_adc_state_t s_mic_adc_state = MIC_ADC_STATE_IDLE;
 
 /* 任务句柄：用于防止重复创建 Mic ADC 测试任务。 */
 static TaskHandle_t s_mic_adc_task_handle;
 static portMUX_TYPE s_mic_adc_task_lock = portMUX_INITIALIZER_UNLOCKED;
+/* The TCB remains in internal static storage; the 12 KiB task stack lives in
+ * PSRAM, enabled by CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY. */
+static StackType_t *s_mic_adc_task_stack;
+static StaticTask_t s_mic_adc_task_storage;
+/* Protect the interval between publishing the task and opening its READY gate.
+ * A shutdown in this interval used to be able to delete the event group while
+ * the starter was still creating/configuring the ADC/GDMA handle. */
+static bool s_mic_adc_start_in_progress;
 static bool s_mic_adc_shutdown_in_progress;
 /* Only the Mic task may transition the ADC continuous driver. */
 static TaskHandle_t s_mic_adc_owner_task;
 static EventGroupHandle_t s_mic_adc_control_events;
 static volatile bool s_mic_adc_started;
 static volatile uint32_t s_mic_session_generation;
+static uint32_t s_mic_vad_frame_seq;
 static mic_adc_voice_stream_ops_t s_mic_adc_voice_stream_ops;
 static bool s_mic_adc_voice_stream_ops_registered;
 
-static bool mic_adc_begin_shutdown(TaskHandle_t *task)
+static esp_err_t mic_adc_begin_start(bool *already_started)
 {
-    bool begun = false;
+    esp_err_t ret = ESP_OK;
+
+    if (already_started != NULL) {
+        *already_started = false;
+    }
+    portENTER_CRITICAL(&s_mic_adc_task_lock);
+    if (s_mic_adc_shutdown_in_progress || s_mic_adc_start_in_progress) {
+        ret = MIC_ADC_ERR_NOT_READY;
+    } else if (s_mic_adc_task_handle != NULL && s_mic_adc_state == MIC_ADC_STATE_READY) {
+        if (already_started != NULL) {
+            *already_started = true;
+        }
+    } else if (s_mic_adc_task_handle != NULL) {
+        ret = MIC_ADC_ERR_NOT_READY;
+    } else {
+        s_mic_adc_start_in_progress = true;
+        s_mic_adc_state = MIC_ADC_STATE_INITING;
+    }
+    portEXIT_CRITICAL(&s_mic_adc_task_lock);
+    return ret;
+}
+
+static void mic_adc_end_start(void)
+{
+    portENTER_CRITICAL(&s_mic_adc_task_lock);
+    s_mic_adc_start_in_progress = false;
+    portEXIT_CRITICAL(&s_mic_adc_task_lock);
+}
+
+static esp_err_t mic_adc_begin_shutdown(TaskHandle_t *task)
+{
+    esp_err_t ret = ESP_OK;
 
     portENTER_CRITICAL(&s_mic_adc_task_lock);
-    if (!s_mic_adc_shutdown_in_progress) {
+    if (s_mic_adc_start_in_progress) {
+        ret = MIC_ADC_ERR_NOT_READY;
+    } else if (!s_mic_adc_shutdown_in_progress) {
         s_mic_adc_shutdown_in_progress = true;
+        s_mic_adc_state = MIC_ADC_STATE_INITING;
         if (task != NULL) {
             *task = s_mic_adc_task_handle;
         }
-        begun = true;
+    } else {
+        ret = MIC_ADC_ERR_NOT_READY;
     }
     portEXIT_CRITICAL(&s_mic_adc_task_lock);
-    return begun;
+    return ret;
 }
 
 static void mic_adc_end_shutdown(void)
@@ -70,14 +127,19 @@ static void mic_adc_end_shutdown(void)
     portEXIT_CRITICAL(&s_mic_adc_task_lock);
 }
 
-static bool mic_adc_shutdown_is_in_progress(void)
+static void mic_adc_set_state(mic_adc_state_t state)
 {
-    bool in_progress;
-
     portENTER_CRITICAL(&s_mic_adc_task_lock);
-    in_progress = s_mic_adc_shutdown_in_progress;
+    s_mic_adc_state = state;
     portEXIT_CRITICAL(&s_mic_adc_task_lock);
-    return in_progress;
+}
+
+static void mic_adc_reset_failed_state(void)
+{
+    mic_adc_set_state(MIC_ADC_STATE_FAILED);
+
+    /* FAILED is observable while cleanup is active; the next retry begins IDLE. */
+    mic_adc_set_state(MIC_ADC_STATE_IDLE);
 }
 
 enum {
@@ -93,6 +155,7 @@ enum {
 /* The pre-roll ring is 16 KiB at the current settings, so keep it out of internal RAM. */
 static int16_t *s_mic_voice_pre_roll_storage;
 static int16_t s_mic_voice_live_chunk_storage[MIC_ADC_VOICE_LIVE_CHUNK_SAMPLES];
+static int16_t s_mic_wake_live_chunk_storage[MIC_ADC_VOICE_LIVE_CHUNK_SAMPLES];
 static uint8_t s_mic_adc_raw_buffer[MIC_ADC_READ_BYTES];
 static adc_continuous_data_t s_mic_adc_parsed_buffer[MIC_ADC_READ_BYTES / SOC_ADC_DIGI_RESULT_BYTES];
 
@@ -145,17 +208,33 @@ typedef struct {
     uint32_t generation;               // 当前 Mic/VAD 周期，旧回调不得复用本地 PCM 状态。
 } mic_adc_voice_stream_t;
 
+/* This path is intentionally separate from the later HTTP voice turn.  It is
+ * owned by local VAD and sends only a bounded speech segment to S3 WakeNet. */
 typedef struct {
-    int16_t *samples;          // WakeNet 单次 detect 需要的输入缓冲。
-    size_t capacity_samples;   // samples 可容纳的样本数，来自 local_wake_word_get_chunk_samples()。
+    int16_t *live_chunk_samples;
+    size_t live_chunk_sample_count;
+    size_t post_roll_remaining_samples;
+    uint32_t generation;
+    uint32_t frame_count;
+    uint32_t bytes;
+    uint32_t dropped_frames;
+    int64_t last_stats_ms;
+    bool active;
+    bool tail;
+} mic_adc_wake_stream_t;
+
+typedef struct {
+    int16_t *samples;          // 保留结构字段，迁移后不再分配模型输入。
+    size_t capacity_samples;
     size_t sample_count;       // 当前已累计样本数。
-    bool enabled;              // WakeNet 模型和输入缓冲均就绪时为 true。
+    bool enabled;
     bool unavailable_logged;    // 控制不可用日志只打印一次。
 } mic_adc_local_wake_t;
 
 /* READY gate 打开前由启动线程完成这些对象的初始化，采样任务只在 gate 后借用。 */
 static mic_vad_t s_mic_adc_vad;
 static mic_adc_voice_stream_t s_mic_adc_voice_stream;
+static mic_adc_wake_stream_t s_mic_adc_wake_stream;
 static mic_adc_local_wake_t s_mic_adc_local_wake;
 
 /**
@@ -173,6 +252,7 @@ typedef struct {
     uint64_t sum_square_raw; // raw 平方累加和，用于计算去直流后的 RMS。
     uint32_t adc_clip_low;   // ADC raw 等于 0 的次数，用于判断低端削顶。
     uint32_t adc_clip_high;  // ADC raw 等于最大值的次数，用于判断高端削顶。
+    uint32_t zero_sample_count;
     int16_t min_pcm;         // 当前窗口 PCM 最小值，用于观察转换后的负向摆幅。
     int16_t max_pcm;         // 当前窗口 PCM 最大值，用于观察转换后的正向摆幅。
     int16_t last_pcm;        // 最近一个 PCM 样本，用于确认 ADC -> PCM 链路正在刷新。
@@ -398,6 +478,180 @@ static void mic_adc_voice_stream_init(mic_adc_voice_stream_t *stream,
     }
 }
 
+static void mic_adc_wake_stream_reset(mic_adc_wake_stream_t *stream)
+{
+    if (stream == NULL) {
+        return;
+    }
+    memset(stream, 0, sizeof(*stream));
+    stream->live_chunk_samples = s_mic_wake_live_chunk_storage;
+    stream->generation = s_mic_session_generation;
+}
+
+static void mic_adc_wake_stream_log_stats(mic_adc_wake_stream_t *stream, bool force)
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (stream == NULL || (!force && stream->last_stats_ms != 0 &&
+                           now_ms - stream->last_stats_ms < 1000)) {
+        return;
+    }
+    stream->last_stats_ms = now_ms;
+    ESP_LOGI(TAG,
+             "VOICE_PCM_TX_STATS frame_count=%lu bytes=%lu dropped_frames=%lu queue_depth=0 oldest_frame_age=0 transport_state=%s stream_id=%lu generation=%lu",
+             (unsigned long)stream->frame_count,
+             (unsigned long)stream->bytes,
+             (unsigned long)stream->dropped_frames,
+             stream->active ? (stream->tail ? "DRAINING" : "STREAMING") : "IDLE",
+             (unsigned long)c5_audio_transport_get_stream_id(),
+             (unsigned long)stream->generation);
+}
+
+static esp_err_t mic_adc_wake_stream_append(mic_adc_wake_stream_t *stream,
+                                             const int16_t *pcm,
+                                             size_t samples)
+{
+    if (stream == NULL || pcm == NULL || samples == 0U || !stream->active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t ret = c5_audio_transport_append_pcm(pcm, samples);
+    if (ret == ESP_OK) {
+        stream->frame_count++;
+        stream->bytes += (uint32_t)(samples * sizeof(*pcm));
+    } else {
+        stream->dropped_frames++;
+    }
+    mic_adc_wake_stream_log_stats(stream, false);
+    return ret;
+}
+
+static esp_err_t mic_adc_wake_stream_send_pre_roll(mic_adc_wake_stream_t *stream,
+                                                    const mic_adc_voice_stream_t *voice_stream)
+{
+    if (stream == NULL || voice_stream == NULL || voice_stream->pre_roll_samples == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t read_index = voice_stream->pre_roll_sample_count == voice_stream->pre_roll_capacity_samples ?
+                            voice_stream->pre_roll_write_index : 0U;
+    size_t remaining = voice_stream->pre_roll_sample_count;
+    uint32_t frames = 0;
+    const uint32_t expected_frames = (uint32_t)((remaining + MIC_ADC_VOICE_LIVE_CHUNK_SAMPLES - 1U) /
+                                                MIC_ADC_VOICE_LIVE_CHUNK_SAMPLES);
+    esp_err_t ret = c5_audio_transport_begin_pre_roll(expected_frames);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    while (remaining > 0U) {
+        size_t contiguous = voice_stream->pre_roll_capacity_samples - read_index;
+        if (contiguous > remaining) {
+            contiguous = remaining;
+        }
+        while (contiguous > 0U) {
+            size_t chunk = contiguous > MIC_ADC_VOICE_LIVE_CHUNK_SAMPLES ?
+                               MIC_ADC_VOICE_LIVE_CHUNK_SAMPLES : contiguous;
+            ret = mic_adc_wake_stream_append(stream,
+                                              &voice_stream->pre_roll_samples[read_index],
+                                              chunk);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            frames++;
+            read_index = (read_index + chunk) % voice_stream->pre_roll_capacity_samples;
+            remaining -= chunk;
+            contiguous -= chunk;
+        }
+    }
+    ESP_LOGI(TAG,
+             "VOICE_PRE_ROLL_TX frame_count=%lu samples=%u stream_id=%lu generation=%lu",
+             (unsigned long)frames,
+             (unsigned int)voice_stream->pre_roll_sample_count,
+             (unsigned long)c5_audio_transport_get_stream_id(),
+             (unsigned long)stream->generation);
+    return c5_audio_transport_mark_live();
+}
+
+static void mic_adc_wake_stream_start(mic_adc_wake_stream_t *stream,
+                                      const mic_adc_voice_stream_t *voice_stream)
+{
+    if (stream == NULL || stream->active) {
+        return;
+    }
+    ESP_LOGI(TAG,
+             "VOICE_VAD_EVENT event=VAD_SPEECH_START generation=%lu local_gateway_ready=%u",
+             (unsigned long)s_mic_session_generation,
+             gateway_link_is_local_ready() ? 1U : 0U);
+    if (!gateway_link_is_local_ready()) {
+        ESP_LOGW(TAG, "VOICE_STREAM_OPEN deferred reason=local_gateway_not_ready");
+        return;
+    }
+    esp_err_t ret = c5_audio_transport_start();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "VOICE_STREAM_OPEN failed ret=%s", esp_err_to_name(ret));
+        return;
+    }
+    stream->active = true;
+    stream->generation = s_mic_session_generation;
+    ESP_LOGI(TAG,
+             "VOICE_STREAM_OPEN stream_id=%lu generation=%lu sample_rate=%u frame_samples=%u",
+             (unsigned long)c5_audio_transport_get_stream_id(),
+             (unsigned long)stream->generation,
+             (unsigned int)MIC_ADC_SAMPLE_FREQ_HZ,
+             (unsigned int)MIC_ADC_VOICE_LIVE_CHUNK_SAMPLES);
+    ret = mic_adc_wake_stream_send_pre_roll(stream, voice_stream);
+    if (ret != ESP_OK) {
+        stream->dropped_frames++;
+        (void)c5_audio_transport_abort("pre_roll_failed");
+        mic_adc_wake_stream_log_stats(stream, true);
+        mic_adc_wake_stream_reset(stream);
+    }
+}
+
+static void mic_adc_wake_stream_push_sample(mic_adc_wake_stream_t *stream, int16_t pcm_sample)
+{
+    if (stream == NULL || !stream->active) {
+        return;
+    }
+    stream->live_chunk_samples[stream->live_chunk_sample_count++] = pcm_sample;
+    bool tail_complete = false;
+    if (stream->tail && stream->post_roll_remaining_samples > 0U) {
+        stream->post_roll_remaining_samples--;
+        tail_complete = stream->post_roll_remaining_samples == 0U;
+    }
+    if (stream->live_chunk_sample_count < MIC_ADC_VOICE_LIVE_CHUNK_SAMPLES && !tail_complete) {
+        return;
+    }
+    if (mic_adc_wake_stream_append(stream, stream->live_chunk_samples,
+                                   stream->live_chunk_sample_count) != ESP_OK) {
+        (void)c5_audio_transport_abort("pcm_tx_failed");
+        mic_adc_wake_stream_log_stats(stream, true);
+        mic_adc_wake_stream_reset(stream);
+        return;
+    }
+    stream->live_chunk_sample_count = 0U;
+    if (tail_complete) {
+        (void)c5_audio_transport_finish();
+        mic_adc_wake_stream_log_stats(stream, true);
+        ESP_LOGI(TAG,
+                 "VOICE_STREAM_CLOSE stream_id=%lu generation=%lu reason=vad_speech_end",
+                 (unsigned long)c5_audio_transport_get_stream_id(),
+                 (unsigned long)stream->generation);
+        mic_adc_wake_stream_reset(stream);
+    }
+}
+
+static void mic_adc_wake_stream_begin_tail(mic_adc_wake_stream_t *stream)
+{
+    if (stream == NULL || !stream->active) {
+        return;
+    }
+    stream->tail = true;
+    stream->post_roll_remaining_samples = MIC_ADC_VOICE_POST_ROLL_SAMPLES;
+    (void)c5_audio_transport_mark_tail();
+    ESP_LOGI(TAG,
+             "VOICE_VAD_EVENT event=VAD_SPEECH_END generation=%lu hangover_frames=%u",
+             (unsigned long)stream->generation,
+             (unsigned int)MIC_VAD_END_FRAMES);
+}
+
 /**
  * @brief 写入一个样本到 server voice 句首预缓存。
  *
@@ -448,7 +702,6 @@ static void mic_adc_local_wake_reset(mic_adc_local_wake_t *wake)
     if (wake != NULL) {
         wake->sample_count = 0;
     }
-    local_wake_word_reset_detector();
 }
 
 static esp_err_t mic_adc_local_wake_init(mic_adc_local_wake_t *wake)
@@ -458,36 +711,7 @@ static esp_err_t mic_adc_local_wake_init(mic_adc_local_wake_t *wake)
     }
 
     memset(wake, 0, sizeof(*wake));
-    mic_adc_log_start_stage("local_wake_recording_start", "before", ESP_ERR_NOT_FINISHED);
-    size_t chunk_samples = local_wake_word_get_chunk_samples();
-    if (!local_wake_word_is_detection_ready() || chunk_samples == 0) {
-        mic_adc_log_start_stage("local_wake_recording_start", "after", ESP_OK);
-        ESP_LOGW(TAG,
-                 "local WakeNet detector unavailable; standby will ignore ordinary VAD wake attempts");
-        wake->unavailable_logged = true;
-        return ESP_OK;
-    }
-
-    wake->samples = (int16_t *)c5_mem_alloc(chunk_samples * sizeof(int16_t),
-                                             C5_MEM_INTERNAL_CONTROL,
-                                             "local_wake_realtime_samples");
-    if (wake->samples == NULL) {
-        mic_adc_log_start_stage("local_wake_recording_start", "after", ESP_ERR_NO_MEM);
-        mic_adc_log_start_failure("c5_mem_alloc(local_wake_samples)", ESP_ERR_NO_MEM);
-        ESP_LOGE(TAG,
-                 "local WakeNet input buffer alloc failed samples=%u",
-                 (unsigned int)chunk_samples);
-        return ESP_ERR_NO_MEM;
-    }
-
-    wake->capacity_samples = chunk_samples;
-    wake->sample_count = 0;
-    wake->enabled = true;
-    mic_adc_log_start_stage("local_wake_recording_start", "after", ESP_OK);
-    ESP_LOGI(TAG,
-             "local WakeNet detector feed ready chunk_samples=%u bytes=%u",
-             (unsigned int)chunk_samples,
-             (unsigned int)(chunk_samples * sizeof(int16_t)));
+    wake->unavailable_logged = true;
     return ESP_OK;
 }
 
@@ -495,9 +719,6 @@ static void mic_adc_local_wake_deinit(mic_adc_local_wake_t *wake)
 {
     if (wake == NULL) {
         return;
-    }
-    if (wake->samples != NULL) {
-        c5_mem_free(wake->samples, "local_wake_realtime_samples");
     }
     memset(wake, 0, sizeof(*wake));
 }
@@ -507,57 +728,11 @@ static bool mic_adc_local_wake_push_idle_sample(mic_adc_local_wake_t *wake,
                                                 mic_vad_t *vad,
                                                 int16_t pcm_sample)
 {
-    if (wake == NULL || voice_stream == NULL || vad == NULL) {
-        return false;
-    }
-    if (voice_stream->state != MIC_ADC_VOICE_STATE_IDLE ||
-        local_wake_word_is_recording_window_open()) {
-        wake->sample_count = 0;
-        return false;
-    }
-    if (!wake->enabled || wake->samples == NULL || wake->capacity_samples == 0) {
-        if (!wake->unavailable_logged) {
-            ESP_LOGW(TAG,
-                     "local WakeNet detector unavailable; ordinary VAD will remain ignored before wake");
-            wake->unavailable_logged = true;
-        }
-        return false;
-    }
-    if (!local_wake_word_is_detection_ready()) {
-        wake->sample_count = 0;
-        return false;
-    }
-
-    wake->samples[wake->sample_count] = pcm_sample;
-    wake->sample_count++;
-    if (wake->sample_count < wake->capacity_samples) {
-        return false;
-    }
-
-    bool detected = false;
-    esp_err_t ret = local_wake_word_detect_chunk(wake->samples,
-                                                 wake->capacity_samples,
-                                                 &detected);
-    wake->sample_count = 0;
-    if (ret != ESP_OK) {
-        if (ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "WakeNet detect chunk failed: %s", esp_err_to_name(ret));
-        }
-        return false;
-    }
-    if (!detected) {
-        return false;
-    }
-
-    mic_adc_voice_stream_clear_pre_roll(voice_stream);
-    mic_vad_init(vad);
-    ESP_LOGI(TAG, "fixed wake word detected, request local prompt and server voice prepare");
-    mic_adc_voice_activate_result_t activate_ret = mic_adc_voice_stream_activate(voice_stream);
-    if (activate_ret == MIC_ADC_VOICE_ACTIVATE_NONE) {
-        ESP_LOGW(TAG, "fixed wake word detected but voice chain prepare failed");
-        local_wake_word_reset_detector();
-    }
-    return true;
+    (void)wake;
+    (void)voice_stream;
+    (void)vad;
+    (void)pcm_sample;
+    return false;
 }
 
 /**
@@ -714,6 +889,7 @@ static void mic_adc_voice_stream_enter_waiting(mic_adc_voice_stream_t *stream, b
     stream->pcm_bytes_total = 0;
     stream->finish_busy_log_printed = false;
     mic_adc_voice_stream_clear_pre_roll(stream);
+    (void)c5_audio_transport_mark_live();
     if (log_session_done) {
         ESP_LOGI(TAG, "Ready for next speech");
     } else if (!stream->waiting_log_printed) {
@@ -731,6 +907,11 @@ static void mic_adc_reset_runtime_state(mic_adc_window_t *window,
                                         mic_adc_local_wake_t *local_wake)
 {
     const uint32_t generation = mic_adc_next_generation();
+    s_mic_vad_frame_seq = 0U;
+    /* Resetting the local state must not orphan a live UDP stream on S3. */
+    if (!c5_audio_transport_is_idle()) {
+        (void)c5_audio_transport_abort("mic_runtime_reset");
+    }
     if (pcm_converter != NULL) {
         mic_adc_pcm_converter_init(pcm_converter);
     }
@@ -744,6 +925,7 @@ static void mic_adc_reset_runtime_state(mic_adc_window_t *window,
     if (local_wake != NULL) {
         mic_adc_local_wake_reset(local_wake);
     }
+    mic_adc_wake_stream_reset(&s_mic_adc_wake_stream);
     if (window != NULL) {
         mic_adc_window_reset(window);
     }
@@ -810,6 +992,14 @@ static void mic_adc_release_psram_audio_storage(void)
     if (s_mic_voice_pre_roll_storage != NULL) {
         heap_caps_free(s_mic_voice_pre_roll_storage);
         s_mic_voice_pre_roll_storage = NULL;
+    }
+}
+
+static void mic_adc_release_psram_task_stack(void)
+{
+    if (s_mic_adc_task_stack != NULL) {
+        c5_mem_free(s_mic_adc_task_stack, "mic_adc_test_stack");
+        s_mic_adc_task_stack = NULL;
     }
 }
 
@@ -950,7 +1140,7 @@ static esp_err_t mic_adc_start_if_needed(adc_continuous_handle_t handle,
     return ESP_OK;
 }
 
-/* The shutdown requester owns final deletion and task-stack release. */
+/* The shutdown requester owns final deletion; static task storage remains reserved. */
 static void mic_adc_wait_for_external_delete(const char *reason)
 {
     ESP_LOGI(TAG,
@@ -1187,6 +1377,8 @@ static mic_adc_voice_activate_result_t mic_adc_voice_stream_activate(mic_adc_voi
     }
 
     mic_adc_voice_stream_clear_pre_roll(stream);
+    /* Pre-roll is complete; all subsequent PCM frames belong to the live VAD interval. */
+    (void)c5_audio_transport_mark_live();
     return MIC_ADC_VOICE_ACTIVATE_STREAMING;
 }
 
@@ -1347,6 +1539,7 @@ static void mic_adc_voice_stream_start_post_roll(mic_adc_voice_stream_t *stream)
     }
 
     stream->state = MIC_ADC_VOICE_STATE_POST_ROLL;
+    (void)c5_audio_transport_mark_tail();
     if (APP_DEBUG_VOICE_VAD_KEY_LOG) {
         ESP_LOGI(TAG,
                  "server voice: voice_end detected, sending post-roll pcm_ms=%d samples=%u",
@@ -1445,6 +1638,9 @@ static void mic_adc_window_add(mic_adc_window_t *window, uint32_t raw, int16_t p
     if (raw >= MIC_ADC_PCM_ADC_RAW_MAX) {
         window->adc_clip_high++;
     }
+    if (pcm == 0) {
+        window->zero_sample_count++;
+    }
     if (pcm < window->min_pcm) {
         window->min_pcm = pcm;
     }
@@ -1503,20 +1699,63 @@ static void mic_adc_window_report(const mic_adc_window_t *window,
         .pcm_peak = pcm_peak,
         .clipped = clipped,
     };
+    const mic_vad_state_t previous_state = vad->state;
     mic_vad_event_t vad_event = mic_vad_process(vad, &vad_features);
+    const uint32_t vad_frame_seq = ++s_mic_vad_frame_seq;
+    static int64_t last_signal_stats_ms;
+    static int64_t last_vad_continue_ms;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (last_signal_stats_ms == 0 || now_ms - last_signal_stats_ms >= 1000) {
+        last_signal_stats_ms = now_ms;
+        const int64_t dc_offset = window->sum_raw / (int64_t)window->count;
+        ESP_LOGI(TAG,
+                 "MIC_SIGNAL_STATS sample_rate=%u frame_samples=%u channel=%u bit_width=%u raw_min=%u raw_max=%u dc_offset=%lld rms=%u peak=%u clipping_count=%u zero_sample_count=%u",
+                 (unsigned int)MIC_ADC_SAMPLE_FREQ_HZ,
+                 (unsigned int)window->count,
+                 (unsigned int)MIC_ADC_CHANNEL,
+                 (unsigned int)MIC_ADC_BIT_WIDTH,
+                 (unsigned int)window->min_raw,
+                 (unsigned int)window->max_raw,
+                 (long long)dc_offset,
+                 (unsigned int)pcm_rms,
+                 (unsigned int)pcm_peak,
+                 (unsigned int)(window->adc_clip_low + window->adc_clip_high +
+                                window->pcm_clip_low + window->pcm_clip_high),
+                 (unsigned int)window->zero_sample_count);
+    }
+    if (vad_event != MIC_VAD_EVENT_NONE || previous_state != vad->state ||
+        last_vad_continue_ms == 0 || now_ms - last_vad_continue_ms >= 1000) {
+        last_vad_continue_ms = now_ms;
+        ESP_LOGI(TAG,
+                 "VAD_STATE generation=%lu frame_seq=%lu score=%u previous_state=%u new_state=%u speech_frames=%d silence_frames=%d rms=%u threshold=%u hangover_frames=%u",
+                 (unsigned long)s_mic_session_generation,
+                 (unsigned long)vad_frame_seq,
+                 (unsigned int)pcm_rms,
+                 (unsigned int)previous_state,
+                 (unsigned int)vad->state,
+                 vad->speech_frames,
+                 vad->end_count,
+                 (unsigned int)pcm_rms,
+                 (unsigned int)MIC_VAD_START_RMS,
+                 (unsigned int)MIC_VAD_END_FRAMES);
+    }
 
     if (vad_event == MIC_VAD_EVENT_VOICE_START) {
         if (voice_stream->state == MIC_ADC_VOICE_STATE_FINISHING) {
             (void)mic_adc_voice_stream_poll_finish(voice_stream);
         }
 
+        ESP_LOGI(TAG,
+                 "VAD_SPEECH_START generation=%lu rms=%u peak=%u threshold=%u",
+                 (unsigned long)s_mic_session_generation,
+                 (unsigned int)pcm_rms,
+                 (unsigned int)pcm_peak,
+                 (unsigned int)MIC_VAD_START_RMS);
+        mic_adc_wake_stream_start(&s_mic_adc_wake_stream, voice_stream);
+
+        /* The S3 WakeNet transport never depends on a cloud voice session.
+         * The legacy recording window only gates the later HTTP conversation. */
         if (!local_wake_word_is_recording_window_open()) {
-            ESP_LOGD(TAG,
-                     "VAD voice_start ignored before fixed wake word rms=%u peak=%u",
-                     (unsigned int)pcm_rms,
-                     (unsigned int)pcm_peak);
-            mic_adc_voice_stream_clear_pre_roll(voice_stream);
-            mic_vad_init(vad);
             return;
         }
 
@@ -1540,6 +1779,7 @@ static void mic_adc_window_report(const mic_adc_window_t *window,
         // Server voice 阶段采用边采样边发送：这里只打开 PCM 发送闸门并发送句首小预缓存，不再启动整句 PCM 缓存。
         if (mic_adc_voice_stream_activate(voice_stream) == MIC_ADC_VOICE_ACTIVATE_STREAMING) {
             ESP_LOGI(TAG, "USER_SPEECH_START");
+            ESP_LOGI(TAG, "VAD_STATE transition=silence_to_voice stream=pcm_enabled");
             ESP_LOGD(TAG,
                      "vad_start rms=%u peak=%u hit_frames=%u cooldown_elapsed=%u",
                      (unsigned int)pcm_rms,
@@ -1548,7 +1788,14 @@ static void mic_adc_window_report(const mic_adc_window_t *window,
                      (unsigned int)cooldown_elapsed_ms);
         }
     } else if (vad_event == MIC_VAD_EVENT_VOICE_END) {
+        ESP_LOGI(TAG,
+                 "VAD_SPEECH_END generation=%lu rms=%u silence_frames=%d",
+                 (unsigned long)s_mic_session_generation,
+                 (unsigned int)pcm_rms,
+                 vad->end_count);
+        mic_adc_wake_stream_begin_tail(&s_mic_adc_wake_stream);
         ESP_LOGI(TAG, "USER_SPEECH_END");
+        ESP_LOGI(TAG, "VAD_STATE transition=voice_to_hangover stream=post_roll");
         // 句尾先进入 post-roll 继续发送尾部 PCM，再由 server voice 流式状态机 finalize。
         mic_adc_voice_stream_start_post_roll(voice_stream);
         mic_vad_init(vad);
@@ -1568,6 +1815,36 @@ static void mic_adc_log_stack_high_water_mark(void)
 }
 #endif
 
+static void mic_adc_stop_and_deinit_handle(adc_continuous_handle_t *handle,
+                                            volatile bool *adc_started,
+                                            const char *stage)
+{
+    if (handle == NULL || *handle == NULL) {
+        return;
+    }
+
+    if (adc_started != NULL && *adc_started) {
+        esp_err_t stop_ret = adc_continuous_stop(*handle);
+        if (stop_ret != ESP_OK && stop_ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG,
+                     "ADC continuous stop failed during %s: %s",
+                     stage != NULL ? stage : "cleanup",
+                     esp_err_to_name(stop_ret));
+        }
+        *adc_started = false;
+        s_mic_adc_started = false;
+    }
+
+    esp_err_t deinit_ret = adc_continuous_deinit(*handle);
+    if (deinit_ret != ESP_OK && deinit_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG,
+                 "ADC continuous deinit failed during %s: %s",
+                 stage != NULL ? stage : "cleanup",
+                 esp_err_to_name(deinit_ret));
+    }
+    *handle = NULL;
+}
+
 /**
  * @brief 初始化 ADC continuous 驱动并绑定 Mic 所在的 ADC1_CH5。
  *
@@ -1579,6 +1856,18 @@ static void mic_adc_log_stack_high_water_mark(void)
 static esp_err_t mic_adc_continuous_init(adc_continuous_handle_t *out_handle)
 {
     adc_continuous_handle_t handle = NULL;
+    bool adc_started = false;
+    const size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    if (out_handle == NULL || *out_handle != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (dma_largest < MIC_ADC_MIN_DMA_LARGEST_BLOCK) {
+        ESP_LOGW(TAG,
+                 "MIC_ADC_DMA_ADMISSION_REJECTED dma_largest=%u required=%u",
+                 (unsigned int)dma_largest,
+                 (unsigned int)MIC_ADC_MIN_DMA_LARGEST_BLOCK);
+        return ESP_ERR_NO_MEM;
+    }
     adc_continuous_handle_cfg_t handle_cfg = {
         .max_store_buf_size = MIC_ADC_STORE_BYTES,
         .conv_frame_size = MIC_ADC_READ_BYTES,
@@ -1613,8 +1902,8 @@ static esp_err_t mic_adc_continuous_init(adc_continuous_handle_t *out_handle)
     mic_adc_log_start_stage("mic_adc_channel_config", "after", ret);
     if (ret != ESP_OK) {
         mic_adc_log_start_failure("adc_continuous_config", ret);
-        adc_continuous_deinit(handle);
-        mic_adc_log_heap("Mic ADC init stage: after adc_continuous_deinit failed config");
+        mic_adc_stop_and_deinit_handle(&handle, &adc_started, "failed_config");
+        mic_adc_log_heap("Mic ADC init stage: after adc continuous cleanup failed config");
         return ret;
     }
 
@@ -1625,14 +1914,14 @@ static esp_err_t mic_adc_continuous_init(adc_continuous_handle_t *out_handle)
 /**
  * @brief Mic ADC continuous 采样和串口统计任务。
  *
- * 调用方法：由 mic_adc_test_start() 在 WiFi 稳定后预创建；任务先等待初始化 READY gate。
+ * 调用方法：由 mic_adc_test_start() 在本地运行时阶段预创建；任务先等待初始化 READY gate。
  * 不要在外部直接调用。
  * 任务流程：
  * 1. 从 ADC continuous 驱动读取 DMA 原始帧。
  * 2. 调用 adc_continuous_parse_data() 解析出 ADC 单元、通道和 raw 值。
  * 3. 只保留 GPIO6 对应的 ADC1_CH5 有效样本。
  * 4. 调用独立的 mic_adc_pcm 模块把 raw 转成 16000 Hz/mono/int16/little-endian PCM。
- * 5. 空闲监听期先把 PCM 喂给本地 WakeNet，只有“你好小智”命中才请求 voice_chain。
+ * 5. 空闲监听期只维护本地 VAD、pre-roll 和 PCM 发送闸门。
  * 6. 唤醒提示后继续用 VAD 捕捉用户后续语音，并打开 server voice PCM 发送闸门。
  *
  * @param arg 未使用；ADC handle 仅在 READY gate 打开后从已初始化的全局状态读取。
@@ -1783,6 +2072,7 @@ static void mic_adc_test_task(void *arg)
             }
             // Server voice 采用流式发送：未触发 VAD 时写入小预缓存，触发后边采样边发送 PCM。
             mic_adc_voice_stream_push_sample(&s_mic_adc_voice_stream, pcm_sample);
+            mic_adc_wake_stream_push_sample(&s_mic_adc_wake_stream, pcm_sample);
             mic_adc_window_add(&window, s_mic_adc_parsed_buffer[i].raw_data, pcm_sample);
             if (window.count >= MIC_ADC_REPORT_SAMPLES) {
                 mic_adc_window_report(&window, &s_mic_adc_vad, &s_mic_adc_voice_stream);
@@ -1809,11 +2099,11 @@ static void mic_adc_abort_precreated_task(void)
                               pdFALSE,
                               portMAX_DELAY);
     mic_adc_log_start_stage("mic_adc_task_init_abort", "after", ESP_OK);
-    (void)c5_task_delete_with_caps_safe(&s_mic_adc_task_handle,
-                                        &s_mic_adc_task_lock,
-                                        TAG,
-                                        "mic_adc_test",
-                                        "start_abort");
+    (void)c5_task_delete_safe(&s_mic_adc_task_handle,
+                              &s_mic_adc_task_lock,
+                              TAG,
+                              "mic_adc_test",
+                              "start_abort");
 }
 
 static void mic_adc_cleanup_failed_start(void)
@@ -1826,27 +2116,21 @@ static void mic_adc_cleanup_failed_start(void)
     memset(&s_mic_adc_vad, 0, sizeof(s_mic_adc_vad));
     memset(&s_mic_adc_voice_stream, 0, sizeof(s_mic_adc_voice_stream));
 
-    if (s_adc_handle != NULL) {
-        mic_adc_log_heap("Mic ADC failed start: before adc_continuous_deinit");
-        esp_err_t deinit_ret = adc_continuous_deinit(s_adc_handle);
-        mic_adc_log_heap("Mic ADC failed start: after adc_continuous_deinit");
-        if (deinit_ret != ESP_OK && deinit_ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGE(TAG, "ADC continuous deinit failed during startup rollback: %s", esp_err_to_name(deinit_ret));
-        }
-        s_adc_handle = NULL;
-    }
+    mic_adc_stop_and_deinit_handle(&s_adc_handle, &s_mic_adc_started, "startup_rollback");
     if (s_mic_adc_control_events != NULL) {
         vEventGroupDelete(s_mic_adc_control_events);
         s_mic_adc_control_events = NULL;
     }
     mic_adc_clear_static_audio_storage();
     mic_adc_release_psram_audio_storage();
+    mic_adc_release_psram_task_stack();
+    mic_adc_reset_failed_state();
 }
 
 /**
  * @brief 启动 Mic ADC continuous 采样测试。
  *
- * 调用方法：voice_chain 在 WiFi 已连接稳定后调用一次。Mic 常驻 VAD-only 待机；
+ * 调用方法：voice_chain 在本地运行时初始化阶段调用一次。Mic 常驻 VAD-only 待机；
  * VAD 触发 VOICE_START 时通过注册回调请求 voice_chain 暂停非语音模块并准备 server voice。
  *
  * @return 成功返回 ESP_OK，失败返回 ESP-IDF 错误码。
@@ -1857,11 +2141,16 @@ esp_err_t mic_adc_test_start(void)
     if (!app_runtime_guard_check_heap_integrity(TAG, "mic_before_start")) {
         return ESP_FAIL;
     }
-    if (mic_adc_shutdown_is_in_progress()) {
-        ESP_LOGW(TAG, "Mic ADC start rejected: shutdown is in progress");
-        return ESP_ERR_INVALID_STATE;
+
+    bool already_started = false;
+    esp_err_t ret = mic_adc_begin_start(&already_started);
+    if (ret != ESP_OK) {
+        ESP_LOGI(TAG,
+                 "MIC_ADC_NOT_READY reason=lifecycle_transition ret=%s",
+                 esp_err_to_name(ret));
+        return ret;
     }
-    if (s_mic_adc_task_handle != NULL) {
+    if (already_started) {
         mic_adc_log_heap("Mic ADC start API: reuse existing task");
         return ESP_OK;
     }
@@ -1872,6 +2161,8 @@ esp_err_t mic_adc_test_start(void)
         if (s_mic_adc_control_events == NULL) {
             mic_adc_log_start_stage("mic_control_event_group_create", "after", ESP_ERR_NO_MEM);
             mic_adc_log_start_failure("xEventGroupCreate", ESP_ERR_NO_MEM);
+            mic_adc_reset_failed_state();
+            mic_adc_end_start();
             return ESP_ERR_NO_MEM;
         }
         mic_adc_log_start_stage("mic_control_event_group_create", "after", ESP_OK);
@@ -1887,44 +2178,53 @@ esp_err_t mic_adc_test_start(void)
                              MIC_CTRL_INIT_ABORT);
     mic_adc_log_heap("Mic ADC start API: after control event clear");
 
-    mic_adc_log_heap("Mic ADC start API: before wifi ready check");
-    if (!wifi_is_stable()) {
-        ESP_LOGW(TAG, "WiFi is not stable yet, skip Mic ADC/VAD start");
-        return ESP_ERR_INVALID_STATE;
-    }
-    mic_adc_log_heap("Mic ADC start API: after wifi ready check");
-
     mic_adc_log_start_stage("mic_pre_roll_alloc", "before", ESP_ERR_NOT_FINISHED);
-    esp_err_t ret = mic_adc_allocate_psram_audio_storage();
+    ret = mic_adc_allocate_psram_audio_storage();
     mic_adc_log_start_stage("mic_pre_roll_alloc", "after", ret);
     if (ret != ESP_OK) {
         mic_adc_log_start_failure("heap_caps_malloc(mic_pre_roll)", ret);
         mic_adc_cleanup_failed_start();
+        mic_adc_end_start();
         return ret;
     }
 
     mic_adc_log_start_stage("mic_adc_task_create", "before", ESP_ERR_NOT_FINISHED);
-    ESP_LOGI(TAG,
-             "VOICE_START_STAGE stage=mic_adc_task_create requested_stack_bytes=%u source=internal",
-             (unsigned int)MIC_ADC_TEST_TASK_STACK_SIZE);
-    TaskHandle_t task = NULL;
-    if (xTaskCreateWithCaps(mic_adc_test_task,
-                            "mic_adc_test",
-                            MIC_ADC_TEST_TASK_STACK_SIZE,
-                            NULL,
-                            MIC_ADC_TASK_PRIORITY,
-                            &task,
-                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
-        mic_adc_log_start_stage("mic_adc_task_create", "after", ESP_ERR_NO_MEM);
-        mic_adc_log_start_failure("xTaskCreateWithCaps(mic_adc_test)", ESP_ERR_NO_MEM);
+    if (s_mic_adc_task_stack == NULL) {
+        s_mic_adc_task_stack = (StackType_t *)c5_mem_alloc(MIC_ADC_TEST_TASK_STACK_SIZE,
+                                                             C5_MEM_PSRAM,
+                                                             "mic_adc_test_stack");
+    }
+    if (s_mic_adc_task_stack == NULL) {
+        mic_adc_log_start_stage("mic_adc_task_stack_alloc", "after", ESP_ERR_NO_MEM);
+        mic_adc_log_start_failure("c5_mem_alloc(mic_adc_test_stack)", ESP_ERR_NO_MEM);
         mic_adc_cleanup_failed_start();
+        mic_adc_end_start();
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG,
+             "VOICE_START_STAGE stage=mic_adc_task_create requested_stack_bytes=%u source=psram_static",
+             (unsigned int)MIC_ADC_TEST_TASK_STACK_SIZE);
+    TaskHandle_t task = xTaskCreateStatic(mic_adc_test_task,
+                                          "mic_adc_test",
+                                          MIC_ADC_TEST_TASK_STACK_WORDS,
+                                          NULL,
+                                          MIC_ADC_TASK_PRIORITY,
+                                          s_mic_adc_task_stack,
+                                          &s_mic_adc_task_storage);
+    if (task == NULL) {
+        mic_adc_log_start_stage("mic_adc_task_create", "after", ESP_ERR_NO_MEM);
+        mic_adc_log_start_failure("xTaskCreateStatic(mic_adc_test, psram_stack)", ESP_ERR_NO_MEM);
+        mic_adc_cleanup_failed_start();
+        mic_adc_end_start();
         return ESP_ERR_NO_MEM;
     }
     c5_task_handle_publish(&s_mic_adc_task_handle, &s_mic_adc_task_lock, task);
     mic_adc_log_start_stage("mic_adc_task_create", "after", ESP_OK);
-    ESP_LOGI(TAG, "TASK_CREATE task=mic_adc_test");
     ESP_LOGI(TAG,
-             "VOICE_TASK_STACK task=mic_adc_test bytes=%u source=internal_caps_dynamic",
+             "TASK_CREATE task=mic_adc_test stack=%u source=psram_static",
+             (unsigned int)MIC_ADC_TEST_TASK_STACK_SIZE);
+    ESP_LOGI(TAG,
+             "VOICE_TASK_STACK task=mic_adc_test bytes=%u source=psram_static",
              (unsigned int)MIC_ADC_TEST_TASK_STACK_SIZE);
 
     mic_adc_log_start_stage("mic_adc_init", "before", ESP_ERR_NOT_FINISHED);
@@ -1934,6 +2234,7 @@ esp_err_t mic_adc_test_start(void)
         mic_adc_log_start_failure("mic_adc_continuous_init", ret);
         ESP_LOGE(TAG, "ADC continuous init failed: %s", esp_err_to_name(ret));
         mic_adc_cleanup_failed_start();
+        mic_adc_end_start();
         return ret;
     }
 
@@ -1948,14 +2249,25 @@ esp_err_t mic_adc_test_start(void)
     ret = mic_adc_local_wake_init(&s_mic_adc_local_wake);
     if (ret != ESP_OK) {
         mic_adc_log_start_failure("mic_adc_local_wake_init", ret);
-        ESP_LOGE(TAG, "local WakeNet feed init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "local VAD gate init failed: %s", esp_err_to_name(ret));
         mic_adc_cleanup_failed_start();
+        mic_adc_end_start();
         return ret;
     }
+    ret = c5_audio_transport_init(TERMINAL_CONFIG_DEFAULT_LOCAL_ID);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "PCM transport init failed: %s", esp_err_to_name(ret));
+        mic_adc_cleanup_failed_start();
+        mic_adc_end_start();
+        return ret;
+    }
+    mic_adc_wake_stream_reset(&s_mic_adc_wake_stream);
 
     /* The Mic task starts ADC after this gate; callers only create/request it. */
     s_mic_adc_started = false;
     xEventGroupSetBits(s_mic_adc_control_events, MIC_CTRL_INIT_READY);
+    mic_adc_set_state(MIC_ADC_STATE_READY);
+    mic_adc_end_start();
 
     if (APP_DEBUG_VOICE_SESSION_LOG) {
         ESP_LOGI(TAG,
@@ -2033,9 +2345,12 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
     /* Preserve cleanup even after an integrity failure so DMA ownership is not leaked. */
     (void)app_runtime_guard_check_heap_integrity(TAG, "mic_before_stop_deinit");
     TaskHandle_t task = NULL;
-    if (!mic_adc_begin_shutdown(&task)) {
-        ESP_LOGI(TAG, "Mic ADC stop/deinit already in progress");
-        return ESP_OK;
+    esp_err_t shutdown_ret = mic_adc_begin_shutdown(&task);
+    if (shutdown_ret != ESP_OK) {
+        ESP_LOGI(TAG,
+                 "MIC_ADC_RELEASE_DEFERRED reason=lifecycle_transition ret=%s",
+                 esp_err_to_name(shutdown_ret));
+        return shutdown_ret;
     }
 
     if (s_mic_adc_control_events == NULL || task == NULL) {
@@ -2043,19 +2358,9 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
         mic_adc_local_wake_deinit(&s_mic_adc_local_wake);
         memset(&s_mic_adc_vad, 0, sizeof(s_mic_adc_vad));
         memset(&s_mic_adc_voice_stream, 0, sizeof(s_mic_adc_voice_stream));
-        if (s_adc_handle != NULL) {
-            mic_adc_log_heap("Mic ADC stop/deinit API: before adc continuous deinit no task");
-            esp_err_t deinit_ret = adc_continuous_deinit(s_adc_handle);
-            mic_adc_log_heap("Mic ADC stop/deinit API: after adc continuous deinit no task");
-            if (deinit_ret != ESP_OK && deinit_ret != ESP_ERR_INVALID_STATE) {
-                ESP_LOGE(TAG,
-                         "ADC continuous deinit failed without task: %s",
-                         esp_err_to_name(deinit_ret));
-                mic_adc_end_shutdown();
-                return deinit_ret;
-            }
-            s_adc_handle = NULL;
-        }
+        mic_adc_log_heap("Mic ADC stop/deinit API: before ADC cleanup no task");
+        mic_adc_stop_and_deinit_handle(&s_adc_handle, &s_mic_adc_started, "no_task_cleanup");
+        mic_adc_log_heap("Mic ADC stop/deinit API: after ADC cleanup no task");
         if (s_mic_adc_control_events != NULL) {
             mic_adc_log_heap("Mic ADC stop/deinit API: before event group delete no task");
             vEventGroupDelete(s_mic_adc_control_events);
@@ -2063,14 +2368,16 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
             mic_adc_log_heap("Mic ADC stop/deinit API: after event group delete no task");
         }
         s_mic_adc_started = false;
-        (void)c5_task_delete_with_caps_safe(&s_mic_adc_task_handle,
-                                            &s_mic_adc_task_lock,
-                                            TAG,
-                                            "mic_adc_test",
-                                            "no_task_cleanup");
+        (void)c5_task_delete_safe(&s_mic_adc_task_handle,
+                                  &s_mic_adc_task_lock,
+                                  TAG,
+                                  "mic_adc_test",
+                                  "no_task_cleanup");
+        mic_adc_release_psram_task_stack();
         s_mic_adc_owner_task = NULL;
         mic_adc_clear_static_audio_storage();
         mic_adc_release_psram_audio_storage();
+        mic_adc_set_state(MIC_ADC_STATE_IDLE);
         mic_adc_log_heap("Mic ADC stop/deinit API: done no task");
         mic_adc_end_shutdown();
         return ESP_OK;
@@ -2091,15 +2398,17 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
         ESP_LOGE(TAG,
                  "Mic ADC stop/deinit timeout during voice recovery: timeout_ms=%u",
                  (unsigned int)timeout_ms);
+        mic_adc_set_state(MIC_ADC_STATE_READY);
         mic_adc_end_shutdown();
         return ESP_ERR_TIMEOUT;
     }
 
-    (void)c5_task_delete_with_caps_safe(&s_mic_adc_task_handle,
-                                        &s_mic_adc_task_lock,
-                                        TAG,
-                                        "mic_adc_test",
-                                        "stop_and_deinit");
+    (void)c5_task_delete_safe(&s_mic_adc_task_handle,
+                              &s_mic_adc_task_lock,
+                              TAG,
+                              "mic_adc_test",
+                              "stop_and_deinit");
+    mic_adc_release_psram_task_stack();
     s_mic_adc_owner_task = NULL;
 
     /* 任务可能仍在 READY gate 等待，停止确认后统一回收预初始化的状态。 */
@@ -2107,19 +2416,9 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
     memset(&s_mic_adc_vad, 0, sizeof(s_mic_adc_vad));
     memset(&s_mic_adc_voice_stream, 0, sizeof(s_mic_adc_voice_stream));
 
-    if (s_adc_handle != NULL) {
-        mic_adc_log_heap("Mic ADC stop/deinit API: before adc continuous deinit");
-        esp_err_t deinit_ret = adc_continuous_deinit(s_adc_handle);
-        mic_adc_log_heap("Mic ADC stop/deinit API: after adc continuous deinit");
-        if (deinit_ret != ESP_OK && deinit_ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGE(TAG,
-                     "ADC continuous deinit failed during voice recovery: %s",
-                     esp_err_to_name(deinit_ret));
-            mic_adc_end_shutdown();
-            return deinit_ret;
-        }
-        s_adc_handle = NULL;
-    }
+    mic_adc_log_heap("Mic ADC stop/deinit API: before ADC cleanup");
+    mic_adc_stop_and_deinit_handle(&s_adc_handle, &s_mic_adc_started, "voice_recovery");
+    mic_adc_log_heap("Mic ADC stop/deinit API: after ADC cleanup");
 
     mic_adc_log_heap("Mic ADC stop/deinit API: before event group delete");
     vEventGroupDelete(s_mic_adc_control_events);
@@ -2129,6 +2428,7 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
     s_mic_adc_started = false;
     mic_adc_clear_static_audio_storage();
     mic_adc_release_psram_audio_storage();
+    mic_adc_set_state(MIC_ADC_STATE_IDLE);
     mic_adc_log_heap("Mic ADC stop/deinit API: done");
     mic_adc_end_shutdown();
     return ESP_OK;

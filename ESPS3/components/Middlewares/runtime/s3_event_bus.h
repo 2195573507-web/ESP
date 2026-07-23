@@ -21,6 +21,7 @@ extern "C" {
 #endif
 
 #define S3_EVENT_BUS_DEVICE_ID_LEN 48U
+#define S3_EVENT_BUS_EVENT_TYPE_COUNT 8U
 
 typedef enum {
     S3_EVENT_BUS_LEVEL_CRITICAL = 0,
@@ -50,6 +51,11 @@ typedef struct {
     uint32_t drop_count;
     uint32_t background_drop_count;
     uint32_t coalesce_count;
+    /* Event-type attribution keeps aggregate drops actionable without
+     * logging every enqueue in normal firmware builds. Index by the
+     * s3_scheduler_event_type_t numeric value. */
+    uint32_t drop_by_event_type[S3_EVENT_BUS_EVENT_TYPE_COUNT];
+    uint32_t coalesce_by_state_key[S3_EVENT_BUS_STATE_COUNT];
 } s3_event_bus_stats_t;
 
 struct s3_scheduler_event;

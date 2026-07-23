@@ -26,6 +26,7 @@ set(speaker_srcs
             speaker/speaker_resample.c)
 
 set(voice_srcs
+            voice_transport/c5_audio_transport.c
             voice_domain/voice_chain.c)
 
 set(runtime_srcs
@@ -57,7 +58,7 @@ set(radar_domain_srcs
             radar_domain/radar_memory_manager.c
             radar_domain/radar_buffer.c
             radar_domain/radar_upload_queue.c
-            radar_domain/radar_resource_adapter.c
+            radar_domain/radar_home_snapshot_client.c
             radar_domain/radar_worker.c)
 
 set(system_srcs
@@ -89,6 +90,7 @@ set(priv_include_dirs
             wifi
             mic
             server_voice
+            voice_transport
             wake
             display_placeholder
             speaker
@@ -127,12 +129,12 @@ set(requires
             esp111_protocol_common
             radar_ld2450
             lcd_ui
-            radar_domain
             bt
-            espressif__esp-sr)
+            )
 
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS ${include_dirs}
                        PRIV_INCLUDE_DIRS ${priv_include_dirs}
-                       REQUIRES ${requires})
+                       REQUIRES ${requires}
+                       EMBED_FILES wake/resources/wake_ack_zh.pcm)
 component_compile_options(-Wno-error=format -Wno-format)

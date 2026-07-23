@@ -69,6 +69,10 @@ typedef struct {
     char device_id[RADAR_GATEWAY_DEVICE_ID_LEN];
     uint8_t local_id;
     bool radar_online;
+    /* A source that was valid before but has exceeded the receive-time
+     * freshness deadline. This is additive so existing online consumers
+     * keep their current contract. */
+    bool radar_stale;
     radar_occupancy_state_t occupancy;
     radar_motion_state_t motion;
     uint64_t updated_at_ms;

@@ -71,6 +71,9 @@ typedef struct {
 /** @brief 初始化 network/upload/command worker 队列和任务；gateway_orchestrator 启动时调用。 */
 esp_err_t network_worker_init(void);
 
+/** @brief Stops workers and releases only resources owned by this module; repeated calls are safe. */
+void network_worker_deinit(void);
+
 /** @brief 请求 worker 在 SoftAP ready 后启动本地 HTTP；重复调用安全。 */
 esp_err_t network_worker_enable_local_http_server(void);
 

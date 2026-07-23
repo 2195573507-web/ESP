@@ -1,0 +1,27 @@
+Command: ninja all
+[1/12] Performing build step for 'bootloader'
+[1/1] cd "/Users/zhiqin/ESP 部分开发 1/build-c52-voice-network/bootloader/esp-idf/esptool_py" && /Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x2000 /Users/zhiqin/ESP\ 部分开发\ 1/build-c52-voice-network/bootloader/bootloader.bin
+Bootloader binary size 0x5670 bytes. 0x990 bytes (10%) free.
+[2/12] No install step for 'bootloader'
+[3/12] Completed 'bootloader'
+[4/12] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/wifi/wifi_manager.c.obj
+[5/12] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/app_orchestrator/app_orchestrator.c.obj
+[6/12] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/voice_domain/voice_chain.c.obj
+/Users/zhiqin/ESP 部分开发 1/ESPC52/components/Middlewares/voice_domain/voice_chain.c:900:18: warning: 'voice_chain_command_speech_end_sink' defined but not used [-Wunused-function]
+  900 | static esp_err_t voice_chain_command_speech_end_sink(uint32_t command_generation,
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/zhiqin/ESP 部分开发 1/ESPC52/components/Middlewares/voice_domain/voice_chain.c:868:18: warning: 'voice_chain_command_speech_start_sink' defined but not used [-Wunused-function]
+  868 | static esp_err_t voice_chain_command_speech_start_sink(uint32_t command_generation,
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[7/12] Building C object esp-idf/Middlewares/CMakeFiles/__idf_Middlewares.dir/mic/mic_adc_test.c.obj
+[8/12] Linking C static library esp-idf/Middlewares/libMiddlewares.a
+[9/12] Generating esp-idf/esp_system/ld/sections.ld
+[10/12] Linking CXX executable 00_Learn.elf
+[11/12] Generating binary image from built executable
+esptool.py v4.12.dev2
+Creating esp32c5 image...
+Merged 1 ELF section
+Successfully created esp32c5 image.
+Generated /Users/zhiqin/ESP 部分开发 1/build-c52-voice-network/00_Learn.bin
+[12/12] cd "/Users/zhiqin/ESP 部分开发 1/build-c52-voice-network/esp-idf/esptool_py" && /Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python /Users/zhiqin/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /Users/zhiqin/ESP\ 部分开发\ 1/build-c52-voice-network/partition_table/partition-table.bin /Users/zhiqin/ESP\ 部分开发\ 1/build-c52-voice-network/00_Learn.bin
+00_Learn.bin binary size 0x240520 bytes. Smallest app partition is 0x500000 bytes. 0x2bfae0 bytes (55%) free.

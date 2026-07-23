@@ -21,7 +21,7 @@ typedef struct {
     int16_t speed_cm_s;
     uint16_t resolution_mm;
     uint32_t distance_mm;
-    /* C5 edge-filter continuity confidence (0-100), not raw RF quality. */
+    /* Reserved wire field. C5 forwards no inferred confidence, so this remains zero. */
     uint8_t confidence;
 } radar_target_t;
 

@@ -1,6 +1,11 @@
 #ifndef ESP111_PROTOCOL_COMMON_H
 #define ESP111_PROTOCOL_COMMON_H
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
 /**
  * @file esp111_protocol_common.h
  * @brief ESP-111 三套固件共享协议常量。
@@ -152,6 +157,7 @@ extern "C" {
 #define ESP111_PROTOCOL_ROUTE_RADAR_STATE "/local/v1/radar/state"
 #define ESP111_PROTOCOL_ROUTE_RADAR_RESULT "/local/v1/radar/result"
 #define ESP111_PROTOCOL_ROUTE_RADAR_DEBUG "/local/v1/radar/debug"
+#define ESP111_PROTOCOL_ROUTE_RADAR_HOME_SNAPSHOT "/local/v1/radar/home_snapshot"
 #define ESP111_PROTOCOL_ROUTE_DEVICE_STREAM "/local/v1/stream"
 #define ESP111_PROTOCOL_ROUTE_VOICE_TURN "/local/v1/voice/turn"
 #define ESP111_PROTOCOL_ROUTE_VOICE_PROMPT_CACHE "/local/v1/voice/prompt-cache"
@@ -169,6 +175,113 @@ extern "C" {
     "audio/L16; rate=16000; channels=1"
 #define ESP111_PROTOCOL_AUDIO_RESPONSE_CONTENT_TYPE "audio/L16"
 #define ESP111_PROTOCOL_AUDIO_FORMAT_PCM_S16LE_MONO_16K "pcm_s16le_mono_16k"
+/* VAD-gated C5 -> S3 audio datagrams. Fields are explicitly little-endian. */
+#define ESP111_PROTOCOL_AUDIO_STREAM_PORT 33435U
+#define ESP111_PROTOCOL_AUDIO_STREAM_VERSION 1U
+#define ESP111_PROTOCOL_AUDIO_STREAM_MAX_PAYLOAD 640U
+#define ESP111_PROTOCOL_AUDIO_STREAM_HEADER_BYTES 28U
+#define ESP111_PROTOCOL_AUDIO_STREAM_FLAG_PREROLL 0x01U
+#define ESP111_PROTOCOL_AUDIO_STREAM_FLAG_TAIL 0x02U
+#define ESP111_PROTOCOL_AUDIO_STREAM_FLAG_END 0x04U
+
+typedef enum {
+    ESP111_PROTOCOL_AUDIO_STREAM_VOICE_START = 1,
+    ESP111_PROTOCOL_AUDIO_STREAM_PCM = 2,
+    ESP111_PROTOCOL_AUDIO_STREAM_VOICE_END = 3,
+    ESP111_PROTOCOL_AUDIO_STREAM_VOICE_ABORT = 4,
+} esp111_protocol_audio_stream_type_t;
+
+typedef struct {
+    uint8_t type;
+    uint8_t source_id;
+    uint8_t flags;
+    uint32_t stream_id;
+    uint32_t sequence;
+    uint32_t sample_counter;
+    uint16_t sample_rate;
+    uint8_t bits_per_sample;
+    uint8_t channels;
+    uint16_t frame_samples;
+    uint16_t payload_length;
+    uint16_t crc16;
+} esp111_protocol_audio_frame_t;
+
+static inline uint16_t esp111_protocol_audio_crc16(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xffffU;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (unsigned int bit = 0; bit < 8U; ++bit) {
+            crc = (crc & 1U) != 0U ? (uint16_t)((crc >> 1U) ^ 0xa001U) : (uint16_t)(crc >> 1U);
+        }
+    }
+    return crc;
+}
+
+static inline void esp111_protocol_audio_write_u16(uint8_t *dst, uint16_t value)
+{ dst[0] = (uint8_t)value; dst[1] = (uint8_t)(value >> 8U); }
+
+static inline void esp111_protocol_audio_write_u32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)value; dst[1] = (uint8_t)(value >> 8U);
+    dst[2] = (uint8_t)(value >> 16U); dst[3] = (uint8_t)(value >> 24U);
+}
+
+static inline uint16_t esp111_protocol_audio_read_u16(const uint8_t *src)
+{ return (uint16_t)src[0] | (uint16_t)((uint16_t)src[1] << 8U); }
+
+static inline uint32_t esp111_protocol_audio_read_u32(const uint8_t *src)
+{
+    return (uint32_t)src[0] | ((uint32_t)src[1] << 8U) | ((uint32_t)src[2] << 16U) |
+           ((uint32_t)src[3] << 24U);
+}
+
+static inline size_t esp111_protocol_audio_encode(const esp111_protocol_audio_frame_t *frame,
+                                                   const uint8_t *payload, uint8_t *out,
+                                                   size_t out_capacity)
+{
+    if (frame == NULL || out == NULL || frame->payload_length > ESP111_PROTOCOL_AUDIO_STREAM_MAX_PAYLOAD ||
+        out_capacity < ESP111_PROTOCOL_AUDIO_STREAM_HEADER_BYTES + frame->payload_length ||
+        (frame->payload_length > 0U && payload == NULL)) return 0U;
+    out[0] = ESP111_PROTOCOL_AUDIO_STREAM_VERSION; out[1] = frame->type;
+    out[2] = frame->source_id; out[3] = frame->flags;
+    esp111_protocol_audio_write_u32(out + 4U, frame->stream_id);
+    esp111_protocol_audio_write_u32(out + 8U, frame->sequence);
+    esp111_protocol_audio_write_u32(out + 12U, frame->sample_counter);
+    esp111_protocol_audio_write_u16(out + 16U, frame->sample_rate);
+    out[18] = frame->bits_per_sample; out[19] = frame->channels;
+    esp111_protocol_audio_write_u16(out + 20U, frame->frame_samples);
+    esp111_protocol_audio_write_u16(out + 22U, frame->payload_length);
+    if (frame->payload_length > 0U) memcpy(out + ESP111_PROTOCOL_AUDIO_STREAM_HEADER_BYTES, payload, frame->payload_length);
+    uint16_t crc = esp111_protocol_audio_crc16(out, 24U);
+    if (frame->payload_length > 0U) crc ^= esp111_protocol_audio_crc16(out + ESP111_PROTOCOL_AUDIO_STREAM_HEADER_BYTES, frame->payload_length);
+    esp111_protocol_audio_write_u16(out + 24U, crc); out[26] = 0U; out[27] = 0U;
+    return ESP111_PROTOCOL_AUDIO_STREAM_HEADER_BYTES + frame->payload_length;
+}
+
+static inline bool esp111_protocol_audio_decode(const uint8_t *packet, size_t packet_length,
+                                                esp111_protocol_audio_frame_t *out,
+                                                const uint8_t **payload)
+{
+    if (packet == NULL || out == NULL || packet_length < ESP111_PROTOCOL_AUDIO_STREAM_HEADER_BYTES ||
+        packet[0] != ESP111_PROTOCOL_AUDIO_STREAM_VERSION) return false;
+    uint16_t length = esp111_protocol_audio_read_u16(packet + 22U);
+    if (length > ESP111_PROTOCOL_AUDIO_STREAM_MAX_PAYLOAD ||
+        packet_length != ESP111_PROTOCOL_AUDIO_STREAM_HEADER_BYTES + length) return false;
+    out->type = packet[1]; out->source_id = packet[2]; out->flags = packet[3];
+    out->stream_id = esp111_protocol_audio_read_u32(packet + 4U);
+    out->sequence = esp111_protocol_audio_read_u32(packet + 8U);
+    out->sample_counter = esp111_protocol_audio_read_u32(packet + 12U);
+    out->sample_rate = esp111_protocol_audio_read_u16(packet + 16U);
+    out->bits_per_sample = packet[18]; out->channels = packet[19];
+    out->frame_samples = esp111_protocol_audio_read_u16(packet + 20U);
+    out->payload_length = length; out->crc16 = esp111_protocol_audio_read_u16(packet + 24U);
+    uint16_t crc = esp111_protocol_audio_crc16(packet, 24U);
+    if (length > 0U) crc ^= esp111_protocol_audio_crc16(packet + ESP111_PROTOCOL_AUDIO_STREAM_HEADER_BYTES, length);
+    if (crc != out->crc16) return false;
+    if (payload != NULL) *payload = packet + ESP111_PROTOCOL_AUDIO_STREAM_HEADER_BYTES;
+    return true;
+}
 
 #define ESP111_PROTOCOL_ERROR_INVALID_ENVELOPE "invalid_envelope"
 #define ESP111_PROTOCOL_ERROR_INVALID_DEVICE_ID "invalid_device_id"

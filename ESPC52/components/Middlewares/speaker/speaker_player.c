@@ -1042,6 +1042,9 @@ esp_err_t audio_player_stream_open(void)
     s_pcm_stream_open = true;
     s_pcm_stream_owner_task = xTaskGetCurrentTaskHandle();
     s_pcm_player_state = AUDIO_PLAYER_STATE_PLAYING;
+    ESP_LOGI(TAG,
+             "AUDIO_DMA_OWNERSHIP owner=speaker_iis_writer action=acquire stream_generation=%lu",
+             (unsigned long)s_pcm_stream_ctx.generation);
     return ESP_OK;
 }
 
@@ -1237,6 +1240,7 @@ esp_err_t audio_player_release_session(uint32_t timeout_ms)
     s_pcm_stream_owner_task = NULL;
     s_pcm_stream_sequence = 0U;
     s_pcm_player_state = AUDIO_PLAYER_STATE_UNINITIALIZED;
+    ESP_LOGI(TAG, "AUDIO_DMA_OWNERSHIP owner=speaker_iis_writer action=release");
     c5_mem_log("after_i2s_deinit");
     xSemaphoreGive(s_play_mutex);
     return ESP_OK;

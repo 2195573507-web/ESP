@@ -45,17 +45,25 @@ static inline UBaseType_t app_stack_monitor_log(const char *tag,
     return high_water;
 }
 
+void app_stack_monitor_log_system_state(const char *tag, const char *stage);
+
 /* Invoke only at lifecycle boundaries; full heap walks are not suitable for
  * ISR or high-frequency audio callbacks. */
 static inline bool app_runtime_guard_check_heap_integrity(const char *tag,
                                                          const char *stage)
 {
     const bool integrity_ok = heap_caps_check_integrity_all(true);
-    ESP_LOG_LEVEL_LOCAL(integrity_ok ? ESP_LOG_INFO : ESP_LOG_ERROR,
-                        tag != NULL ? tag : "runtime_guard",
-                        "RUNTIME_PROTECTION heap_integrity stage=%s result=%s",
-                        stage != NULL ? stage : "<none>",
-                        integrity_ok ? "ok" : "failed");
+    /* Successful checks are common lifecycle breadcrumbs. Keep failures loud,
+     * but demote repeated ok lines so mic/voice retries do not flood the log. */
+    if (!integrity_ok) {
+        ESP_LOGE(tag != NULL ? tag : "runtime_guard",
+                 "RUNTIME_PROTECTION heap_integrity stage=%s result=failed",
+                 stage != NULL ? stage : "<none>");
+    } else {
+        ESP_LOGD(tag != NULL ? tag : "runtime_guard",
+                 "RUNTIME_PROTECTION heap_integrity stage=%s result=ok",
+                 stage != NULL ? stage : "<none>");
+    }
     return integrity_ok;
 }
 

@@ -23,6 +23,9 @@ typedef struct {
 
 /* 单一主队列承接 timer/callback 事件；handler 表把事件快速路由到各 worker queue。 */
 static QueueHandle_t s_event_queue;
+static StaticQueue_t s_event_queue_storage;
+static uint8_t s_event_queue_buffer[C5_EVENT_BUS_QUEUE_LENGTH * sizeof(c5_event_t)]
+    __attribute__((aligned(portBYTE_ALIGNMENT)));
 static c5_event_handler_slot_t s_handlers[C5_EVENT_MAX];
 static c5_event_bus_stats_t s_stats;
 static uint32_t s_next_sequence;
@@ -45,22 +48,12 @@ esp_err_t c5_event_bus_init(void)
         return ESP_OK;
     }
 
-    /* 先在临时变量中创建，再在临界区内发布，避免重复 init 造成句柄覆盖。 */
-    QueueHandle_t queue = xQueueCreate((UBaseType_t)C5_EVENT_BUS_QUEUE_LENGTH,
-                                       sizeof(c5_event_t));
-    if (queue == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    portENTER_CRITICAL(&s_event_bus_lock);
+    s_event_queue = xQueueCreateStatic((UBaseType_t)C5_EVENT_BUS_QUEUE_LENGTH,
+                                       sizeof(c5_event_t),
+                                       s_event_queue_buffer,
+                                       &s_event_queue_storage);
     if (s_event_queue == NULL) {
-        s_event_queue = queue;
-        queue = NULL;
-    }
-    portEXIT_CRITICAL(&s_event_bus_lock);
-
-    if (queue != NULL) {
-        vQueueDelete(queue);
+        return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
 }
@@ -198,6 +191,8 @@ const char *c5_event_type_name(c5_event_type_t type)
         return "C5_EVENT_STATUS";
     case C5_EVENT_COMMAND:
         return "C5_EVENT_COMMAND";
+    case C5_EVENT_RADAR_HOME_SNAPSHOT:
+        return "C5_EVENT_RADAR_HOME_SNAPSHOT";
     default:
         return "C5_EVENT_UNKNOWN";
     }

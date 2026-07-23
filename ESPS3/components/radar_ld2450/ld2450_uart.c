@@ -4,9 +4,11 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "app_stack_monitor.h"
 #include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "radar_config.h"
 
 /*
@@ -17,6 +19,21 @@
 static bool s_driver_installed;
 static ld2450_uart_diagnostics_t s_diagnostics;
 static QueueHandle_t s_event_queue;
+static StaticSemaphore_t s_lifecycle_lock_storage;
+static SemaphoreHandle_t s_lifecycle_lock;
+static portMUX_TYPE s_lifecycle_lock_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static SemaphoreHandle_t lifecycle_lock_handle(void)
+{
+    if (s_lifecycle_lock == NULL) {
+        portENTER_CRITICAL(&s_lifecycle_lock_mux);
+        if (s_lifecycle_lock == NULL) {
+            s_lifecycle_lock = xSemaphoreCreateMutexStatic(&s_lifecycle_lock_storage);
+        }
+        portEXIT_CRITICAL(&s_lifecycle_lock_mux);
+    }
+    return s_lifecycle_lock;
+}
 
 static void sat_inc_u32(uint32_t *value)
 {
@@ -30,6 +47,13 @@ bool ld2450_uart_is_enabled(void)
     return RADAR_CONFIG_UART_ENABLED == 1;
 }
 
+size_t ld2450_uart_internal_requirement_bytes(void)
+{
+    return RADAR_CONFIG_UART_RX_RING_BYTES +
+           (20U * sizeof(uart_event_t)) +
+           RADAR_CONFIG_UART_DRIVER_CONTROL_BYTES;
+}
+
 esp_err_t ld2450_uart_init(void)
 {
     if (!ld2450_uart_is_enabled()) {
@@ -40,7 +64,15 @@ esp_err_t ld2450_uart_init(void)
         RADAR_CONFIG_UART_RX_GPIO < 0) {
         return ESP_ERR_INVALID_STATE;
     }
+    SemaphoreHandle_t lock = lifecycle_lock_handle();
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     if (s_driver_installed) {
+        xSemaphoreGive(lock);
         return ESP_OK;
     }
 
@@ -59,6 +91,7 @@ esp_err_t ld2450_uart_init(void)
         },
     };
 
+    app_s3_mem_log("radar_ld2450", "radar_uart_install_before");
     esp_err_t ret = uart_param_config(port, &config);
     if (ret == ESP_OK) {
         ret = uart_set_pin(port,
@@ -76,32 +109,57 @@ esp_err_t ld2450_uart_init(void)
                                   0);
     }
     if (ret != ESP_OK) {
+        s_event_queue = NULL;
+        app_s3_mem_log("radar_ld2450", "radar_uart_install_after");
+        xSemaphoreGive(lock);
         return ret;
     }
 
     s_driver_installed = true;
+    app_s3_mem_log("radar_ld2450", "radar_uart_install_after");
+    xSemaphoreGive(lock);
     return ESP_OK;
 }
 
 esp_err_t ld2450_uart_deinit(void)
 {
+    SemaphoreHandle_t lock = lifecycle_lock_handle();
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     if (!s_driver_installed) {
+        xSemaphoreGive(lock);
         return ESP_OK;
     }
+    app_s3_mem_log("radar_ld2450", "radar_uart_delete_before");
     esp_err_t ret = uart_driver_delete((uart_port_t)RADAR_CONFIG_UART_PORT_INDEX);
     if (ret == ESP_OK) {
         s_driver_installed = false;
         s_event_queue = NULL;
     }
+    app_s3_mem_log("radar_ld2450", "radar_uart_delete_after");
+    xSemaphoreGive(lock);
     return ret;
 }
 
 esp_err_t ld2450_uart_flush(void)
 {
+    SemaphoreHandle_t lock = lifecycle_lock_handle();
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     if (!s_driver_installed) {
+        xSemaphoreGive(lock);
         return ESP_OK;
     }
     esp_err_t ret = uart_flush_input((uart_port_t)RADAR_CONFIG_UART_PORT_INDEX);
+    xSemaphoreGive(lock);
     return ret;
 }
 
@@ -111,8 +169,14 @@ int ld2450_uart_read(uint8_t *buffer, size_t buffer_size, uint32_t timeout_ms)
         sat_inc_u32(&s_diagnostics.read_driver_error);
         return -1;
     }
+    SemaphoreHandle_t lock = lifecycle_lock_handle();
+    if (lock == NULL || xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        sat_inc_u32(&s_diagnostics.read_driver_error);
+        return -1;
+    }
     if (!s_driver_installed) {
         sat_inc_u32(&s_diagnostics.read_driver_error);
+        xSemaphoreGive(lock);
         return -1;
     }
 
@@ -126,17 +190,27 @@ int ld2450_uart_read(uint8_t *buffer, size_t buffer_size, uint32_t timeout_ms)
         sat_inc_u32(timeout_ms == 0U ? &s_diagnostics.read_zero :
                                     &s_diagnostics.read_timeout);
     }
+    xSemaphoreGive(lock);
     return len;
 }
 
 int ld2450_uart_write(const uint8_t *data, size_t data_len)
 {
-    if (!s_driver_installed || data == NULL || data_len == 0U || data_len > INT_MAX) {
+    if (data == NULL || data_len == 0U || data_len > INT_MAX) {
+        return -1;
+    }
+    SemaphoreHandle_t lock = lifecycle_lock_handle();
+    if (lock == NULL || xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        return -1;
+    }
+    if (!s_driver_installed) {
+        xSemaphoreGive(lock);
         return -1;
     }
     int written = uart_write_bytes((uart_port_t)RADAR_CONFIG_UART_PORT_INDEX,
                                    data,
                                    data_len);
+    xSemaphoreGive(lock);
     return written;
 }
 
@@ -145,7 +219,12 @@ void ld2450_uart_drain_events(ld2450_uart_events_t *out)
     if (out != NULL) {
         memset(out, 0, sizeof(*out));
     }
+    SemaphoreHandle_t lock = lifecycle_lock_handle();
+    if (lock == NULL || xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
     if (!s_driver_installed || s_event_queue == NULL) {
+        xSemaphoreGive(lock);
         return;
     }
 
@@ -172,6 +251,7 @@ void ld2450_uart_drain_events(ld2450_uart_events_t *out)
             }
         }
     }
+    xSemaphoreGive(lock);
 }
 
 void ld2450_uart_get_diagnostics(ld2450_uart_diagnostics_t *out)

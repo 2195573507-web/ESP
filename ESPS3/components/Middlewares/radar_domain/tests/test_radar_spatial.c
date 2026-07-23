@@ -304,11 +304,15 @@ static void test_uart_recovery(void)
     for (uint32_t i = 0U; i < 3U; ++i) radar_uart_recovery_note_error(&recovery, 400U + i);
     assert(recovery.state == RADAR_UART_RECOVERY_BACKOFF);
     assert(radar_uart_recovery_should_stop_rx(&recovery));
-    assert(!radar_uart_recovery_retry_due(&recovery, 651U));
-    assert(radar_uart_recovery_retry_due(&recovery, 652U));
-    radar_uart_recovery_note_init_result(&recovery, false, 652U);
+    assert(!radar_uart_recovery_retry_due(&recovery, 1401U));
+    assert(radar_uart_recovery_retry_due(&recovery, 1402U));
+    radar_uart_recovery_note_init_result(&recovery, false, 1402U);
     assert(recovery.init_failure_count == 1U);
-    assert(recovery.current_backoff_ms == 500U);
+    assert(recovery.current_backoff_ms == 2000U);
+    assert(!radar_uart_recovery_retry_due(&recovery, 3401U));
+    assert(radar_uart_recovery_retry_due(&recovery, 3402U));
+    radar_uart_recovery_note_init_result(&recovery, false, 3402U);
+    assert(recovery.current_backoff_ms == 4000U);
 
     radar_uart_recovery_init(&recovery, NULL, 0U);
     radar_uart_recovery_note_init_result(&recovery, true, 0U);

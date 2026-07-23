@@ -93,8 +93,10 @@ static void registry_snapshot_from_spatial(const radar_spatial_snapshot_t *spati
     snapshot->uart_online = spatial->sensor_state != RADAR_SENSOR_OFFLINE;
     snapshot->frame_fresh = spatial->sensor_state == RADAR_SENSOR_VALID;
     snapshot->last_valid_frame_ms = spatial->latest_frame_ms;
-    snapshot->current_target_count = spatial->visible_track_count;
-    for (size_t i = 0U; i < spatial->visible_track_count; ++i) {
+    const size_t visible_count = spatial->visible_track_count > LD2450_MAX_TARGETS
+        ? LD2450_MAX_TARGETS : spatial->visible_track_count;
+    snapshot->current_target_count = (uint8_t)visible_count;
+    for (size_t i = 0U; i < visible_count; ++i) {
         const radar_track_snapshot_t *target = &spatial->current_targets[i];
         snapshot->targets[i] = (radar_target_t){
             .valid = true,
@@ -161,6 +163,7 @@ static void adapter_task(void *arg)
     uint64_t last_tracker_ms = 0U;
     uint64_t last_snapshot_ms = 0U;
     uint64_t last_stack_log_ms = 0U;
+    uint32_t last_consumed_frame_sequence = 0U;
 
     if (workspace == NULL) {
         ESP_LOGE(TAG,
@@ -169,8 +172,66 @@ static void adapter_task(void *arg)
         return;
     }
 
+    bool logged_idle = false;
     while (!s_stop_requested) {
         const uint64_t current_ms = now_ms();
+        const bool uart_enabled = RADAR_CONFIG_UART_ENABLED != 0;
+        radar_service_get_diagnostics(&workspace->service_diagnostics);
+        const bool recovery_valid =
+            workspace->service_diagnostics.recovery.state == RADAR_UART_RECOVERY_VALID;
+        const bool has_frame = radar_service_get_latest_frame(&workspace->latest_frame);
+        /* No full tracker/history churn until the local UART is both enabled and valid. */
+        if (!uart_enabled || !recovery_valid) {
+            /* Disconnected/disabled local radar: light idle path, no full tracking churn. */
+            (void)radar_rate_manager_update(&s_rate_manager, 0U, 0U, 0U, current_ms);
+            if (!logged_idle) {
+                ESP_LOGI(TAG,
+                         "RADAR_SOURCE_STATE event=local_idle source_id=0 source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local sequence=0 reason=%s",
+                         !uart_enabled ? "uart_disabled" : "uart_offline_or_disconnected");
+                logged_idle = true;
+            }
+            if (last_snapshot_ms == 0U || current_ms < last_snapshot_ms ||
+                current_ms - last_snapshot_ms >= 5000U) {
+                radar_spatial_state_poll(s_context->spatial_state,
+                                         workspace->service_diagnostics.recovery.state,
+                                         current_ms);
+                radar_spatial_state_set_diagnostics(s_context->spatial_state,
+                                                    &workspace->service_diagnostics.parser,
+                                                    &workspace->service_diagnostics.uart,
+                                                    &workspace->service_diagnostics.recovery);
+                radar_spatial_state_get_snapshot(s_context->spatial_state,
+                                                 &workspace->spatial_snapshot);
+                registry_snapshot_from_spatial(&workspace->spatial_snapshot,
+                                               &workspace->registry_snapshot);
+                const radar_count_summary_t count_summary =
+                    count_summary_from_spatial(&workspace->spatial_snapshot);
+                if (s_spatial_lock != NULL &&
+                    xSemaphoreTake(s_spatial_lock, portMAX_DELAY) == pdTRUE) {
+                    radar_source_context_publish(s_context,
+                                                 &workspace->spatial_snapshot,
+                                                 &count_summary,
+                                                 false,
+                                                 s_context->spatial_state->last_frame_seq,
+                                                 workspace->spatial_snapshot.latest_frame_ms);
+                    xSemaphoreGive(s_spatial_lock);
+                }
+                /* State-change only logs in idle; skip high-rate track updates. */
+                bool state_changed = false;
+                (void)radar_registry_update_local(&workspace->registry_snapshot,
+                                                  &count_summary,
+                                                  &workspace->registry_diagnostics,
+                                                  current_ms,
+                                                  &state_changed);
+                if (state_changed) {
+                    radar_log_manager_publish(s_context, &s_rate_manager);
+                }
+                last_snapshot_ms = current_ms;
+            }
+            vTaskDelay(pdMS_TO_TICKS(200U));
+            continue;
+        }
+        logged_idle = false;
+
         const radar_rate_policy_t *policy = &s_rate_manager.policy;
         if (last_parser_ms == 0U || current_ms < last_parser_ms ||
             current_ms - last_parser_ms >= policy->parser_period_ms) {
@@ -181,10 +242,13 @@ static void adapter_task(void *arg)
         policy = &s_rate_manager.policy;
         if (last_tracker_ms == 0U || current_ms < last_tracker_ms ||
             current_ms - last_tracker_ms >= policy->tracker_period_ms) {
-            if (radar_service_get_latest_frame(&workspace->latest_frame)) {
+            if ((has_frame || radar_service_get_latest_frame(&workspace->latest_frame)) &&
+                workspace->latest_frame.frame_seq != 0U &&
+                workspace->latest_frame.frame_seq != last_consumed_frame_sequence) {
                 radar_spatial_state_on_frame(s_context->spatial_state, &workspace->latest_frame,
                                              workspace->service_diagnostics.recovery.state ==
                                                  RADAR_UART_RECOVERY_VALID, current_ms);
+                last_consumed_frame_sequence = workspace->latest_frame.frame_seq;
             }
             radar_spatial_state_poll(s_context->spatial_state,
                                      workspace->service_diagnostics.recovery.state, current_ms);
@@ -303,20 +367,24 @@ esp_err_t radar_local_adapter_start(void)
     }
     radar_source_context_reset(s_context, now_ms());
     radar_rate_manager_init(&s_rate_manager, now_ms());
-    ret = radar_log_manager_start();
-    if (ret != ESP_OK) {
-        goto fail;
-    }
-
-    esp_err_t uart_start_result = radar_service_start();
+    const bool uart_enabled = ld2450_uart_is_enabled();
+    esp_err_t uart_start_result = uart_enabled ? radar_service_start() : ESP_ERR_NOT_SUPPORTED;
     portENTER_CRITICAL(&s_diagnostics_lock);
     s_diagnostics.uart_start_result = uart_start_result;
     portEXIT_CRITICAL(&s_diagnostics_lock);
-    if (uart_start_result != ESP_OK) {
+    if (!uart_enabled) {
+        ESP_LOGI(TAG,
+                 "RADAR_SOURCE_STATE event=uart_disabled_idle source_id=0 source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local sequence=%lu",
+                 (unsigned long)s_context->sequence);
+    } else if (uart_start_result != ESP_OK) {
         ESP_LOGW(TAG,
                  "RADAR_SOURCE_STATE event=uart_offline source_id=0 source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local sequence=%lu recovery=backoff ret=%d",
                  (unsigned long)s_context->sequence, (int)uart_start_result);
     } else {
+        ret = radar_log_manager_start();
+        if (ret != ESP_OK) {
+            goto fail;
+        }
         ESP_LOGI(TAG,
                  "RADAR_SOURCE_STATE event=uart_started source_id=0 source=S3_LOCAL device_id=sensair_s3_gateway_01 room=s3_local sequence=%lu",
                  (unsigned long)s_context->sequence);
@@ -463,7 +531,9 @@ bool radar_local_adapter_get_readonly_snapshot(radar_readonly_snapshot_t *out)
     out->occupancy_state = spatial.occupancy_state;
     out->motion_state = spatial.motion_state;
     out->count_summary = count_summary_from_spatial(&spatial);
-    for (size_t i = 0U; i < spatial.visible_track_count; ++i) {
+    const size_t visible_count = spatial.visible_track_count > RADAR_TRACKER_MAX_TRACKS
+        ? RADAR_TRACKER_MAX_TRACKS : spatial.visible_track_count;
+    for (size_t i = 0U; i < visible_count; ++i) {
         const radar_track_snapshot_t *track = &spatial.current_targets[i];
         out->tracks[out->track_count++] = (radar_readonly_track_t){
             .track_id = track->track_id,

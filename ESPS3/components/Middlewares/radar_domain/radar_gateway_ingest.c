@@ -386,7 +386,10 @@ static void build_output(radar_gateway_slot_t *slot)
     if (device_id != NULL) {
         strncpy(slot->output.device_id, device_id, sizeof(slot->output.device_id) - 1U);
     }
-    slot->output.radar_online = slot->last_sample.link_state == 5U;
+    const bool frame_fresh = snapshot.sensor_state == RADAR_SENSOR_VALID;
+    slot->output.radar_online = slot->last_sample.link_state == 5U && frame_fresh;
+    slot->output.radar_stale = slot->has_sample &&
+        slot->last_sample.link_state == 5U && !frame_fresh;
     slot->output.occupancy = snapshot.occupancy_state;
     slot->output.motion = snapshot.motion_state;
     slot->output.updated_at_ms = slot->last_received_ms;
@@ -658,6 +661,12 @@ radar_gateway_ingest_result_t radar_gateway_ingest_process_json(
 bool radar_gateway_ingest_get_output(uint8_t local_id, radar_gateway_output_t *out)
 {
     const size_t index = slot_index_for_local_id(local_id);
+    /* HTTP/debug readers must not retain an old online output when the
+     * scheduler has not yet reached its next ingest cadence. */
+    const uint64_t current_ms = now_ms();
+    if (current_ms != 0U) {
+        radar_gateway_ingest_poll(current_ms);
+    }
     if (out == NULL || index >= RADAR_GATEWAY_MAX_REMOTE_SOURCES ||
         !s_initialized || !gateway_lock()) return false;
     *out = s_slots[index].output;

@@ -58,6 +58,17 @@ void server_comm_http_set_voice_request_active(bool active);
 /** @brief 标记当前调用为 local_wake wake prompt GET；不代表新的 voice turn。 */
 void server_comm_http_set_wake_prompt_request_active(bool active);
 
+/**
+ * @brief Mark one current command ACK as voice control work.
+ *
+ * The admission remains limited to the registering task, generation, command id,
+ * and matching `/local/v1/commands/<id>/ack` endpoint. It is not a bypass for
+ * ordinary command ACKs while voice-exclusive work is active.
+ */
+void server_comm_http_set_voice_control_request_active(bool active,
+                                                       const char *command_id,
+                                                       uint32_t generation);
+
 /** @brief 由 app_runtime 设置语音独占 gate；普通 local_gateway_comm 请求会被安静跳过。 */
 void server_comm_http_set_non_voice_paused(bool paused);
 

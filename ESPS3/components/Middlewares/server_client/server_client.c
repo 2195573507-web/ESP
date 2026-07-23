@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "app_stack_monitor.h"
 #include "esp111_protocol_common.h"
@@ -28,9 +29,15 @@
 #include "freertos/task.h"
 #include "gateway_config.h"
 #include "gateway_wifi.h"
+#include "network_worker.h"
 #include "s3_scheduler.h"
 
 static const char *TAG = "server_client";
+
+#define SERVER_CLIENT_VOICE_CONTENT_TYPE_MAX 64U
+#define SERVER_CLIENT_VOICE_AUDIO_FORMAT_MAX 48U
+#define SERVER_CLIENT_VOICE_AUDIO_RATE_MAX 16U
+#define SERVER_CLIENT_VOICE_AUDIO_CHANNELS_MAX 8U
 
 #ifndef VOICE_TOTAL_TIMEOUT_MS
 #define VOICE_TOTAL_TIMEOUT_MS 90000U
@@ -50,7 +57,8 @@ enum {
     SERVER_CLIENT_HTTP_SLOT_VOICE_WAIT_MS = 5000,
     SERVER_CLIENT_HTTP_SLOT_BUSY_LOG_MS = 2000,
     SERVER_CLIENT_HTTP_DIAGNOSTIC_LOG_MS = 5000,
-    SERVER_CLIENT_HTTP_MAX_INFLIGHT = 3,
+    /* One transport at a time keeps TLS/lwIP allocation below the S3 internal/DMA reserve. */
+    SERVER_CLIENT_HTTP_MAX_INFLIGHT = 1,
     SERVER_CLIENT_CANCEL_POLL_MS = 100,
     SERVER_CLIENT_CANCEL_START_POLL_MS = 10,
     SERVER_CLIENT_CANCEL_START_WAIT_MS = SERVER_CLIENT_HTTP_CONNECT_TIMEOUT_MS,
@@ -65,9 +73,11 @@ static int64_t s_last_upload_incomplete_log_ms;
 static StaticSemaphore_t s_http_core_slot_storage;
 static StaticSemaphore_t s_http_telemetry_slot_storage;
 static StaticSemaphore_t s_http_snapshot_slot_storage;
+static StaticSemaphore_t s_http_connection_slot_storage;
 static SemaphoreHandle_t s_http_core_slot;
 static SemaphoreHandle_t s_http_telemetry_slot;
 static SemaphoreHandle_t s_http_snapshot_slot;
+static SemaphoreHandle_t s_http_connection_slot;
 static portMUX_TYPE s_http_scheduler_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_http_core_inflight;
 static uint32_t s_http_telemetry_inflight;
@@ -114,6 +124,261 @@ typedef struct {
     size_t body_len;
     bool overflow;
 } server_body_ctx_t;
+
+typedef struct {
+    char content_type[SERVER_CLIENT_VOICE_CONTENT_TYPE_MAX];
+    char audio_format[SERVER_CLIENT_VOICE_AUDIO_FORMAT_MAX];
+    char audio_sample_rate[SERVER_CLIENT_VOICE_AUDIO_RATE_MAX];
+    char audio_channels[SERVER_CLIENT_VOICE_AUDIO_CHANNELS_MAX];
+} server_client_voice_header_ctx_t;
+
+static int64_t now_ms(void);
+
+static size_t internal_free_bytes(void)
+{
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+/* Admission thresholds measured against the 108 KB -> 99 B DMA collapse. */
+#ifndef SERVER_CLIENT_MEM_CORE_INTERNAL_FREE
+#define SERVER_CLIENT_MEM_CORE_INTERNAL_FREE 12288U
+#endif
+#ifndef SERVER_CLIENT_MEM_CORE_INTERNAL_LARGEST
+#define SERVER_CLIENT_MEM_CORE_INTERNAL_LARGEST 6144U
+#endif
+#ifndef SERVER_CLIENT_MEM_CORE_DMA_FREE
+#define SERVER_CLIENT_MEM_CORE_DMA_FREE 8192U
+#endif
+#ifndef SERVER_CLIENT_MEM_CORE_DMA_LARGEST
+#define SERVER_CLIENT_MEM_CORE_DMA_LARGEST 4096U
+#endif
+
+#ifndef SERVER_CLIENT_MEM_TELEMETRY_INTERNAL_FREE
+#define SERVER_CLIENT_MEM_TELEMETRY_INTERNAL_FREE 20480U
+#endif
+#ifndef SERVER_CLIENT_MEM_TELEMETRY_INTERNAL_LARGEST
+#define SERVER_CLIENT_MEM_TELEMETRY_INTERNAL_LARGEST 10240U
+#endif
+#ifndef SERVER_CLIENT_MEM_TELEMETRY_DMA_FREE
+#define SERVER_CLIENT_MEM_TELEMETRY_DMA_FREE 16384U
+#endif
+#ifndef SERVER_CLIENT_MEM_TELEMETRY_DMA_LARGEST
+#define SERVER_CLIENT_MEM_TELEMETRY_DMA_LARGEST 8192U
+#endif
+
+#ifndef SERVER_CLIENT_MEM_BEST_EFFORT_INTERNAL_FREE
+#define SERVER_CLIENT_MEM_BEST_EFFORT_INTERNAL_FREE 28672U
+#endif
+#ifndef SERVER_CLIENT_MEM_BEST_EFFORT_INTERNAL_LARGEST
+#define SERVER_CLIENT_MEM_BEST_EFFORT_INTERNAL_LARGEST 12288U
+#endif
+#ifndef SERVER_CLIENT_MEM_BEST_EFFORT_DMA_FREE
+#define SERVER_CLIENT_MEM_BEST_EFFORT_DMA_FREE 24576U
+#endif
+#ifndef SERVER_CLIENT_MEM_BEST_EFFORT_DMA_LARGEST
+#define SERVER_CLIENT_MEM_BEST_EFFORT_DMA_LARGEST 12288U
+#endif
+
+#ifndef SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MS
+#define SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MS 2000U
+#endif
+#ifndef SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MAX_MS
+#define SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MAX_MS 15000U
+#endif
+#ifndef SERVER_CLIENT_MEM_ADMISSION_LOG_MS
+#define SERVER_CLIENT_MEM_ADMISSION_LOG_MS 2000U
+#endif
+
+static portMUX_TYPE s_http_mem_mux = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_http_mem_pressure_until_ms;
+static uint32_t s_http_mem_pressure_backoff_ms = SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MS;
+static int64_t s_last_http_mem_admission_log_ms;
+
+typedef struct {
+    size_t internal_free;
+    size_t internal_largest;
+    size_t dma_free;
+    size_t dma_largest;
+} server_client_mem_snapshot_t;
+
+static server_client_mem_snapshot_t capture_http_mem_snapshot(void)
+{
+    const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const uint32_t dma_caps = MALLOC_CAP_DMA;
+    return (server_client_mem_snapshot_t){
+        .internal_free = heap_caps_get_free_size(internal_caps),
+        .internal_largest = heap_caps_get_largest_free_block(internal_caps),
+        .dma_free = heap_caps_get_free_size(dma_caps),
+        .dma_largest = heap_caps_get_largest_free_block(dma_caps),
+    };
+}
+
+static const char *http_class_name(server_client_http_class_t http_class)
+{
+    switch (http_class) {
+    case SERVER_CLIENT_HTTP_CLASS_CORE:
+        return "core";
+    case SERVER_CLIENT_HTTP_CLASS_TELEMETRY:
+        return "telemetry";
+    case SERVER_CLIENT_HTTP_CLASS_BEST_EFFORT:
+        return "best_effort";
+    default:
+        return "unknown";
+    }
+}
+
+static void http_class_thresholds(server_client_http_class_t http_class,
+                                  size_t *internal_free,
+                                  size_t *internal_largest,
+                                  size_t *dma_free,
+                                  size_t *dma_largest)
+{
+    switch (http_class) {
+    case SERVER_CLIENT_HTTP_CLASS_CORE:
+        *internal_free = SERVER_CLIENT_MEM_CORE_INTERNAL_FREE;
+        *internal_largest = SERVER_CLIENT_MEM_CORE_INTERNAL_LARGEST;
+        *dma_free = SERVER_CLIENT_MEM_CORE_DMA_FREE;
+        *dma_largest = SERVER_CLIENT_MEM_CORE_DMA_LARGEST;
+        break;
+    case SERVER_CLIENT_HTTP_CLASS_TELEMETRY:
+        *internal_free = SERVER_CLIENT_MEM_TELEMETRY_INTERNAL_FREE;
+        *internal_largest = SERVER_CLIENT_MEM_TELEMETRY_INTERNAL_LARGEST;
+        *dma_free = SERVER_CLIENT_MEM_TELEMETRY_DMA_FREE;
+        *dma_largest = SERVER_CLIENT_MEM_TELEMETRY_DMA_LARGEST;
+        break;
+    case SERVER_CLIENT_HTTP_CLASS_BEST_EFFORT:
+    default:
+        *internal_free = SERVER_CLIENT_MEM_BEST_EFFORT_INTERNAL_FREE;
+        *internal_largest = SERVER_CLIENT_MEM_BEST_EFFORT_INTERNAL_LARGEST;
+        *dma_free = SERVER_CLIENT_MEM_BEST_EFFORT_DMA_FREE;
+        *dma_largest = SERVER_CLIENT_MEM_BEST_EFFORT_DMA_LARGEST;
+        break;
+    }
+}
+
+static void note_http_mem_pressure_locked(int64_t now)
+{
+    if (s_http_mem_pressure_backoff_ms < SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MS) {
+        s_http_mem_pressure_backoff_ms = SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MS;
+    }
+    s_http_mem_pressure_until_ms = now + (int64_t)s_http_mem_pressure_backoff_ms;
+    if (s_http_mem_pressure_backoff_ms < SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MAX_MS) {
+        const uint32_t next = s_http_mem_pressure_backoff_ms * 2U;
+        s_http_mem_pressure_backoff_ms =
+            next > SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MAX_MS ?
+                SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MAX_MS :
+                next;
+    }
+}
+
+static void clear_http_mem_pressure_locked(void)
+{
+    s_http_mem_pressure_until_ms = 0;
+    s_http_mem_pressure_backoff_ms = SERVER_CLIENT_MEM_PRESSURE_BACKOFF_MS;
+}
+
+static void log_http_mem_admission(const char *endpoint,
+                                   server_client_http_class_t http_class,
+                                   const server_client_mem_snapshot_t *snap,
+                                   const char *decision,
+                                   bool force)
+{
+    const int64_t now = now_ms();
+    if (!force &&
+        s_last_http_mem_admission_log_ms != 0 &&
+        now - s_last_http_mem_admission_log_ms < (int64_t)SERVER_CLIENT_MEM_ADMISSION_LOG_MS) {
+        return;
+    }
+    s_last_http_mem_admission_log_ms = now;
+    ESP_LOGW(TAG,
+             "HTTP_MEM_ADMISSION decision=%s class=%s endpoint=%s internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u backoff_ms=%lu",
+             decision != NULL ? decision : "-",
+             http_class_name(http_class),
+             endpoint != NULL ? endpoint : "-",
+             (unsigned int)snap->internal_free,
+             (unsigned int)snap->internal_largest,
+             (unsigned int)snap->dma_free,
+             (unsigned int)snap->dma_largest,
+             (unsigned long)s_http_mem_pressure_backoff_ms);
+    app_s3_mem_log(TAG, "http_mem_admission");
+}
+
+esp_err_t server_client_http_mem_admission(server_client_http_class_t http_class,
+                                           const char *endpoint)
+{
+    const int64_t now = now_ms();
+    const server_client_mem_snapshot_t snap = capture_http_mem_snapshot();
+    size_t need_internal_free = 0U;
+    size_t need_internal_largest = 0U;
+    size_t need_dma_free = 0U;
+    size_t need_dma_largest = 0U;
+    http_class_thresholds(http_class,
+                          &need_internal_free,
+                          &need_internal_largest,
+                          &need_dma_free,
+                          &need_dma_largest);
+
+    portENTER_CRITICAL(&s_http_mem_mux);
+    const bool under_backoff = s_http_mem_pressure_until_ms != 0 &&
+                               now < s_http_mem_pressure_until_ms;
+    const bool heap_ok = snap.internal_free >= need_internal_free &&
+                         snap.internal_largest >= need_internal_largest &&
+                         snap.dma_free >= need_dma_free &&
+                         snap.dma_largest >= need_dma_largest;
+    if (!heap_ok) {
+        if (!under_backoff) {
+            note_http_mem_pressure_locked(now);
+        }
+        portEXIT_CRITICAL(&s_http_mem_mux);
+        log_http_mem_admission(endpoint, http_class, &snap, "defer_low_heap", false);
+        return ESP_ERR_HTTP_EAGAIN;
+    }
+    if (under_backoff && http_class == SERVER_CLIENT_HTTP_CLASS_BEST_EFFORT) {
+        portEXIT_CRITICAL(&s_http_mem_mux);
+        log_http_mem_admission(endpoint, http_class, &snap, "defer_backoff", false);
+        return ESP_ERR_HTTP_EAGAIN;
+    }
+    if (heap_ok && !under_backoff) {
+        clear_http_mem_pressure_locked();
+    }
+    portEXIT_CRITICAL(&s_http_mem_mux);
+    return ESP_OK;
+}
+
+bool server_client_http_best_effort_should_defer(void)
+{
+    return server_client_http_mem_admission(SERVER_CLIENT_HTTP_CLASS_BEST_EFFORT,
+                                           "best_effort_gate") != ESP_OK;
+}
+
+uint32_t server_client_http_mem_backoff_remaining_ms(server_client_http_class_t http_class)
+{
+    if (http_class != SERVER_CLIENT_HTTP_CLASS_BEST_EFFORT) {
+        return 0U;
+    }
+    const int64_t now = now_ms();
+    uint32_t remaining = 0U;
+    portENTER_CRITICAL(&s_http_mem_mux);
+    if (s_http_mem_pressure_until_ms > now) {
+        const int64_t delta = s_http_mem_pressure_until_ms - now;
+        remaining = delta > UINT32_MAX ? UINT32_MAX : (uint32_t)delta;
+    }
+    portEXIT_CRITICAL(&s_http_mem_mux);
+    return remaining;
+}
+
+static void log_http_mem_delta(const char *endpoint, size_t before)
+{
+    const size_t after = internal_free_bytes();
+    const int delta = after >= before ? (int)(after - before) : -(int)(before - after);
+    ESP_LOGI(TAG,
+             "HTTP_MEM_DELTA endpoint=%s before=%u after=%u delta=%d",
+             endpoint != NULL ? endpoint : "-",
+             (unsigned int)before,
+             (unsigned int)after,
+             delta);
+    app_s3_mem_log(TAG, "http_request_end");
+}
 
 typedef enum {
     SERVER_CLIENT_HTTP_CHANNEL_HIGH = 0,
@@ -185,6 +450,19 @@ static SemaphoreHandle_t http_channel_slot_handle(server_client_http_channel_t c
         portEXIT_CRITICAL(&s_http_scheduler_mux);
     }
     return *slot;
+}
+
+static SemaphoreHandle_t http_connection_slot_handle(void)
+{
+    if (s_http_connection_slot == NULL) {
+        portENTER_CRITICAL(&s_http_scheduler_mux);
+        if (s_http_connection_slot == NULL) {
+            s_http_connection_slot =
+                xSemaphoreCreateMutexStatic(&s_http_connection_slot_storage);
+        }
+        portEXIT_CRITICAL(&s_http_scheduler_mux);
+    }
+    return s_http_connection_slot;
 }
 
 static uint32_t next_request_sequence(void)
@@ -313,6 +591,19 @@ static esp_err_t take_http_channel_slot(server_client_http_channel_t channel,
     }
 
     if (xSemaphoreTake(slot, 0) == pdTRUE) {
+        SemaphoreHandle_t connection_slot = http_connection_slot_handle();
+        if (connection_slot == NULL ||
+            xSemaphoreTake(connection_slot, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+            xSemaphoreGive(slot);
+            portENTER_CRITICAL(&s_http_scheduler_mux);
+            ++s_http_slot_busy_count;
+            portEXIT_CRITICAL(&s_http_scheduler_mux);
+            ESP_LOGI(TAG,
+                     "HTTP_REQUEST_DEFER endpoint=%s class=%s reason=connection_permit_busy",
+                     endpoint != NULL ? endpoint : "-",
+                     http_channel_name(channel));
+            return channel == SERVER_CLIENT_HTTP_CHANNEL_LOW ? ESP_ERR_HTTP_EAGAIN : ESP_ERR_TIMEOUT;
+        }
         portENTER_CRITICAL(&s_http_scheduler_mux);
         s_last_http_queue_wait_ms = now_ms() - wait_started_ms;
         portEXIT_CRITICAL(&s_http_scheduler_mux);
@@ -357,6 +648,16 @@ static esp_err_t take_http_channel_slot(server_client_http_channel_t channel,
     }
     portEXIT_CRITICAL(&s_http_scheduler_mux);
     if (acquired == pdTRUE) {
+        SemaphoreHandle_t connection_slot = http_connection_slot_handle();
+        if (connection_slot == NULL ||
+            xSemaphoreTake(connection_slot, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+            xSemaphoreGive(slot);
+            ESP_LOGI(TAG,
+                     "HTTP_REQUEST_DEFER endpoint=%s class=%s reason=connection_permit_busy",
+                     endpoint != NULL ? endpoint : "-",
+                     http_channel_name(channel));
+            return channel == SERVER_CLIENT_HTTP_CHANNEL_LOW ? ESP_ERR_HTTP_EAGAIN : ESP_ERR_TIMEOUT;
+        }
         portENTER_CRITICAL(&s_http_scheduler_mux);
         s_last_http_queue_wait_ms = now_ms() - wait_started_ms;
         portEXIT_CRITICAL(&s_http_scheduler_mux);
@@ -399,6 +700,10 @@ static void give_http_channel_slot(server_client_http_channel_t channel,
     if (slot != NULL) {
         const int64_t latency_ms = request_started_ms > 0 ? now_ms() - request_started_ms : 0;
         const uint32_t active_count = mark_http_channel_released(channel, latency_ms);
+        SemaphoreHandle_t connection_slot = http_connection_slot_handle();
+        if (connection_slot != NULL) {
+            xSemaphoreGive(connection_slot);
+        }
         xSemaphoreGive(slot);
         ESP_LOGI(TAG,
                  "HTTP_RESOURCE_RELEASE request_type=%s duration_ms=%lld result=%s active_count=%lu",
@@ -406,6 +711,11 @@ static void give_http_channel_slot(server_client_http_channel_t channel,
                  (long long)latency_ms,
                  esp_err_to_name(result),
                  (unsigned long)active_count);
+        ESP_LOGI(TAG,
+                 "HTTP_REQUEST_COMPLETE endpoint=%s result=%s duration_ms=%lld",
+                 request_type != NULL ? request_type : "-",
+                 esp_err_to_name(result),
+                 (long long)latency_ms);
         log_http_scheduler_diagnostics("request_complete", NULL, channel, false);
     }
 }
@@ -844,6 +1154,7 @@ static esp_err_t perform_json_once(esp_http_client_method_t method,
                                    int *http_status,
                                    bool *slot_busy,
                                    server_client_http_channel_t channel,
+                                   server_client_http_class_t http_class,
                                    const server_client_request_scope_t *scope,
                                    server_client_cancel_cb_t cancel_cb,
                                    void *cancel_ctx)
@@ -878,6 +1189,14 @@ static esp_err_t perform_json_once(esp_http_client_method_t method,
     };
 
     const bool snapshot_request = channel == SERVER_CLIENT_HTTP_CHANNEL_LOW;
+    ret = server_client_http_mem_admission(http_class, endpoint);
+    if (ret != ESP_OK) {
+        if (slot_busy != NULL) {
+            *slot_busy = true;
+        }
+        return ret;
+    }
+
     const uint32_t slot_wait_ms = !snapshot_request ?
                                       SERVER_CLIENT_HTTP_SLOT_WAIT_MS :
                                       0U;
@@ -890,6 +1209,9 @@ static esp_err_t perform_json_once(esp_http_client_method_t method,
         return ret;
     }
 
+    const size_t internal_before = internal_free_bytes();
+    app_s3_mem_log(TAG, "http_request_begin");
+
     esp_http_client_config_t config = {
         .url = url,
         .method = method,
@@ -901,6 +1223,7 @@ static esp_err_t perform_json_once(esp_http_client_method_t method,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
+        log_http_mem_delta(endpoint, internal_before);
         give_http_channel_slot(channel, 0, endpoint, ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
     }
@@ -997,6 +1320,7 @@ static esp_err_t perform_json_once(esp_http_client_method_t method,
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    log_http_mem_delta(endpoint, internal_before);
     give_http_channel_slot(channel, request_started_ms, endpoint, ret);
     return ret;
 }
@@ -1033,6 +1357,7 @@ static esp_err_t perform_json_with_cancel(esp_http_client_method_t method,
                                           size_t response_body_size,
                                           int *http_status,
                                           server_client_http_channel_t channel,
+                                          server_client_http_class_t http_class,
                                           const char *device_id,
                                           server_client_cancel_cb_t cancel_cb,
                                           void *cancel_ctx)
@@ -1078,6 +1403,7 @@ static esp_err_t perform_json_with_cancel(esp_http_client_method_t method,
                                 &status,
                                 NULL,
                                 channel,
+                                http_class,
                                 scope_ptr,
                                 cancel_cb,
                                 cancel_ctx);
@@ -1091,12 +1417,16 @@ static esp_err_t perform_json_with_cancel(esp_http_client_method_t method,
             ret = ESP_ERR_INVALID_STATE;
             break;
         }
-        if (ret == ESP_ERR_INVALID_STATE) {
+        if (ret == ESP_ERR_INVALID_STATE || ret == ESP_ERR_NO_MEM) {
+            break;
+        }
+        /* Memory-pressure deferral must not form a fast retry storm. */
+        if (ret == ESP_ERR_HTTP_EAGAIN) {
             break;
         }
 
         if (status >= 500 || ret == ESP_ERR_TIMEOUT || ret == ESP_ERR_HTTP_CONNECT ||
-            ret == ESP_ERR_HTTP_CONNECTION_CLOSED || ret == ESP_ERR_HTTP_EAGAIN) {
+            ret == ESP_ERR_HTTP_CONNECTION_CLOSED) {
             if (attempt < retry_count) {
                 ESP_LOGW(TAG,
                          "server request retry endpoint=%s attempt=%u next_backoff_ms=%u status=%d ret=%s",
@@ -1136,6 +1466,7 @@ static esp_err_t perform_json(esp_http_client_method_t method,
                                     response_body_size,
                                     http_status,
                                     SERVER_CLIENT_HTTP_CHANNEL_HIGH,
+                                    SERVER_CLIENT_HTTP_CLASS_CORE,
                                     NULL,
                                     NULL,
                                     NULL);
@@ -1157,10 +1488,14 @@ static esp_err_t perform_telemetry_json(esp_http_client_method_t method,
                                       http_status,
                                       &slot_busy,
                                       SERVER_CLIENT_HTTP_CHANNEL_MEDIUM,
+                                      SERVER_CLIENT_HTTP_CLASS_TELEMETRY,
                                       NULL,
                                       NULL,
                                       NULL);
-    return slot_busy ? ESP_ERR_NOT_FINISHED : ret;
+    if (slot_busy || ret == ESP_ERR_HTTP_EAGAIN) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    return ret;
 }
 
 static esp_err_t perform_snapshot_json(esp_http_client_method_t method,
@@ -1182,9 +1517,13 @@ static esp_err_t perform_snapshot_json(esp_http_client_method_t method,
                                       http_status,
                                       &slot_busy,
                                       SERVER_CLIENT_HTTP_CHANNEL_LOW,
+                                      SERVER_CLIENT_HTTP_CLASS_BEST_EFFORT,
                                       NULL,
                                       NULL,
                                       NULL);
+    if (slot_busy && ret == ESP_OK) {
+        ret = ESP_ERR_HTTP_EAGAIN;
+    }
     return ret;
 }
 
@@ -1218,6 +1557,7 @@ esp_err_t server_client_post_ingest_json_cancellable(const char *json_body,
                                     response_body_size,
                                     http_status,
                                     SERVER_CLIENT_HTTP_CHANNEL_MEDIUM,
+                                    SERVER_CLIENT_HTTP_CLASS_TELEMETRY,
                                     NULL,
                                     cancel_cb,
                                     cancel_ctx);
@@ -1242,6 +1582,7 @@ esp_err_t server_client_post_ingest_json_cancellable_for_device(
                                     response_body_size,
                                     http_status,
                                     SERVER_CLIENT_HTTP_CHANNEL_MEDIUM,
+                                    SERVER_CLIENT_HTTP_CLASS_TELEMETRY,
                                     device_id,
                                     cancel_cb,
                                     cancel_ctx);
@@ -1423,7 +1764,13 @@ esp_err_t server_client_probe_available(int *http_status)
         .timeout_ms = SERVER_CLIENT_PROBE_TIMEOUT_MS,
         .keep_alive_enable = false,
     };
-    ret = take_http_channel_slot(SERVER_CLIENT_HTTP_CHANNEL_HIGH,
+    ret = server_client_http_mem_admission(SERVER_CLIENT_HTTP_CLASS_BEST_EFFORT,
+                                           SERVER_CLIENT_PROBE_ENDPOINT);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = take_http_channel_slot(SERVER_CLIENT_HTTP_CHANNEL_LOW,
                                  SERVER_CLIENT_PROBE_ENDPOINT,
                                  "probe",
                                  0U);
@@ -1431,9 +1778,13 @@ esp_err_t server_client_probe_available(int *http_status)
         return ret == ESP_ERR_TIMEOUT ? ESP_ERR_NOT_FINISHED : ret;
     }
 
+    const size_t internal_before = internal_free_bytes();
+    app_s3_mem_log(TAG, "http_request_begin");
+
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
-        give_http_channel_slot(SERVER_CLIENT_HTTP_CHANNEL_HIGH,
+        log_http_mem_delta(SERVER_CLIENT_PROBE_ENDPOINT, internal_before);
+        give_http_channel_slot(SERVER_CLIENT_HTTP_CHANNEL_LOW,
                                0,
                                SERVER_CLIENT_PROBE_ENDPOINT,
                                ESP_ERR_NO_MEM);
@@ -1497,7 +1848,8 @@ esp_err_t server_client_probe_available(int *http_status)
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    give_http_channel_slot(SERVER_CLIENT_HTTP_CHANNEL_HIGH,
+    log_http_mem_delta(SERVER_CLIENT_PROBE_ENDPOINT, internal_before);
+    give_http_channel_slot(SERVER_CLIENT_HTTP_CHANNEL_LOW,
                            request_started_ms,
                            SERVER_CLIENT_PROBE_ENDPOINT,
                            ret);
@@ -1594,6 +1946,7 @@ esp_err_t server_client_get_pending_commands_cancellable(const char *device_id,
                                     response_body_size,
                                     http_status,
                                     SERVER_CLIENT_HTTP_CHANNEL_HIGH,
+                                    SERVER_CLIENT_HTTP_CLASS_CORE,
                                     device_id,
                                     cancel_cb,
                                     cancel_ctx);
@@ -1638,6 +1991,42 @@ static server_client_voice_eof_state_t response_eof_state(esp_http_client_handle
                                          total_read,
                                          transport_complete,
                                          zero_read);
+}
+
+static void copy_voice_response_header(char *out,
+                                       size_t out_size,
+                                       const char *value)
+{
+    if (out != NULL && out_size > 0U) {
+        strlcpy(out, value != NULL ? value : "", out_size);
+    }
+}
+
+static esp_err_t voice_response_header_event(esp_http_client_event_t *event)
+{
+    if (event == NULL || event->event_id != HTTP_EVENT_ON_HEADER || event->user_data == NULL ||
+        event->header_key == NULL || event->header_value == NULL) {
+        return ESP_OK;
+    }
+
+    server_client_voice_header_ctx_t *ctx =
+        (server_client_voice_header_ctx_t *)event->user_data;
+    if (strcasecmp(event->header_key, "Content-Type") == 0) {
+        copy_voice_response_header(ctx->content_type, sizeof(ctx->content_type), event->header_value);
+    } else if (strcasecmp(event->header_key, "X-Audio-Format") == 0) {
+        copy_voice_response_header(ctx->audio_format, sizeof(ctx->audio_format), event->header_value);
+    } else if (strcasecmp(event->header_key, "X-Audio-Sample-Rate") == 0 ||
+               strcasecmp(event->header_key, "X-Sample-Rate") == 0) {
+        copy_voice_response_header(ctx->audio_sample_rate,
+                                   sizeof(ctx->audio_sample_rate),
+                                   event->header_value);
+    } else if (strcasecmp(event->header_key, "X-Audio-Channels") == 0 ||
+               strcasecmp(event->header_key, "X-Channels") == 0) {
+        copy_voice_response_header(ctx->audio_channels,
+                                   sizeof(ctx->audio_channels),
+                                   event->header_value);
+    }
+    return ESP_OK;
 }
 
 static esp_err_t read_voice_response(esp_http_client_handle_t client,
@@ -1826,6 +2215,21 @@ esp_err_t server_client_post_voice_turn(const char *device_id,
                  (unsigned int)pcm_len);
         return ESP_ERR_INVALID_STATE;
     }
+    if (!network_worker_is_server_ready()) {
+        /* Keep local C5 capture independent of Server health, but attribute a
+         * debounced Server outage distinctly from a lost S3 STA/link. */
+        if (http_status != NULL) {
+            *http_status = 503;
+        }
+        if (response_content_length != NULL) {
+            *response_content_length = -1;
+        }
+        ESP_LOGW(TAG,
+                 "voice upstream unavailable reason=server_unavailable server_ready=0 endpoint=%s upload_pcm_bytes=%u",
+                 ESP111_PROTOCOL_SERVER_ROUTE_VOICE_TURN,
+                 (unsigned int)pcm_len);
+        return ESP_ERR_INVALID_STATE;
+    }
     if (response_content_length != NULL) {
         *response_content_length = -1;
     }
@@ -1839,6 +2243,7 @@ esp_err_t server_client_post_voice_turn(const char *device_id,
         return ret;
     }
 
+    server_client_voice_header_ctx_t response_headers = {0};
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_POST,
@@ -1846,6 +2251,8 @@ esp_err_t server_client_post_voice_turn(const char *device_id,
         .buffer_size = 1024,
         .buffer_size_tx = 512,
         .keep_alive_enable = false,
+        .event_handler = voice_response_header_event,
+        .user_data = &response_headers,
     };
     ret = take_http_channel_slot(SERVER_CLIENT_HTTP_CHANNEL_HIGH,
                                  ESP111_PROTOCOL_SERVER_ROUTE_VOICE_TURN,
@@ -1966,12 +2373,38 @@ esp_err_t server_client_post_voice_turn(const char *device_id,
             if (response_content_length != NULL) {
                 *response_content_length = content_length;
             }
-            if (on_meta != NULL) {
-                on_meta(content_length, meta_ctx);
-            }
             int64_t response_received_ms = now_ms();
             status = esp_http_client_get_status_code(client);
+            if (http_status != NULL) {
+                *http_status = status;
+            }
+            const server_client_voice_response_meta_t meta = {
+                .content_length = content_length,
+                .http_status = status,
+                .chunked = chunked,
+                .content_type = response_headers.content_type,
+                .audio_format = response_headers.audio_format,
+                .audio_sample_rate = response_headers.audio_sample_rate,
+                .audio_channels = response_headers.audio_channels,
+            };
+            if (on_meta != NULL && status >= 200 && status < 300) {
+                ret = on_meta(&meta, meta_ctx);
+                if (ret != ESP_OK) {
+                    stage = "validate_response_metadata";
+                }
+            }
             ESP_LOGI(TAG,
+                     "SERVER_RESPONSE_HEADERS endpoint=%s status=%d content_type=%s audio_format=%s sample_rate=%s channels=%s content_length=%lld chunked=%d elapsed_ms=%lld",
+                     ESP111_PROTOCOL_SERVER_ROUTE_VOICE_TURN,
+                     status,
+                     meta.content_type[0] != '\0' ? meta.content_type : "-",
+                     meta.audio_format[0] != '\0' ? meta.audio_format : "-",
+                     meta.audio_sample_rate[0] != '\0' ? meta.audio_sample_rate : "-",
+                     meta.audio_channels[0] != '\0' ? meta.audio_channels : "-",
+                     (long long)content_length,
+                     chunked ? 1 : 0,
+                     (long long)(response_received_ms - request_start_ms));
+            ESP_LOGD(TAG,
                      "response received timestamp=%lld endpoint=%s status=%d content_length=%lld chunked=%d elapsed_ms=%lld",
                      (long long)response_received_ms,
                      ESP111_PROTOCOL_SERVER_ROUTE_VOICE_TURN,

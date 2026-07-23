@@ -39,7 +39,7 @@
 #define APP_VOICE_VAD_SPEECH_START_RMS              1800 // 起始 RMS 阈值，降低正常说话音量触发门槛。
 #define APP_VOICE_VAD_SPEECH_START_PEAK             4500 // 起始 peak 阈值，保留峰值过滤以减少环境噪声误触发。
 #define APP_VOICE_VAD_SPEECH_END_RMS                850  // 低于该 RMS 累计静音，认为接近说话结束。
-#define APP_VOICE_VAD_START_FRAMES                  4    // 连续 4 帧达到起始阈值才触发 VOICE_START。
+#define APP_VOICE_VAD_START_FRAMES                  2    // 200 ms 窗口下 400 ms 起始确认，落在 500 ms pre-roll 覆盖范围内。
 #define APP_VOICE_VAD_START_COOLDOWN_MS             1200 // local voice done 后 VAD 起始冷却，防止刚恢复就再次触发。
 #define APP_VOICE_VAD_SILENCE_END_MS                1500 // 静音累计 1500 ms 后结束本轮音频。
 #define APP_VOICE_VAD_MIN_RECORD_MS                 800  // 防止过短语音误触发结束。

@@ -5,6 +5,7 @@
 
 #include "cJSON.h"
 #include "app_stack_monitor.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -18,6 +19,13 @@
 
 static const char *TAG = "habit_event_reporter";
 static TaskHandle_t s_task;
+typedef struct {
+    char json[768];
+    char response[SERVER_CLIENT_SMALL_BODY_BYTES];
+} habit_event_reporter_workspace_t;
+
+/* Kept outside the 3 KiB reporter stack for the task's full lifetime. */
+static habit_event_reporter_workspace_t *s_workspace;
 static habit_event_t s_pending;
 static bool s_has_pending;
 static uint32_t s_retry_count;
@@ -63,9 +71,13 @@ static esp_err_t serialize_event(const habit_event_t *event, char *out, size_t o
 
 static void habit_event_reporter_task(void *arg)
 {
-    (void)arg;
-    char json[768];
-    char response[SERVER_CLIENT_SMALL_BODY_BYTES];
+    habit_event_reporter_workspace_t *workspace = (habit_event_reporter_workspace_t *)arg;
+    if (workspace == NULL) {
+        ESP_LOGE(TAG, "habit event reporter workspace unavailable");
+        s_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
     for (;;) {
         if (!s_has_pending) {
             s_has_pending = habit_rule_engine_runtime_pop_event(&s_pending);
@@ -76,9 +88,14 @@ static void habit_event_reporter_task(void *arg)
         }
         if (s_has_pending && now_ms() >= s_next_attempt_ms) {
             int http_status = 0;
-            const esp_err_t json_ret = serialize_event(&s_pending, json, sizeof(json));
+            const esp_err_t json_ret = serialize_event(&s_pending,
+                                                       workspace->json,
+                                                       sizeof(workspace->json));
             const esp_err_t ret = json_ret == ESP_OK
-                ? server_client_post_habit_event_json(json, response, sizeof(response), &http_status)
+                ? server_client_post_habit_event_json(workspace->json,
+                                                      workspace->response,
+                                                      sizeof(workspace->response),
+                                                      &http_status)
                 : json_ret;
             if (ret == ESP_OK && http_status >= 200 && http_status < 300) {
                 ++s_stats.sent_events;
@@ -104,14 +121,24 @@ static void habit_event_reporter_task(void *arg)
 esp_err_t habit_event_reporter_start(void)
 {
     if (s_task != NULL) return ESP_OK;
+    if (s_workspace == NULL) {
+        s_workspace = heap_caps_calloc(1U,
+                                       sizeof(*s_workspace),
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_workspace == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     if (xTaskCreateWithCaps(habit_event_reporter_task,
                             "habit_event_reporter",
                             HABIT_EVENT_REPORTER_STACK,
-                            NULL,
+                            s_workspace,
                             HABIT_EVENT_REPORTER_PRIORITY,
                             &s_task,
-                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+                            APP_TASK_STACK_CAPS_PSRAM) != pdPASS) {
         s_task = NULL;
+        heap_caps_free(s_workspace);
+        s_workspace = NULL;
         return ESP_ERR_NO_MEM;
     }
     app_stack_monitor_log_task_created(TAG,

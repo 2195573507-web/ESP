@@ -104,6 +104,10 @@ static const char *safe_diagnostic_text(const char *value)
 #define S3_SCHEDULER_HEARTBEAT_LOG_MS 30000U
 #endif
 
+#ifndef S3_SCHEDULER_MEMORY_DIAGNOSTICS
+#define S3_SCHEDULER_MEMORY_DIAGNOSTICS 0
+#endif
+
 #ifndef S3_SCHEDULER_WEATHER_REFRESH_INTERVAL_MS
 #define S3_SCHEDULER_WEATHER_REFRESH_INTERVAL_MS (20U * 60U * 1000U)
 #endif
@@ -179,6 +183,38 @@ static int64_t s_last_stream_stack_monitor_ms;
 static int64_t s_last_stream_heap_monitor_ms;
 static int64_t s_last_dispatch_warning_ms;
 static bool s_pending_command_pull;
+
+static void log_memory_trace(const char *phase,
+                             const s3_scheduler_event_t *event,
+                             const s3_runtime_ingress_t *ingress)
+{
+#if S3_SCHEDULER_MEMORY_DIAGNOSTICS
+    const s3_event_bus_stats_t stats = s3_event_bus_get_stats();
+    const void *body = ingress != NULL ? ingress->body : NULL;
+    const size_t body_len = ingress != NULL ? ingress->body_len : 0U;
+    ESP_LOGI(TAG,
+             "S3_MEM_TRACE phase=%s event=%p ingress=%p body=%p body_size=%u body_region=%s "
+             "internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u "
+             "psram_free=%u psram_largest=%u event_bus_depth=%u",
+             phase != NULL ? phase : "-",
+             (const void *)event,
+             (const void *)ingress,
+             body,
+             (unsigned int)body_len,
+             body == NULL ? "none" : (esp_ptr_external_ram(body) ? "psram" : "internal"),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned int)stats.queue_depth);
+#else
+    (void)phase;
+    (void)event;
+    (void)ingress;
+#endif
+}
 
 static s3_scheduler_event_t *event_alloc(s3_scheduler_event_type_t type,
                                          s3_scheduler_priority_t priority);
@@ -790,59 +826,62 @@ static esp_err_t parse_ingress_envelope(const s3_runtime_ingress_t *ingress,
     return ret;
 }
 
-static esp_err_t handle_status_ingress(const s3_runtime_ingress_t *ingress)
+static esp_err_t handle_status_ingress(const s3_runtime_ingress_t *ingress,
+                                       protocol_adapter_envelope_t *parsed_envelope)
 {
     protocol_adapter_envelope_t envelope = {0};
-    esp_err_t ret = parse_ingress_envelope(ingress, &envelope);
+    protocol_adapter_envelope_t *active = parsed_envelope != NULL ? parsed_envelope : &envelope;
+    const bool release_active = parsed_envelope == NULL;
+    esp_err_t ret = release_active ? parse_ingress_envelope(ingress, active) : ESP_OK;
     if (ret != ESP_OK) {
         return ret;
     }
 
     /* resource_manager rejects stale ingress, then records retained identity before restore. */
-    protocol_adapter_message_kind_t kind = protocol_adapter_message_kind(envelope.message_type);
+    protocol_adapter_message_kind_t kind = protocol_adapter_message_kind(active->message_type);
     if (kind == PROTOCOL_ADAPTER_MESSAGE_REGISTER) {
-        ret = confirm_peer_network_identity(envelope.device_id,
+        ret = confirm_peer_network_identity(active->device_id,
                                             ingress->peer_ip,
                                             RESOURCE_MANAGER_SIGNAL_REGISTER,
                                             ingress->rx_time_us > 0 ?
                                                 ingress->rx_time_us :
                                                 ingress->rx_time_ms * 1000);
         if (ret == ESP_OK) {
-            char *capabilities = capabilities_to_string(&envelope);
-            ret = child_registry_register_or_update(envelope.device_id,
-                                                    envelope.room_id,
-                                                    envelope.alias,
+            char *capabilities = capabilities_to_string(active);
+            ret = child_registry_register_or_update(active->device_id,
+                                                    active->room_id,
+                                                    active->alias,
                                                     capabilities,
-                                                    envelope.seq);
+                                                    active->seq);
             cJSON_free(capabilities);
             if (ret == ESP_OK) {
-                device_stream_gateway_reset_timestamp_baseline(envelope.device_id,
+                device_stream_gateway_reset_timestamp_baseline(active->device_id,
                                                                "child_registered_online");
             } else {
-                (void)resource_manager_release_peer_at_us(envelope.device_id,
+                (void)resource_manager_release_peer_at_us(active->device_id,
                                                           esp_timer_get_time(),
                                                           "register_update_failed");
             }
         }
     } else if (kind == PROTOCOL_ADAPTER_MESSAGE_HEARTBEAT) {
-        ret = confirm_peer_network_identity(envelope.device_id,
+        ret = confirm_peer_network_identity(active->device_id,
                                             ingress->peer_ip,
                                             RESOURCE_MANAGER_SIGNAL_HEARTBEAT,
                                             ingress->rx_time_us > 0 ?
                                                 ingress->rx_time_us :
                                                 ingress->rx_time_ms * 1000);
         if (ret == ESP_OK) {
-            ret = child_registry_touch(envelope.device_id, envelope.seq);
+            ret = child_registry_touch(active->device_id, active->seq);
         }
     } else if (kind == PROTOCOL_ADAPTER_MESSAGE_STATUS) {
-        ret = confirm_peer_network_identity(envelope.device_id,
+        ret = confirm_peer_network_identity(active->device_id,
                                             ingress->peer_ip,
                                             RESOURCE_MANAGER_SIGNAL_STATUS,
                                             ingress->rx_time_us > 0 ?
                                                 ingress->rx_time_us :
                                                 ingress->rx_time_ms * 1000);
         if (ret == ESP_OK) {
-            ret = child_registry_note_activity(envelope.device_id, envelope.seq);
+            ret = child_registry_note_activity(active->device_id, active->seq);
         }
     } else {
         ret = ESP_ERR_NOT_SUPPORTED;
@@ -850,39 +889,48 @@ static esp_err_t handle_status_ingress(const s3_runtime_ingress_t *ingress)
 
     if (ret == ESP_OK) {
         sensor_aggregator_result_t result = {0};
-        ret = sensor_aggregator_handle_envelope(&envelope, &result);
+        ret = sensor_aggregator_handle_envelope(active, &result);
     }
 
-    protocol_adapter_release_envelope(&envelope);
+    if (release_active) {
+        protocol_adapter_release_envelope(active);
+    }
     return ret;
 }
 
-static esp_err_t handle_sensor_ingress(const s3_runtime_ingress_t *ingress)
+static esp_err_t handle_sensor_ingress(const s3_runtime_ingress_t *ingress,
+                                       protocol_adapter_envelope_t *parsed_envelope)
 {
     protocol_adapter_envelope_t envelope = {0};
-    esp_err_t ret = parse_ingress_envelope(ingress, &envelope);
+    protocol_adapter_envelope_t *active = parsed_envelope != NULL ? parsed_envelope : &envelope;
+    const bool release_active = parsed_envelope == NULL;
+    esp_err_t ret = release_active ? parse_ingress_envelope(ingress, active) : ESP_OK;
     if (ret != ESP_OK) {
         return ret;
     }
-    if (protocol_adapter_message_kind(envelope.message_type) !=
+    if (protocol_adapter_message_kind(active->message_type) !=
         PROTOCOL_ADAPTER_MESSAGE_SENSOR_BME690) {
-        protocol_adapter_release_envelope(&envelope);
+        if (release_active) {
+            protocol_adapter_release_envelope(active);
+        }
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    ret = confirm_peer_network_identity(envelope.device_id,
+    ret = confirm_peer_network_identity(active->device_id,
                                         ingress->peer_ip,
                                         RESOURCE_MANAGER_SIGNAL_SENSOR,
                                         ingress->rx_time_us > 0 ?
                                             ingress->rx_time_us :
                                             ingress->rx_time_ms * 1000);
     if (ret == ESP_OK) {
-        (void)child_registry_touch(envelope.device_id, envelope.seq);
+        (void)child_registry_touch(active->device_id, active->seq);
         sensor_aggregator_result_t result = {0};
-        ret = sensor_aggregator_handle_envelope(&envelope, &result);
+        ret = sensor_aggregator_handle_envelope(active, &result);
     }
 
-    protocol_adapter_release_envelope(&envelope);
+    if (release_active) {
+        protocol_adapter_release_envelope(active);
+    }
     return ret;
 }
 
@@ -914,24 +962,26 @@ static void process_ingress(s3_runtime_ingress_t *ingress)
         return;
     }
 
-    /* 先填一份 best-effort 摘要用于失败日志；解析成 envelope 后再用 canonical 字段覆盖。 */
-    fill_unified_from_raw_body(ingress);
-
     protocol_adapter_envelope_t envelope = {0};
-    if ((ingress->kind == S3_RUNTIME_MSG_STATUS ||
-         ingress->kind == S3_RUNTIME_MSG_SENSOR) &&
-        parse_ingress_envelope(ingress, &envelope) == ESP_OK) {
+    bool envelope_valid = false;
+    if (ingress->kind == S3_RUNTIME_MSG_STATUS ||
+        ingress->kind == S3_RUNTIME_MSG_SENSOR) {
+        envelope_valid = parse_ingress_envelope(ingress, &envelope) == ESP_OK;
+    }
+    if (envelope_valid) {
         fill_unified_from_envelope(ingress, &envelope);
-        protocol_adapter_release_envelope(&envelope);
+    } else {
+        /* 失败日志仍保留轻量摘要；成功路径只解析一次 cJSON envelope。 */
+        fill_unified_from_raw_body(ingress);
     }
 
     esp_err_t ret = ESP_ERR_NOT_SUPPORTED;
     switch (ingress->kind) {
     case S3_RUNTIME_MSG_SENSOR:
-        ret = handle_sensor_ingress(ingress);
+        ret = envelope_valid ? handle_sensor_ingress(ingress, &envelope) : ESP_ERR_INVALID_RESPONSE;
         break;
     case S3_RUNTIME_MSG_STATUS:
-        ret = handle_status_ingress(ingress);
+        ret = envelope_valid ? handle_status_ingress(ingress, &envelope) : ESP_ERR_INVALID_RESPONSE;
         break;
     case S3_RUNTIME_MSG_EVENT:
         ret = handle_event_ingress(ingress);
@@ -940,6 +990,10 @@ static void process_ingress(s3_runtime_ingress_t *ingress)
     default:
         ret = ESP_ERR_NOT_SUPPORTED;
         break;
+    }
+
+    if (envelope_valid) {
+        protocol_adapter_release_envelope(&envelope);
     }
 
     if (ret != ESP_OK) {
@@ -1002,8 +1056,11 @@ static void protocol_worker_task(void *arg)
         if (xQueueReceive(s_protocol_queue, &ingress, pdMS_TO_TICKS(S3_SCHEDULER_BASE_TICK_MS)) ==
             pdTRUE) {
             /* protocol worker 独立处理 JSON parse/Server mapping，避免 scheduler 主循环被长路径阻塞。 */
+            log_memory_trace("event_consumer_begin", NULL, ingress);
             process_ingress(ingress);
+            log_memory_trace("event_consumer_end", NULL, ingress);
             heap_caps_free(ingress);
+            log_memory_trace("payload_destroyed", NULL, NULL);
         }
 
         app_stack_monitor_log_periodic(TAG,
@@ -1137,6 +1194,7 @@ static s3_scheduler_event_t *event_alloc(s3_scheduler_event_type_t type,
     }
     event->type = type;
     event->priority = priority;
+    log_memory_trace("event_alloc", event, NULL);
     return event;
 }
 
@@ -1146,6 +1204,7 @@ static void event_release(s3_scheduler_event_t *event)
         return;
     }
     if (event->ingress != NULL) {
+        log_memory_trace("payload_destroyed", event, event->ingress);
         heap_caps_free(event->ingress);
         event->ingress = NULL;
     }
@@ -1619,7 +1678,7 @@ esp_err_t s3_scheduler_start(void)
                                                  NULL,
                                                  S3_PROTOCOL_WORKER_TASK_PRIORITY,
                                                  &s_protocol_worker_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_protocol_worker_task = NULL;
             return ESP_ERR_NO_MEM;
@@ -1637,7 +1696,7 @@ esp_err_t s3_scheduler_start(void)
                                                  NULL,
                                                  S3_STREAM_WORKER_TASK_PRIORITY,
                                                  &s_stream_worker_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_stream_worker_task = NULL;
             goto fail;
@@ -1658,7 +1717,7 @@ esp_err_t s3_scheduler_start(void)
                                              NULL,
                                              S3_SCHEDULER_TASK_PRIORITY,
                                              &s_scheduler_task,
-                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                             APP_TASK_STACK_CAPS_PSRAM);
     if (created != pdPASS) {
         s_scheduler_task = NULL;
         goto fail;
@@ -1813,12 +1872,17 @@ static esp_err_t enqueue_ingress_owned_internal(
         goto done;
     }
     event->ingress = ingress;
+    log_memory_trace("before_event_enqueue", event, ingress);
 
     ret = bounded_event_bus_lock ?
               queue_push_timed_owned(event, event_bus_lock_timeout_ms, out_diagnostics) :
               queue_push_reliable_owned(event);
     if (ret != ESP_OK) {
         event_release(event);
+    }
+    if (ret == ESP_OK) {
+        /* ownership moved to event bus; do not inspect pointers after this call. */
+        log_memory_trace("after_event_enqueue", NULL, NULL);
     }
 done:
     if (out_diagnostics != NULL) {

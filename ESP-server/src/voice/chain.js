@@ -335,15 +335,24 @@ async function requestVoiceTts(text, config, deviceId, signal) {
 
 async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConfig, signal, metrics, logger = console, options = {}) {
     let stageStartedAt = Date.now();
+    logger.log(
+        `[voice-turn] ASR_STREAM_START device_id=${maskLogValue(deviceId)} input_bytes=${audioBuffer.length}`
+    );
     const asrResult = await requestVoiceAsr(audioBuffer, gatewayConfig, voiceConfig, signal, logger);
     metrics.asrMs = Date.now() - stageStartedAt;
     metrics.asrTextLength = asrResult.text.length;
     metrics.asrTextPreview = normalizeLogPreview(asrResult.text, 60);
     logger.log(
+        `[voice-turn] ASR_RESULT device_id=${maskLogValue(deviceId)} asr_text_length=${metrics.asrTextLength} asr_text=${JSON.stringify(metrics.asrTextPreview)}`
+    );
+    logger.log(
         `[voice-turn] asr_success device_id=${maskLogValue(deviceId)} input_bytes=${audioBuffer.length} asr_ws_url=${maskUrlForLog(gatewayConfig.asr.url)} asr_text_length=${metrics.asrTextLength} asr_text=${JSON.stringify(metrics.asrTextPreview)} elapsed_ms=${metrics.asrMs}`
     );
 
     stageStartedAt = Date.now();
+    logger.log(
+        `[voice-turn] LLM_REQUEST device_id=${maskLogValue(deviceId)} asr_text_length=${metrics.asrTextLength}`
+    );
     const llmResult = await runVoiceAgentConversation(asrResult.text, gatewayConfig, signal, {
         dbAll: options.dbAll,
         deviceId,
@@ -356,6 +365,9 @@ async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConf
     );
 
     stageStartedAt = Date.now();
+    logger.log(
+        `[voice-turn] TTS_START device_id=${maskLogValue(deviceId)} llm_reply_length=${metrics.llmReplyLength}`
+    );
     const ttsResult = await requestVoiceTts(llmResult.text, gatewayConfig, deviceId, signal);
     metrics.ttsMs = Date.now() - stageStartedAt;
     metrics.ttsPcmBytes = ttsResult.pcm.length;

@@ -14,13 +14,22 @@
 
 /* VAD 参数：当前 MIC_ADC 每帧 3200 samples / 16000 Hz = 200 ms。 */
 #define MIC_VAD_FRAME_MS           200 // 每帧统计对应的时间。
-#define MIC_VAD_START_RMS          APP_VOICE_VAD_SPEECH_START_RMS // 连续超过该 PCM RMS 才认为开始说话。
-#define MIC_VAD_START_PEAK         APP_VOICE_VAD_SPEECH_START_PEAK // 连续超过该 PCM peak 才认为开始说话。
-#define MIC_VAD_END_RMS            APP_VOICE_VAD_SPEECH_END_RMS   // 连续低于该 PCM RMS 才认为说话结束。
-#define MIC_VAD_START_FRAMES       APP_VOICE_VAD_START_FRAMES // 连续达到配置帧数才开始。
-#define MIC_VAD_END_FRAMES         ((APP_VOICE_VAD_SILENCE_END_MS + MIC_VAD_FRAME_MS - 1) / MIC_VAD_FRAME_MS) // 连续静音达到配置时长才结束。
-#define MIC_VAD_MIN_SPEECH_FRAMES  2   // 小于 400 ms 的语音忽略。
-#define MIC_VAD_MAX_SPEECH_FRAMES  ((APP_VOICE_VAD_MAX_RECORD_MS + MIC_VAD_FRAME_MS - 1) / MIC_VAD_FRAME_MS) // 最长录音时长，防止卡死。
+
+typedef enum {
+    MIC_VAD_MODE_WAKE_LISTENER = 0,
+    MIC_VAD_MODE_COMMAND_CAPTURE,
+} mic_vad_mode_t;
+
+typedef struct {
+    uint32_t start_rms;
+    uint32_t start_peak;
+    uint32_t end_rms;
+    uint32_t start_confirm_frames;
+    uint32_t hangover_frames;
+    uint32_t max_active_frames;
+    uint32_t max_active_ms;
+    const char *source;
+} mic_vad_config_t;
 
 /**
  * @brief VAD 状态机状态
@@ -47,6 +56,17 @@ typedef enum {
 } mic_vad_event_t;
 
 /**
+ * @brief VOICE_END 的结束原因。
+ *
+ * `end_reason` 仅在 mic_vad_process() 返回 MIC_VAD_EVENT_VOICE_END 的本帧有效。
+ */
+typedef enum {
+    MIC_VAD_END_REASON_NONE = 0,
+    MIC_VAD_END_REASON_SILENCE,  // 连续低于结束阈值达到配置静音时长。
+    MIC_VAD_END_REASON_TIMEOUT,  // 达到 APP_VOICE_VAD_MAX_RECORD_MS 的明确保护超时。
+} mic_vad_end_reason_t;
+
+/**
  * @brief VAD 输入特征。
  *
  * 调用方法：ADC 统计窗口算出 adc_rms/adc_p2p/pcm_rms/pcm_p2p/pcm_peak/clipped 后填入本结构。
@@ -70,7 +90,18 @@ typedef struct {
     int start_count;        // 连续达到开始阈值的帧数。
     int end_count;          // 连续达到结束阈值的帧数。
     int speech_frames;      // 当前语音段已持续的帧数。
+    mic_vad_end_reason_t end_reason; // 本帧 VOICE_END 的原因；其他帧为 NONE。
+    mic_vad_mode_t mode;
+    mic_vad_config_t config;
 } mic_vad_t;
+
+/**
+ * @brief 将 VAD 结束原因转换为稳定日志字符串。
+ *
+ * @param reason VAD 结束原因。
+ * @return 只读的 ASCII 原因字符串。
+ */
+const char *mic_vad_end_reason_name(mic_vad_end_reason_t reason);
 
 /**
  * @brief 初始化 VAD 状态机。
@@ -80,6 +111,11 @@ typedef struct {
  * @param vad VAD 状态机，不能为空。
  */
 void mic_vad_init(mic_vad_t *vad);
+
+/** Initialize a VAD session using the standby or command-capture profile. */
+void mic_vad_init_mode(mic_vad_t *vad, mic_vad_mode_t mode);
+
+const char *mic_vad_mode_name(mic_vad_mode_t mode);
 
 /**
  * @brief 处理一帧统计值并更新 VAD 状态。

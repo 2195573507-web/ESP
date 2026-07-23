@@ -10,6 +10,7 @@ extern "C" {
 
 esp_err_t radar_local_handler(httpd_req_t *req);
 esp_err_t radar_debug_handler(httpd_req_t *req);
+esp_err_t radar_home_snapshot_handler(httpd_req_t *req);
 
 #ifdef __cplusplus
 }

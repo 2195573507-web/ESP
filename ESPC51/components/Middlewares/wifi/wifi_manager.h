@@ -38,7 +38,8 @@ esp_err_t wifi_manager_init(void);
  *
  * 调用方法：wifi_manager_init() 成功后调用；本函数会等待首次连接成功。
  *
- * 本函数会启动后台重连任务，并阻塞等待首次连接成功。后台任务只使用
+ * 本函数会启动后台重连任务，并在 WIFI_CONNECT_TIMEOUT_MS 内等待首次连接。超时后
+ * 返回 ESP_ERR_TIMEOUT，后台重连任务仍继续运行。后台任务只使用
  * terminal_config 中的 gateway_ssid/gateway_password，不连接家庭 WiFi。
  * @return 首次连接成功返回 ESP_OK；初始化状态异常或任务创建失败时返回错误码。
  */

@@ -24,6 +24,7 @@
 #include "freertos/task.h"
 #include "c5_memory.h"
 #include "c5_resource_manager.h"
+#include "esp111_protocol_common.h"
 #include "server_comm_config.h"
 #include "server_comm_http.h"
 #include "server_voice_protocol.h"
@@ -173,19 +174,14 @@ static bool server_voice_abort_requested(void)
 static esp_err_t server_voice_ensure_upload_capacity(size_t required)
 {
     if (required > SERVER_VOICE_UPLOAD_MAX_BYTES) {
-        ESP_LOGE(TAG,
-                 "local voice upload too large required=%u max=%u",
-                 (unsigned int)required,
-                 (unsigned int)SERVER_VOICE_UPLOAD_MAX_BYTES);
         return ESP_ERR_INVALID_SIZE;
     }
     if (required <= s_voice.upload_capacity) {
         return ESP_OK;
     }
 
-    size_t new_capacity = s_voice.upload_capacity > 0 ?
-                          s_voice.upload_capacity :
-                          SERVER_VOICE_UPLOAD_INITIAL_BYTES;
+    size_t new_capacity = s_voice.upload_capacity > 0U ?
+                              s_voice.upload_capacity : SERVER_VOICE_UPLOAD_INITIAL_BYTES;
     while (new_capacity < required && new_capacity < SERVER_VOICE_UPLOAD_MAX_BYTES) {
         new_capacity *= 2U;
     }
@@ -193,18 +189,13 @@ static esp_err_t server_voice_ensure_upload_capacity(size_t required)
         new_capacity = SERVER_VOICE_UPLOAD_MAX_BYTES;
     }
 
-    uint8_t *new_buf = (uint8_t *)c5_mem_realloc(s_voice.upload_buf,
-                                                  new_capacity,
-                                                  C5_MEM_PSRAM,
-                                                  "voice_upload_pcm");
+    uint8_t *new_buf = c5_mem_realloc(s_voice.upload_buf,
+                                      new_capacity,
+                                      C5_MEM_PSRAM,
+                                      "voice_upload_pcm");
     if (new_buf == NULL) {
-        ESP_LOGE(TAG,
-                 "local voice upload buffer alloc failed required=%u capacity=%u",
-                 (unsigned int)required,
-                 (unsigned int)new_capacity);
         return ESP_ERR_NO_MEM;
     }
-
     s_voice.upload_buf = new_buf;
     s_voice.upload_capacity = new_capacity;
     return ESP_OK;
@@ -592,7 +583,7 @@ esp_err_t server_voice_client_init(const server_voice_client_config_t *config)
     c5_mem_log("task_create_before_server_voice_rx");
     s_voice_response_task_stack = (StackType_t *)c5_mem_alloc(
         SERVER_VOICE_RESPONSE_TASK_STACK_WORDS * sizeof(*s_voice_response_task_stack),
-        C5_MEM_INTERNAL_CONTROL,
+        C5_MEM_PSRAM,
         "server_voice_rx_stack");
     if (s_voice_response_task_stack == NULL) {
         c5_mem_log("task_create_after_server_voice_rx_failed");
@@ -612,7 +603,7 @@ esp_err_t server_voice_client_init(const server_voice_client_config_t *config)
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG,
-             "VOICE_TASK_STACK task=server_voice_rx bytes=%u source=internal_static",
+             "VOICE_TASK_STACK task=server_voice_rx bytes=%u source=psram_static",
              (unsigned int)SERVER_VOICE_RESPONSE_TASK_STACK);
     ESP_LOGI(TAG, "TASK_CREATE task=server_voice_rx handle=%p", s_voice.response_task);
     c5_mem_log("task_create_after_server_voice_rx");
@@ -657,8 +648,8 @@ esp_err_t server_voice_client_start_turn(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    s_voice.upload_bytes = 0;
-    s_voice.response_bytes = 0;
+    s_voice.upload_bytes = 0U;
+    s_voice.response_bytes = 0U;
     s_voice.upload_finished_ms = 0;
     s_voice.fetch_headers_begin_ms = 0;
     s_voice.fetch_headers_end_ms = 0;
@@ -672,7 +663,6 @@ esp_err_t server_voice_client_start_turn(void)
     (void)c5_resource_manager_note_phase((c5_voice_lease_t) {
         .generation = s_voice.lease_generation,
     }, "after_upload_buffer_alloc");
-
     server_voice_set_state(SERVER_VOICE_STATE_STREAMING);
     ESP_LOGI(TAG,
              "local gateway voice turn begin gateway_id=%s device_id=%s",
@@ -689,13 +679,10 @@ esp_err_t server_voice_client_append_pcm(const int16_t *pcm, size_t samples)
     if (server_voice_abort_requested()) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_voice.state != SERVER_VOICE_STATE_STREAMING || s_voice.stream == NULL) {
-        if (s_voice.state != SERVER_VOICE_STATE_STREAMING || s_voice.upload_buf == NULL) {
-            return ESP_ERR_INVALID_STATE;
-        }
+    if (s_voice.state != SERVER_VOICE_STATE_STREAMING || s_voice.upload_buf == NULL) {
+        return ESP_ERR_INVALID_STATE;
     }
-
-    size_t bytes = samples * sizeof(int16_t);
+    const size_t bytes = samples * sizeof(int16_t);
     esp_err_t ret = server_voice_ensure_upload_capacity(s_voice.upload_bytes + bytes);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "local voice PCM buffer append failed: %s", esp_err_to_name(ret));
@@ -719,7 +706,7 @@ esp_err_t server_voice_client_finish_turn(void)
     if (s_voice.state != SERVER_VOICE_STATE_STREAMING || s_voice.upload_buf == NULL) {
         return ESP_OK;
     }
-    if (s_voice.upload_bytes == 0) {
+    if (s_voice.upload_bytes == 0U) {
         server_voice_cleanup_client();
         server_voice_set_state(SERVER_VOICE_STATE_IDLE);
         return ESP_ERR_INVALID_SIZE;
@@ -728,15 +715,15 @@ esp_err_t server_voice_client_finish_turn(void)
     device_protocol_metadata_t metadata = {0};
     device_protocol_prepare_metadata(&metadata, "voice.turn");
     server_comm_header_t headers[DEVICE_PROTOCOL_MAX_HEADERS + 1U];
-    size_t header_count = 0;
-    for (size_t i = 0; i < metadata.header_count && header_count < DEVICE_PROTOCOL_MAX_HEADERS; i++) {
+    size_t header_count = 0U;
+    for (size_t i = 0U; i < metadata.header_count && header_count < DEVICE_PROTOCOL_MAX_HEADERS; ++i) {
         headers[header_count++] = metadata.headers[i];
     }
     headers[header_count++] = (server_comm_header_t) {
         .key = "X-Audio-Format",
         .value = SERVER_VOICE_AUDIO_FORMAT,
     };
-    const server_comm_raw_stream_config_t stream_config = {
+    const server_comm_raw_stream_config_t config = {
         .endpoint = SERVER_VOICE_TURN_ENDPOINT,
         .content_type = SERVER_VOICE_REQUEST_CONTENT_TYPE,
         .headers = headers,
@@ -748,71 +735,29 @@ esp_err_t server_voice_client_finish_turn(void)
         .buffer_size = SERVER_VOICE_READ_CHUNK_BYTES,
         .tx_buffer_size = 512,
     };
-
-    ESP_LOGI(TAG,
-             "voice http timeout config connect_ms=%u fetch_headers_ms=%u read_ms=%u turn_ms=%u",
-             (unsigned int)VOICE_CONNECT_TIMEOUT_MS,
-             (unsigned int)VOICE_HEADER_TIMEOUT_MS,
-             (unsigned int)VOICE_READ_TIMEOUT_MS,
-             (unsigned int)VOICE_REQUEST_TIMEOUT_MS);
-    server_voice_log_heap("local voice fixed POST before");
-    /*
-     * 语音独占模式下只有 server_voice_client 允许继续走本地 HTTP。这里临时允许
-     * local_gateway_comm 建立 /local/v1/voice/turn，避免普通 heartbeat/poll 的 gate
-     * 误拦截本轮语音长连接。
-     */
     server_comm_http_set_voice_request_active(true);
-    int64_t request_start_ms = server_voice_now_ms();
-    ESP_LOGI(TAG,
-             "request start timestamp=%lld endpoint=%s timeout_ms=%u upload pcm bytes=%u",
-             (long long)request_start_ms,
-             SERVER_VOICE_TURN_ENDPOINT,
-             (unsigned int)VOICE_REQUEST_TIMEOUT_MS,
-             (unsigned int)s_voice.upload_bytes);
-    esp_err_t ret = server_comm_http_post_raw_fixed_stream_begin(&stream_config,
-                                                                 s_voice.upload_buf,
-                                                                 s_voice.upload_bytes,
-                                                                 &s_voice.stream);
+    esp_err_t ret = server_comm_http_post_raw_fixed_stream_begin(&config,
+                                                                   s_voice.upload_buf,
+                                                                   s_voice.upload_bytes,
+                                                                   &s_voice.stream);
     server_comm_http_set_voice_request_active(false);
-    server_voice_log_heap("local voice fixed POST after");
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "http error reason=%s endpoint=%s ret=%s elapsed_ms=%lld upload pcm bytes=%u",
-                 ret == ESP_ERR_TIMEOUT ? "timeout" :
-                 ret == ESP_ERR_HTTP_EAGAIN ? "eagain" :
-                 ret == ESP_ERR_HTTP_CONNECTION_CLOSED ? "connection_closed" :
-                 ret == ESP_ERR_HTTP_CONNECT ? "connect_failed" :
-                 ret == ESP_ERR_INVALID_STATE ? "invalid_state" :
-                 "request_failed",
-                 SERVER_VOICE_TURN_ENDPOINT,
-                 esp_err_to_name(ret),
-                 (long long)(server_voice_now_ms() - request_start_ms),
-                 (unsigned int)s_voice.upload_bytes);
         server_voice_cleanup_client();
         server_voice_set_state(SERVER_VOICE_STATE_IDLE);
         return ret;
     }
     s_voice.upload_finished_ms = server_voice_now_ms();
-    ESP_LOGI(TAG,
-             "upload finished timestamp=%lld upload pcm bytes=%u",
-             (long long)s_voice.upload_finished_ms,
-             (unsigned int)s_voice.upload_bytes);
-    ESP_LOGI(TAG, "VOICE_UPLOAD_COMPLETE");
     c5_mem_free(s_voice.upload_buf, "voice_upload_pcm");
     s_voice.upload_buf = NULL;
-    s_voice.upload_capacity = 0;
+    s_voice.upload_capacity = 0U;
     (void)c5_resource_manager_note_phase((c5_voice_lease_t) {
         .generation = s_voice.lease_generation,
     }, "after_upload_buffer_free");
-
     server_voice_set_state(SERVER_VOICE_STATE_FINISHING);
     s_voice.response_active = true;
-    s_voice.response_generation++;
-    if (s_voice.response_generation == 0) {
-        s_voice.response_generation = 1;
+    if (++s_voice.response_generation == 0U) {
+        s_voice.response_generation = 1U;
     }
-    ESP_LOGI(TAG, "VOICE_RX_WORKER_NOTIFY generation=%lu", (unsigned long)s_voice.response_generation);
-    c5_mem_log("after_voice_start");
     xTaskNotifyGive(s_voice.response_task);
     return ESP_OK;
 }

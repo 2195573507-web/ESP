@@ -153,6 +153,10 @@ static const char *TAG = "network_worker";
 #define NETWORK_WORKER_WEATHER_REQUEST_ID_BYTES 48U
 #endif
 
+#ifndef NETWORK_WORKER_QUEUED_JSON_MAX_BYTES
+#define NETWORK_WORKER_QUEUED_JSON_MAX_BYTES 8192U
+#endif
+
 typedef struct {
     network_worker_event_t event;
     network_worker_event_source_t source;
@@ -232,6 +236,16 @@ static int64_t s_next_local_http_start_ms;
 static int64_t s_softap_ready_since_ms;
 static uint32_t s_local_http_retry_count;
 static int64_t s_last_server_probe_ms;
+static int64_t s_last_server_probe_complete_ms;
+static bool s_server_probe_pending;
+static bool s_server_probe_inflight;
+static bool s_server_probe_dispatch_ready;
+static bool s_overview_dedup_logged;
+static int64_t s_overview_next_allowed_at_ms;
+static bool s_overview_backoff_skip_logged;
+static bool s_overview_backoff_expired;
+static esp_timer_handle_t s_overview_backoff_timer;
+static portMUX_TYPE s_overview_state_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_snapshot_upload_pending;
 static bool s_command_pull_pending;
 static bool s_smart_home_poll_pending;
@@ -246,6 +260,8 @@ static uint32_t s_low_priority_drop_count;
 static uint32_t s_low_priority_coalesce_count;
 static portMUX_TYPE s_snapshot_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 static network_worker_snapshot_stats_t s_snapshot_stats;
+
+static void network_worker_release_resources(void);
 
 typedef struct {
     bool used;
@@ -263,6 +279,80 @@ static void release_work_item(network_worker_work_item_t *item);
 static void drop_low_priority_upload_backlog(const char *reason);
 static esp_err_t enqueue_upload_work_item(const network_worker_work_item_t *item);
 static void snapshot_worker_task(void *arg);
+static int64_t now_ms(void);
+
+/* The periodic network state machine must not repeatedly re-admit an overview
+ * request during a known memory-pressure window.  This timer owns its single
+ * re-entry at the absolute deadline. */
+static void overview_backoff_timer_cb(void *arg)
+{
+    (void)arg;
+    portENTER_CRITICAL(&s_overview_state_mux);
+    s_overview_backoff_expired = true;
+    portEXIT_CRITICAL(&s_overview_state_mux);
+    if (s_upload_task != NULL) {
+        xTaskNotifyGive(s_upload_task);
+    }
+}
+
+static bool overview_backoff_active(void)
+{
+    const int64_t timestamp_ms = now_ms();
+    bool active;
+    portENTER_CRITICAL(&s_overview_state_mux);
+    active = s_overview_next_allowed_at_ms > timestamp_ms;
+    portEXIT_CRITICAL(&s_overview_state_mux);
+    return active;
+}
+
+static void arm_overview_backoff(uint32_t delay_ms)
+{
+    const uint64_t delay_us = (uint64_t)(delay_ms == 0U ? 1U : delay_ms) * 1000U;
+    const int64_t timestamp_ms = now_ms();
+    if (s_overview_backoff_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = overview_backoff_timer_cb,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "overview_backoff",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &s_overview_backoff_timer) != ESP_OK) {
+            ESP_LOGW(TAG, "HTTP_BACKOFF_TIMER_CREATE_FAILED endpoint=%s",
+                     "/api/dashboard/v1/overview");
+            return;
+        }
+    }
+    (void)esp_timer_stop(s_overview_backoff_timer);
+    portENTER_CRITICAL(&s_overview_state_mux);
+    s_overview_next_allowed_at_ms = timestamp_ms + (int64_t)(delay_ms == 0U ? 1U : delay_ms);
+    s_overview_backoff_expired = false;
+    s_overview_backoff_skip_logged = false;
+    portEXIT_CRITICAL(&s_overview_state_mux);
+    if (esp_timer_start_once(s_overview_backoff_timer, delay_us) != ESP_OK) {
+        ESP_LOGW(TAG, "HTTP_BACKOFF_TIMER_ARM_FAILED endpoint=%s delay_ms=%lu",
+                 "/api/dashboard/v1/overview", (unsigned long)delay_ms);
+    }
+}
+
+/* Queue control blocks live in PSRAM too; keep deferred payload storage there. */
+static esp_err_t copy_queued_json_to_psram(const char *json_body, char **out_copy)
+{
+    if (json_body == NULL || out_copy == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t length = strnlen(json_body, NETWORK_WORKER_QUEUED_JSON_MAX_BYTES + 1U);
+    if (length == 0U || length > NETWORK_WORKER_QUEUED_JSON_MAX_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    char *copy = heap_caps_malloc(length + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (copy == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(copy, json_body, length + 1U);
+    *out_copy = copy;
+    return ESP_OK;
+}
 
 static bool network_worker_initialized(void)
 {
@@ -289,6 +379,7 @@ static esp_err_t network_worker_init_failed(const char *stage)
              (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
              (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    network_worker_release_resources();
     return ESP_ERR_NO_MEM;
 }
 
@@ -887,6 +978,8 @@ static void mark_server_physical_down(const char *reason)
     s_server_ready = false;
     s_server_success_count = 0U;
     s_server_failure_count = 0U;
+    s_server_probe_pending = false;
+    /* Leave inflight probe to complete and discard via epoch/link checks. */
     strlcpy(s_server_last_error,
             ESP111_PROTOCOL_ERROR_GATEWAY_OFFLINE,
             sizeof(s_server_last_error));
@@ -1085,25 +1178,170 @@ static void set_local_ingest_ready(bool ready, const char *reason)
     }
 }
 
-static bool server_available_for_gate(const char *reason)
+static void request_server_probe(const char *reason)
 {
     const int64_t timestamp_ms = now_ms();
-    if (s_last_server_probe_ms != 0 &&
-        timestamp_ms - s_last_server_probe_ms < (int64_t)NETWORK_WORKER_SERVER_PROBE_INTERVAL_MS) {
-        return s_server_ready;
+    bool dedup = false;
+    const char *dedup_state = NULL;
+    bool skip = false;
+    uint32_t remaining_ms = 0U;
+    portENTER_CRITICAL(&s_overview_state_mux);
+    if (s_server_probe_inflight || s_server_probe_pending) {
+        dedup = true;
+        dedup_state = s_server_probe_inflight ? "active" : "pending";
+    } else if (s_overview_next_allowed_at_ms != 0) {
+        remaining_ms = s_overview_next_allowed_at_ms > timestamp_ms ?
+                           (uint32_t)(s_overview_next_allowed_at_ms - timestamp_ms) : 0U;
+        if (!s_overview_backoff_skip_logged) {
+            s_overview_backoff_skip_logged = true;
+            skip = true;
+        }
+    } else {
+        const int64_t anchor_ms = s_last_server_probe_complete_ms != 0 ?
+                                      s_last_server_probe_complete_ms : s_last_server_probe_ms;
+        if (anchor_ms != 0 &&
+            timestamp_ms - anchor_ms < (int64_t)NETWORK_WORKER_SERVER_PROBE_INTERVAL_MS) {
+            portEXIT_CRITICAL(&s_overview_state_mux);
+            return;
+        }
+        s_server_probe_pending = true;
+        s_server_probe_dispatch_ready = false;
+        s_overview_dedup_logged = false;
     }
+    portEXIT_CRITICAL(&s_overview_state_mux);
+
+    if (dedup) {
+        portENTER_CRITICAL(&s_overview_state_mux);
+        const bool first_dedup = !s_overview_dedup_logged;
+        s_overview_dedup_logged = true;
+        portEXIT_CRITICAL(&s_overview_state_mux);
+        if (first_dedup) {
+            ESP_LOGI(TAG, "HTTP_REQUEST_DEDUP endpoint=%s state=%s",
+                     "/api/dashboard/v1/overview",
+                     dedup_state != NULL ? dedup_state : "pending");
+        }
+        return;
+    }
+    if (skip) {
+        ESP_LOGI(TAG, "HTTP_BACKOFF_SKIP endpoint=%s remaining_ms=%lu",
+                 "/api/dashboard/v1/overview", (unsigned long)remaining_ms);
+        return;
+    }
+    if (server_client_http_best_effort_should_defer()) {
+        remaining_ms = server_client_http_mem_backoff_remaining_ms(
+            SERVER_CLIENT_HTTP_CLASS_BEST_EFFORT);
+        if (remaining_ms == 0U) {
+            remaining_ms = 1U;
+        }
+        arm_overview_backoff(remaining_ms);
+        portENTER_CRITICAL(&s_overview_state_mux);
+        const int64_t next_allowed_ms = s_overview_next_allowed_at_ms;
+        s_server_probe_pending = false;
+        s_server_probe_dispatch_ready = false;
+        portEXIT_CRITICAL(&s_overview_state_mux);
+        ESP_LOGI(TAG,
+                 "HTTP_BACKOFF_SET endpoint=%s class=best_effort delay_ms=%lu next_allowed_ms=%lld",
+                 "/api/dashboard/v1/overview",
+                 (unsigned long)remaining_ms,
+                 (long long)next_allowed_ms);
+        return;
+    }
+
+    portENTER_CRITICAL(&s_overview_state_mux);
     s_last_server_probe_ms = timestamp_ms;
+    s_server_probe_dispatch_ready = true;
+    portEXIT_CRITICAL(&s_overview_state_mux);
+    if (s_upload_task != NULL) {
+        xTaskNotifyGive(s_upload_task);
+    }
+    ESP_LOGI(TAG,
+             "HTTP_REQUEST_SCHEDULE endpoint=%s action=async_probe reason=%s",
+             "/api/dashboard/v1/overview",
+             reason != NULL ? reason : "unknown");
+}
+
+static void service_server_probe(bool wdt_registered)
+{
+    bool backoff_expired = false;
+    portENTER_CRITICAL(&s_overview_state_mux);
+    if (s_overview_backoff_expired && !s_server_probe_pending && !s_server_probe_inflight) {
+        s_overview_backoff_expired = false;
+        s_overview_next_allowed_at_ms = 0;
+        s_overview_backoff_skip_logged = false;
+        s_server_probe_pending = true;
+        s_server_probe_dispatch_ready = true;
+        backoff_expired = true;
+    }
+    portEXIT_CRITICAL(&s_overview_state_mux);
+    if (backoff_expired) {
+        ESP_LOGI(TAG, "HTTP_BACKOFF_EXPIRED endpoint=%s", "/api/dashboard/v1/overview");
+    }
+    portENTER_CRITICAL(&s_overview_state_mux);
+    const bool dispatch_ready = s_server_probe_pending && s_server_probe_dispatch_ready &&
+                                 !s_server_probe_inflight;
+    if (dispatch_ready) {
+        s_server_probe_dispatch_ready = false;
+        s_server_probe_inflight = true;
+    }
+    portEXIT_CRITICAL(&s_overview_state_mux);
+    if (!dispatch_ready) {
+        return;
+    }
+    if (!gateway_wifi_is_sta_ip_ready() || gateway_wifi_get_sta_network_epoch() == 0U) {
+        portENTER_CRITICAL(&s_overview_state_mux);
+        s_server_probe_pending = false;
+        s_server_probe_inflight = false;
+        s_overview_dedup_logged = false;
+        portEXIT_CRITICAL(&s_overview_state_mux);
+        return;
+    }
+    app_task_wdt_reset_current(wdt_registered);
 
     int status = 0;
-    esp_err_t ret = server_client_probe_available(&status);
-    if (ret == ESP_ERR_NOT_FINISHED) {
-        return s_server_ready;
+    const esp_err_t ret = server_client_probe_available(&status);
+    portENTER_CRITICAL(&s_overview_state_mux);
+    s_server_probe_inflight = false;
+    s_server_probe_pending = false;
+    s_overview_dedup_logged = false;
+    s_last_server_probe_complete_ms = now_ms();
+    s_last_server_probe_ms = s_last_server_probe_complete_ms;
+    portEXIT_CRITICAL(&s_overview_state_mux);
+    app_task_wdt_reset_current(wdt_registered);
+
+    if (ret == ESP_ERR_NOT_FINISHED || ret == ESP_ERR_HTTP_EAGAIN) {
+        const uint32_t delay_ms = server_client_http_mem_backoff_remaining_ms(
+            SERVER_CLIENT_HTTP_CLASS_BEST_EFFORT);
+        if (delay_ms > 0U) {
+            arm_overview_backoff(delay_ms);
+            portENTER_CRITICAL(&s_overview_state_mux);
+            const int64_t next_allowed_ms = s_overview_next_allowed_at_ms;
+            portEXIT_CRITICAL(&s_overview_state_mux);
+            ESP_LOGI(TAG,
+                     "HTTP_BACKOFF_SET endpoint=%s class=best_effort delay_ms=%lu next_allowed_ms=%lld",
+                     "/api/dashboard/v1/overview", (unsigned long)delay_ms,
+                     (long long)next_allowed_ms);
+        }
+        return;
     }
-    const bool ready = update_server_health(ret, status, reason);
+
+    (void)update_server_health(ret, status, "server_probe_async");
     if (!server_result_ok(ret, status)) {
-        log_server_health_summary(reason, ret, status, false);
+        log_server_health_summary("server_probe_async", ret, status, false);
+    } else {
+        ESP_LOGI(TAG,
+                 "HTTP_REQUEST_DONE endpoint=%s action=probe_ok status=%d",
+                 "/api/dashboard/v1/overview",
+                 status);
     }
-    return ready;
+}
+
+static bool server_available_for_gate(const char *reason)
+{
+    /* Never block network_worker on overview/HTTP/TLS. Probe runs on upload_worker. */
+    if (!overview_backoff_active()) {
+        request_server_probe(reason);
+    }
+    return s_server_ready;
 }
 
 static void set_gateway_link_state(network_worker_link_state_t state, const char *reason)
@@ -1293,6 +1531,7 @@ static void service_sta_connect(void)
         ESP_LOGW(TAG,
                  "STA connect request timed out pending=1 action=retry_selected_ap timeout_ms=%u",
                  (unsigned int)NETWORK_WORKER_STA_RECONNECT_ATTEMPT_TIMEOUT_MS);
+        app_s3_mem_log(TAG, "wifi_reconnect_end");
         s_sta_connect_pending = false;
         s_sta_connect_request_sent = false;
         s_sta_reconnect_needed = true;
@@ -1303,6 +1542,7 @@ static void service_sta_connect(void)
         return;
     }
 
+    app_s3_mem_log(TAG, "wifi_reconnect_begin");
     esp_err_t ret = gateway_wifi_connect_sta_current();
     if (ret == ESP_OK || ret == ESP_ERR_WIFI_STATE) {
         s_sta_connect_request_sent = true;
@@ -1312,6 +1552,7 @@ static void service_sta_connect(void)
     }
 
     if (ret != ESP_OK) {
+        app_s3_mem_log(TAG, "wifi_reconnect_end");
         ESP_LOGW(TAG,
                  "STA connect request failed mode=selected_ap ret=%s",
                  esp_err_to_name(ret));
@@ -1533,6 +1774,8 @@ static void handle_network_event(const network_worker_item_t *item)
         log_network_epoch("STA_CONNECTED", reason);
         break;
     case NETWORK_WORKER_SOURCE_STA_DISCONNECTED:
+    {
+        const bool reconnect_attempt_inflight = s_sta_connect_request_sent;
         s_sta_reconnect_needed = true;
         s_sta_connect_request_sent = false;
         s_sta_connect_request_deadline_ms = 0;
@@ -1543,9 +1786,13 @@ static void handle_network_event(const network_worker_item_t *item)
         ESP_LOGW(TAG,
                  "WIFI_CONNECT_RESULT status=disconnected disconnect_reason=%u",
                  (unsigned int)item->disconnect_reason);
+        if (reconnect_attempt_inflight) {
+            app_s3_mem_log(TAG, "wifi_reconnect_end");
+        }
         server_client_on_network_epoch_changed(0U, reason);
         schedule_sta_reconnect_from_disconnect(item->disconnect_reason);
         break;
+    }
     case NETWORK_WORKER_SOURCE_STA_GOT_IP:
         s_sta_connect_pending = false;
         s_sta_connect_request_sent = false;
@@ -1556,6 +1803,7 @@ static void handle_network_event(const network_worker_item_t *item)
         s_sta_scan_in_progress = false;
         gateway_wifi_reset_sta_credential_failures();
         ESP_LOGI(TAG, "WIFI_CONNECT_RESULT status=ip_ready");
+        app_s3_mem_log(TAG, "wifi_reconnect_end");
         server_client_on_network_epoch_changed(gateway_wifi_get_sta_network_epoch(), reason);
         log_network_epoch("GOT_IP", reason);
         break;
@@ -1886,7 +2134,7 @@ static void release_work_item(network_worker_work_item_t *item)
     }
     clear_upload_pending_flag(item);
     if (item->json_body != NULL) {
-        cJSON_free(item->json_body);
+        heap_caps_free(item->json_body);
         item->json_body = NULL;
     }
     if (item->bme_cache_sequence != 0U) {
@@ -1904,6 +2152,88 @@ static void notify_environment_completion(const network_worker_work_item_t *item
                                      http_status,
                                      item->environment_completion_context);
     }
+}
+
+static void release_queued_work_items(QueueHandle_t queue)
+{
+    if (queue == NULL) {
+        return;
+    }
+    network_worker_work_item_t item = {0};
+    while (xQueueReceive(queue, &item, 0) == pdTRUE) {
+        notify_environment_completion(&item, ESP_ERR_INVALID_STATE, 0);
+        release_work_item(&item);
+    }
+}
+
+static void delete_worker_task(TaskHandle_t *task)
+{
+    if (task == NULL || *task == NULL) {
+        return;
+    }
+    (void)esp_task_wdt_delete(*task);
+    vTaskDelete(*task);
+    *task = NULL;
+}
+
+static void network_worker_release_resources(void)
+{
+    /* This is called only from external lifecycle/init-failure paths, never
+     * by a worker itself. Delete consumers before their queues and release
+     * retained asynchronous bodies before dropping the queue storage. */
+    delete_worker_task(&s_snapshot_task);
+    delete_worker_task(&s_command_task);
+    delete_worker_task(&s_upload_task);
+    delete_worker_task(&s_worker_task);
+
+    release_queued_work_items(s_work_queue);
+    release_queued_work_items(s_command_queue);
+    if (s_event_queue != NULL) {
+        vQueueDelete(s_event_queue);
+        s_event_queue = NULL;
+    }
+    if (s_ap_disconnect_queue != NULL) {
+        vQueueDelete(s_ap_disconnect_queue);
+        s_ap_disconnect_queue = NULL;
+    }
+    if (s_work_queue != NULL) {
+        vQueueDelete(s_work_queue);
+        s_work_queue = NULL;
+    }
+    if (s_command_queue != NULL) {
+        vQueueDelete(s_command_queue);
+        s_command_queue = NULL;
+    }
+    if (s_command_ack_response != NULL) {
+        heap_caps_free(s_command_ack_response);
+        s_command_ack_response = NULL;
+    }
+    if (s_command_queue_mutation_lock != NULL) {
+        vSemaphoreDelete(s_command_queue_mutation_lock);
+        s_command_queue_mutation_lock = NULL;
+    }
+    if (s_work_queue_mutation_lock != NULL) {
+        vSemaphoreDelete(s_work_queue_mutation_lock);
+        s_work_queue_mutation_lock = NULL;
+    }
+    if (s_pending_station_lock != NULL) {
+        vSemaphoreDelete(s_pending_station_lock);
+        s_pending_station_lock = NULL;
+    }
+
+    if (s_local_http_running || local_http_server_has_handle()) {
+        (void)local_http_server_stop_with_reason("network_worker_deinit");
+    }
+    memset(s_pending_stations, 0, sizeof(s_pending_stations));
+    s_link_state = NETWORK_WORKER_LINK_DOWN;
+    s_last_scheduler_state = S3_SCHEDULER_NET_NOT_READY;
+    s_local_ingest_ready = false;
+    s_local_http_start_requested = false;
+    s_local_http_running = false;
+    s_snapshot_upload_pending = false;
+    s_command_pull_pending = false;
+    s_smart_home_poll_pending = false;
+    s_weather_refresh_pending = false;
 }
 
 static void requeue_or_drop_work(QueueHandle_t queue,
@@ -2067,7 +2397,11 @@ static void process_upload_work_item(network_worker_work_item_t *item)
         sensor_aggregator_upload_snapshot_now();
         break;
     case NETWORK_WORKER_WORK_WEATHER_REFRESH_REQUEST:
-        ret = server_client_post_weather_refresh_json(item->json_body, NULL, 0U, &http_status);
+        if (server_client_http_best_effort_should_defer()) {
+            ret = ESP_ERR_HTTP_EAGAIN;
+        } else {
+            ret = server_client_post_weather_refresh_json(item->json_body, NULL, 0U, &http_status);
+        }
         break;
     default:
         ret = ESP_ERR_INVALID_ARG;
@@ -2096,7 +2430,7 @@ static esp_err_t perform_command_ack(network_worker_work_item_t *item)
     esp_err_t ret = server_client_ack_command(item->command_id,
                                              item->json_body,
                                              s_command_ack_response,
-                                             sizeof(s_command_ack_response),
+                                             SERVER_CLIENT_SMALL_BODY_BYTES,
                                              &status);
     if (ret == ESP_ERR_INVALID_STATE && !server_link_stable()) {
         return ret;
@@ -2197,6 +2531,11 @@ static void upload_worker_task(void *arg)
     app_stack_monitor_report(TAG, "upload_worker", NETWORK_WORKER_UPLOAD_TASK_STACK, "entry");
 
     while (1) {
+        /* Probe must run even before LINK_STABLE so the gate can open without blocking
+         * network_worker on synchronous overview/HTTP. */
+        service_server_probe(wdt_registered);
+        (void)ulTaskNotifyTake(pdTRUE, 0);
+
         if (!server_link_stable()) {
             /* Server 未 ready 时不上传；清掉过期的低优先级 snapshot。 */
             drop_low_priority_upload_backlog("server_not_ready_backlog");
@@ -2271,6 +2610,12 @@ static void snapshot_worker_task(void *arg)
             continue;
         }
 
+        if (server_client_http_best_effort_should_defer()) {
+            snapshot_stats_record_skip();
+            ESP_LOGI(TAG, "snapshot_deferred reason=mem_pressure");
+            app_task_wdt_reset_current(wdt_registered);
+            continue;
+        }
         const esp_err_t ret = sensor_aggregator_upload_snapshot_now();
         if (ret == ESP_OK) {
             snapshot_stats_record_upload();
@@ -2392,16 +2737,20 @@ esp_err_t network_worker_init(void)
     }
 
     if (s_worker_task == NULL) {
+        /* The network state worker only handles queued Wi-Fi state and timers;
+         * it is not entered from cache-off callbacks. Keep cache-off-sensitive
+         * UART/startup tasks internal, but move this long-lived 16 KiB stack to
+         * PSRAM so the internal largest block remains available to HTTP/DMA. */
         BaseType_t created = xTaskCreateWithCaps(network_worker_task,
                                                  "network_worker",
                                                  NETWORK_WORKER_TASK_STACK,
                                                  NULL,
                                                  NETWORK_WORKER_TASK_PRIORITY,
                                                  &s_worker_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_worker_task = NULL;
-            return network_worker_init_failed("network_task_internal");
+            return network_worker_init_failed("network_task_psram");
         }
         app_stack_monitor_log_task_created(TAG,
                                            "network_worker",
@@ -2415,7 +2764,7 @@ esp_err_t network_worker_init(void)
                                                  NULL,
                                                  NETWORK_WORKER_UPLOAD_TASK_PRIORITY,
                                                  &s_upload_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_upload_task = NULL;
             return network_worker_init_failed("upload_task_internal");
@@ -2432,7 +2781,7 @@ esp_err_t network_worker_init(void)
                                                  NULL,
                                                  NETWORK_WORKER_COMMAND_TASK_PRIORITY,
                                                  &s_command_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_command_task = NULL;
             return network_worker_init_failed("command_task_internal");
@@ -2449,7 +2798,7 @@ esp_err_t network_worker_init(void)
                                                  NULL,
                                                  NETWORK_WORKER_UPLOAD_TASK_PRIORITY - 1U,
                                                  &s_snapshot_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_snapshot_task = NULL;
             return network_worker_init_failed("snapshot_task_internal");
@@ -2460,13 +2809,18 @@ esp_err_t network_worker_init(void)
                                            NETWORK_WORKER_UPLOAD_TASK_STACK);
     }
     ESP_LOGI(TAG,
-             "NETWORK_WORKER_INIT_OK task_stacks_internal=%u queues_psram=4 command_ack_buffer_psram=%u",
+             "NETWORK_WORKER_INIT_OK task_stacks_psram=%u queues_psram=4 command_ack_buffer_psram=%u",
              (unsigned int)(NETWORK_WORKER_TASK_STACK +
                             NETWORK_WORKER_UPLOAD_TASK_STACK +
                             NETWORK_WORKER_COMMAND_TASK_STACK +
                             NETWORK_WORKER_UPLOAD_TASK_STACK),
              (unsigned int)SERVER_CLIENT_SMALL_BODY_BYTES);
     return ESP_OK;
+}
+
+void network_worker_deinit(void)
+{
+    network_worker_release_resources();
 }
 
 esp_err_t network_worker_enable_local_http_server(void)
@@ -2630,7 +2984,7 @@ esp_err_t network_worker_submit_peer_server_json(network_worker_server_json_type
     network_worker_work_item_t item = {
         .work_type = NETWORK_WORKER_WORK_UPLOAD_JSON,
         .json_type = type,
-        .json_body = json_body,
+        .json_body = NULL,
     };
     if (device_id != NULL && device_id[0] != '\0') {
         if (!gateway_config_child_allowed(device_id)) {
@@ -2659,9 +3013,21 @@ esp_err_t network_worker_submit_peer_server_json(network_worker_server_json_type
                                                 "session_not_active");
         return ESP_ERR_INVALID_STATE;
     }
+    char *queued_body = NULL;
+    esp_err_t ret = copy_queued_json_to_psram(json_body, &queued_body);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    item.json_body = queued_body;
     strlcpy(item.source, source != NULL ? source : "server_json", sizeof(item.source));
-    /* 入队成功后 json_body 生命周期转交给 upload_worker。 */
-    return enqueue_upload_work_item(&item);
+    /* The original is only released after the PSRAM copy is safely queued. */
+    ret = enqueue_upload_work_item(&item);
+    if (ret != ESP_OK) {
+        heap_caps_free(queued_body);
+        return ret;
+    }
+    cJSON_free(json_body);
+    return ESP_OK;
 }
 
 esp_err_t network_worker_submit_environment_alarm_json(
@@ -2675,10 +3041,15 @@ esp_err_t network_worker_submit_environment_alarm_json(
         return ESP_ERR_INVALID_ARG;
     }
 
+    char *queued_body = NULL;
+    esp_err_t ret = copy_queued_json_to_psram(json_body, &queued_body);
+    if (ret != ESP_OK) {
+        return ret;
+    }
     network_worker_work_item_t item = {
         .work_type = NETWORK_WORKER_WORK_UPLOAD_JSON,
         .json_type = NETWORK_WORKER_SERVER_JSON_ENVIRONMENT_ALARM,
-        .json_body = json_body,
+        .json_body = queued_body,
         .environment_event_seq = event_seq,
         .environment_completion = completion,
         .environment_completion_context = completion_context,
@@ -2686,7 +3057,13 @@ esp_err_t network_worker_submit_environment_alarm_json(
     strlcpy(item.source,
             source != NULL && source[0] != '\0' ? source : "environment_alarm",
             sizeof(item.source));
-    return enqueue_upload_work_item(&item);
+    ret = enqueue_upload_work_item(&item);
+    if (ret != ESP_OK) {
+        heap_caps_free(queued_body);
+        return ret;
+    }
+    heap_caps_free(json_body);
+    return ESP_OK;
 }
 
 esp_err_t network_worker_submit_bme_cached_json(char *json_body,
@@ -2711,7 +3088,7 @@ esp_err_t network_worker_submit_bme_cached_json_for_peer(char *json_body,
     network_worker_work_item_t item = {
         .work_type = NETWORK_WORKER_WORK_UPLOAD_JSON,
         .json_type = NETWORK_WORKER_SERVER_JSON_INGEST,
-        .json_body = json_body,
+        .json_body = NULL,
         .bme_cache_sequence = cache_sequence,
     };
     if (device_id != NULL && device_id[0] != '\0') {
@@ -2741,16 +3118,26 @@ esp_err_t network_worker_submit_bme_cached_json_for_peer(char *json_body,
                                                 "session_not_active");
         return ESP_ERR_INVALID_STATE;
     }
-    strlcpy(item.source, source != NULL ? source : "bme_cache", sizeof(item.source));
-    esp_err_t ret = bme_cache_manager_mark_in_flight(cache_sequence, true);
+    char *queued_body = NULL;
+    esp_err_t ret = copy_queued_json_to_psram(json_body, &queued_body);
     if (ret != ESP_OK) {
+        return ret;
+    }
+    item.json_body = queued_body;
+    strlcpy(item.source, source != NULL ? source : "bme_cache", sizeof(item.source));
+    ret = bme_cache_manager_mark_in_flight(cache_sequence, true);
+    if (ret != ESP_OK) {
+        heap_caps_free(queued_body);
         return ret;
     }
     ret = enqueue_upload_work_item(&item);
     if (ret != ESP_OK) {
         (void)bme_cache_manager_mark_in_flight(cache_sequence, false);
+        heap_caps_free(queued_body);
+        return ret;
     }
-    return ret;
+    cJSON_free(json_body);
+    return ESP_OK;
 }
 
 static size_t cancel_peer_upload_queue(const char *device_id)
@@ -2887,14 +3274,20 @@ esp_err_t network_worker_enqueue_weather_refresh_request(const char *reason)
     if (json_body == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    char *queued_body = NULL;
+    esp_err_t ret = copy_queued_json_to_psram(json_body, &queued_body);
+    cJSON_free(json_body);
+    if (ret != ESP_OK) {
+        return ret;
+    }
     network_worker_work_item_t item = {
         .work_type = NETWORK_WORKER_WORK_WEATHER_REFRESH_REQUEST,
-        .json_body = json_body,
+        .json_body = queued_body,
     };
     strlcpy(item.source, "weather_refresh", sizeof(item.source));
-    esp_err_t ret = enqueue_upload_work_item(&item);
+    ret = enqueue_upload_work_item(&item);
     if (ret != ESP_OK) {
-        cJSON_free(json_body);
+        heap_caps_free(queued_body);
     }
     return ret;
 }
@@ -2919,7 +3312,7 @@ esp_err_t network_worker_enqueue_command_ack(const char *command_id, const char 
 
     size_t ack_len = strlen(ack_json);
     /* ack_json 可能来自调用方栈/临时 buffer，这里复制后再交给异步 command worker。 */
-    char *owned_ack = cJSON_malloc(ack_len + 1U);
+    char *owned_ack = heap_caps_malloc(ack_len + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (owned_ack == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -2934,7 +3327,7 @@ esp_err_t network_worker_enqueue_command_ack(const char *command_id, const char 
 
     esp_err_t ret = enqueue_command_work_item_wait(&item, 0);
     if (ret != ESP_OK) {
-        cJSON_free(owned_ack);
+        heap_caps_free(owned_ack);
     }
     return ret;
 }

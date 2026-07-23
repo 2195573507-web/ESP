@@ -37,6 +37,7 @@ typedef enum {
 } gateway_link_state_t;
 
 typedef void (*gateway_link_voice_abort_cb_t)(const char *reason);
+typedef void (*gateway_link_voice_network_cb_t)(bool available, const char *reason);
 
 /** @brief 启动 gateway_link 重连任务；app_orchestrator 在 WiFi 初始化后调用。 */
 esp_err_t gateway_link_start(void);
@@ -59,6 +60,9 @@ bool gateway_link_wifi_is_down_stable(void);
 /** @brief 业务或语音清理层注册断联中止回调；状态从 READY 掉出时触发。 */
 void gateway_link_set_voice_abort_callback(gateway_link_voice_abort_cb_t callback);
 
+/** @brief Register the voice availability sink; invoked at LINK_READY enter/leave edges. */
+void gateway_link_set_voice_network_callback(gateway_link_voice_network_cb_t callback);
+
 /** @brief 当前状态快照。 */
 gateway_link_state_t gateway_link_get_state(void);
 
@@ -67,6 +71,8 @@ const char *gateway_link_state_name(gateway_link_state_t state);
 
 /** @brief 只有 LINK_READY 才允许普通业务和新的 server voice turn。 */
 bool gateway_link_is_ready(void);
+/** @brief Local S3 is usable for UDP WakeNet even when the cloud-facing voice path is degraded. */
+bool gateway_link_is_local_ready(void);
 
 /** @brief 状态非 READY 时即为 reconnect mode。 */
 bool gateway_link_in_reconnect_mode(void);

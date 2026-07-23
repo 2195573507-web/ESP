@@ -1,10 +1,39 @@
 #include "iic.h"
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "IIC";
 
 i2c_obj_t iic_master[I2C_NUM_MAX];
+static StaticSemaphore_t s_iic_bus_lock_storage;
+static SemaphoreHandle_t s_iic_bus_lock;
+static portMUX_TYPE s_iic_bus_lock_init_guard = portMUX_INITIALIZER_UNLOCKED;
+
+/* I2C devices are added and removed per transaction, so protect that full
+ * lifecycle across BME690 and LCD-touch users of I2C0. All callers are tasks. */
+static esp_err_t iic_bus_lock(void)
+{
+    portENTER_CRITICAL(&s_iic_bus_lock_init_guard);
+    if (s_iic_bus_lock == NULL) {
+        s_iic_bus_lock = xSemaphoreCreateMutexStatic(&s_iic_bus_lock_storage);
+    }
+    SemaphoreHandle_t lock = s_iic_bus_lock;
+    portEXIT_CRITICAL(&s_iic_bus_lock_init_guard);
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    return xSemaphoreTake(lock, portMAX_DELAY) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static void iic_bus_unlock(void)
+{
+    if (s_iic_bus_lock != NULL) {
+        (void)xSemaphoreGive(s_iic_bus_lock);
+    }
+}
 
 static esp_err_t iic_get_gpio(i2c_port_num_t port, gpio_num_t *sda, gpio_num_t *scl)
 {
@@ -85,9 +114,17 @@ i2c_obj_t iic_init(uint8_t iic_port)
         return obj;
     }
 
+    const esp_err_t lock_ret = iic_bus_lock();
+    if (lock_ret != ESP_OK) {
+        obj.init_flag = lock_ret;
+        return obj;
+    }
+
     i2c_obj_t *self = &iic_master[iic_port];
     if (self->init_flag == ESP_OK && self->bus_handle != NULL) {
-        return *self;
+        obj = *self;
+        iic_bus_unlock();
+        return obj;
     }
 
     self->port = (i2c_port_num_t)iic_port;
@@ -97,7 +134,9 @@ i2c_obj_t iic_init(uint8_t iic_port)
     esp_err_t ret = iic_get_gpio(self->port, &self->sda, &self->scl);
     if (ret != ESP_OK) {
         self->init_flag = ret;
-        return *self;
+        obj = *self;
+        iic_bus_unlock();
+        return obj;
     }
 
     i2c_master_bus_config_t bus_cfg = {
@@ -126,7 +165,9 @@ i2c_obj_t iic_init(uint8_t iic_port)
         ESP_LOGE(TAG, "I2C%d init fail: %s", (int)self->port, esp_err_to_name(ret));
     }
 
-    return *self;
+    obj = *self;
+    iic_bus_unlock();
+    return obj;
 }
 
 esp_err_t iic_write(i2c_obj_t *self, uint16_t addr, const uint8_t *write_buf, size_t write_len)
@@ -135,9 +176,14 @@ esp_err_t iic_write(i2c_obj_t *self, uint16_t addr, const uint8_t *write_buf, si
         return ESP_ERR_INVALID_ARG;
     }
 
-    i2c_master_dev_handle_t dev_handle = NULL;
-    esp_err_t ret = iic_add_device(self, addr, &dev_handle);
+    esp_err_t ret = iic_bus_lock();
     if (ret != ESP_OK) {
+        return ret;
+    }
+    i2c_master_dev_handle_t dev_handle = NULL;
+    ret = iic_add_device(self, addr, &dev_handle);
+    if (ret != ESP_OK) {
+        iic_bus_unlock();
         return ret;
     }
 
@@ -155,6 +201,7 @@ esp_err_t iic_write(i2c_obj_t *self, uint16_t addr, const uint8_t *write_buf, si
     }
 
     iic_remove_device(dev_handle);
+    iic_bus_unlock();
     return ret;
 }
 
@@ -169,9 +216,14 @@ esp_err_t iic_read(i2c_obj_t *self,
         return ESP_ERR_INVALID_ARG;
     }
 
-    i2c_master_dev_handle_t dev_handle = NULL;
-    esp_err_t ret = iic_add_device(self, addr, &dev_handle);
+    esp_err_t ret = iic_bus_lock();
     if (ret != ESP_OK) {
+        return ret;
+    }
+    i2c_master_dev_handle_t dev_handle = NULL;
+    ret = iic_add_device(self, addr, &dev_handle);
+    if (ret != ESP_OK) {
+        iic_bus_unlock();
         return ret;
     }
 
@@ -205,5 +257,6 @@ esp_err_t iic_read(i2c_obj_t *self,
     }
 
     iic_remove_device(dev_handle);
+    iic_bus_unlock();
     return ret;
 }

@@ -50,11 +50,20 @@ static portMUX_TYPE s_server_lock_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_handler_metrics_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_local_http_active_count;
 static uint32_t s_telemetry_http_active;
+static uint32_t s_http_request_started;
+static uint32_t s_http_request_finished;
+static uint32_t s_http_request_failed;
+static size_t s_httpd_max_open_sockets = 4U;
+static int64_t s_last_httpd_session_log_ms;
 static int64_t s_last_sensor_ingress_success_log_ms;
 static int64_t s_last_sensor_ingress_failure_log_ms;
 
 #define LOCAL_HTTP_SENSOR_INGRESS_ADMISSION_TIMEOUT_MS 100U
 #define LOCAL_HTTP_SENSOR_DIAGNOSTIC_LOG_MS 5000LL
+#define LOCAL_HTTP_SESSION_DIAGNOSTIC_LOG_MS 5000LL
+#ifndef LOCAL_HTTP_MEMORY_DIAGNOSTICS
+#define LOCAL_HTTP_MEMORY_DIAGNOSTICS 0
+#endif
 #define ESP111_PROTOCOL_LOCAL_JSON_LOCAL_ID "local_id"
 
 typedef struct {
@@ -70,6 +79,94 @@ typedef struct {
     s3_scheduler_enqueue_diagnostics_t enqueue;
 } local_http_sensor_ingress_metrics_t;
 
+static void log_request_memory_phase(const httpd_req_t *req, const char *phase)
+{
+#if LOCAL_HTTP_MEMORY_DIAGNOSTICS
+    ESP_LOGI(TAG,
+             "HTTP_MEM_PHASE phase=%s uri=%s internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u psram_free=%u psram_largest=%u",
+             phase != NULL ? phase : "-", req != NULL && req->uri != NULL ? req->uri : "-",
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#else
+    (void)req;
+    (void)phase;
+#endif
+}
+
+static void log_sensor_memory_trace(const httpd_req_t *req,
+                                    const char *phase,
+                                    const void *payload,
+                                    size_t payload_size)
+{
+#if LOCAL_HTTP_MEMORY_DIAGNOSTICS
+    const s3_scheduler_load_t load = s3_scheduler_get_load();
+    ESP_LOGI(TAG,
+             "SENSOR_MEM_TRACE phase=%s uri=%s payload=%p payload_size=%u payload_region=%s "
+             "internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u "
+             "psram_free=%u psram_largest=%u handler_active=%lu event_bus_depth=%u",
+             phase != NULL ? phase : "-",
+             req != NULL && req->uri != NULL ? req->uri : ESP111_PROTOCOL_ROUTE_SENSOR,
+             payload,
+             (unsigned int)payload_size,
+             payload == NULL ? "none" : (esp_ptr_external_ram(payload) ? "psram" : "internal"),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned long)s_local_http_active_count,
+             (unsigned int)load.queue_depth);
+#else
+    (void)req;
+    (void)phase;
+    (void)payload;
+    (void)payload_size;
+#endif
+}
+
+static void log_httpd_sessions(const char *route, const char *phase, esp_err_t result)
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000LL;
+    uint32_t active;
+    uint32_t started;
+    uint32_t finished;
+    uint32_t failed;
+    bool due;
+    portENTER_CRITICAL(&s_handler_metrics_lock);
+    due = result != ESP_OK || s_last_httpd_session_log_ms == 0 ||
+          now_ms - s_last_httpd_session_log_ms >= LOCAL_HTTP_SESSION_DIAGNOSTIC_LOG_MS;
+    if (due) {
+        s_last_httpd_session_log_ms = now_ms;
+    }
+    active = s_local_http_active_count;
+    started = s_http_request_started;
+    finished = s_http_request_finished;
+    failed = s_http_request_failed;
+    portEXIT_CRITICAL(&s_handler_metrics_lock);
+    if (!due) {
+        return;
+    }
+
+    int client_fds[4] = {0};
+    size_t requested = s_httpd_max_open_sockets;
+    esp_err_t list_ret = s_server != NULL ?
+        httpd_get_client_list(s_server, &requested, client_fds) : ESP_ERR_INVALID_STATE;
+    ESP_LOGI(TAG,
+             "HTTPD_SESSION phase=%s route=%s result=%s open_sockets=%u max_open_sockets=%u "
+             "lwip_socket_fds=%u handler_active=%lu request_started=%lu request_finished=%lu request_failed=%lu list_ret=%s",
+             phase != NULL ? phase : "-", route != NULL ? route : "-",
+             esp_err_to_name(result), (unsigned int)(list_ret == ESP_OK ? requested : 0U),
+             (unsigned int)s_httpd_max_open_sockets,
+             (unsigned int)(list_ret == ESP_OK ? requested : 0U),
+             (unsigned long)active, (unsigned long)started, (unsigned long)finished,
+             (unsigned long)failed, esp_err_to_name(list_ret));
+}
+
 static int64_t local_http_telemetry_begin(const char *route, bool emit_debug)
 {
     const int64_t started_us = esp_timer_get_time();
@@ -78,6 +175,7 @@ static int64_t local_http_telemetry_begin(const char *route, bool emit_debug)
     portENTER_CRITICAL(&s_handler_metrics_lock);
     active = ++s_local_http_active_count;
     telemetry = ++s_telemetry_http_active;
+    ++s_http_request_started;
     portEXIT_CRITICAL(&s_handler_metrics_lock);
     if (emit_debug) {
         ESP_LOGD(TAG,
@@ -103,6 +201,10 @@ static void local_http_telemetry_finish(const char *route,
     if (s_telemetry_http_active > 0U) {
         --s_telemetry_http_active;
     }
+    ++s_http_request_finished;
+    if (ret != ESP_OK) {
+        ++s_http_request_failed;
+    }
     active = s_local_http_active_count;
     telemetry = s_telemetry_http_active;
     portEXIT_CRITICAL(&s_handler_metrics_lock);
@@ -115,6 +217,8 @@ static void local_http_telemetry_finish(const char *route,
                  (unsigned long)telemetry,
                  esp_err_to_name(ret));
     }
+    log_httpd_sessions(route, "request_cleanup", ret);
+    log_request_memory_phase(NULL, "request_cleanup");
 }
 
 static bool sensor_ingress_diagnostic_due(bool failure)
@@ -353,14 +457,6 @@ static bool local_id_number_is_allowed(const cJSON *item, uint8_t *out_local_id)
     return true;
 }
 
-static cJSON *local_id_item_from_json(cJSON *root)
-{
-    cJSON *id = cJSON_GetObjectItemCaseSensitive(root, ESP111_PROTOCOL_LOCAL_JSON_ID);
-    return id != NULL ? id :
-                        cJSON_GetObjectItemCaseSensitive(root,
-                                                         ESP111_PROTOCOL_LOCAL_JSON_LOCAL_ID);
-}
-
 static esp_err_t send_json(httpd_req_t *req, const char *status, const char *body)
 {
     httpd_resp_set_type(req, "application/json");
@@ -444,7 +540,9 @@ static esp_err_t read_json_body(httpd_req_t *req,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    char *body = heap_caps_calloc(1, (size_t)req->content_len + 1U, MALLOC_CAP_8BIT);
+    char *body = heap_caps_calloc(1,
+                                  (size_t)req->content_len + 1U,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (body == NULL) {
         if (out_metrics != NULL) {
             out_metrics->recv_duration_ms =
@@ -501,12 +599,11 @@ static void read_peer_ip(httpd_req_t *req, char *out, size_t out_size)
     }
 }
 
-static uint8_t local_id_from_json_body(const char *body, size_t body_len);
-
 static esp_err_t enqueue_body_buffer_with_admission(
     const char *body,
     size_t body_len,
     s3_runtime_msg_kind_t kind,
+    uint8_t local_id,
     const char *command_id,
     s3_scheduler_priority_t priority,
     int64_t received_at_us,
@@ -521,8 +618,9 @@ static esp_err_t enqueue_body_buffer_with_admission(
         return ESP_ERR_INVALID_SIZE;
     }
 
-    s3_runtime_ingress_t *ingress =
-        heap_caps_calloc(1, sizeof(*ingress), MALLOC_CAP_8BIT);
+    s3_runtime_ingress_t *ingress = heap_caps_calloc(1,
+                                                      sizeof(*ingress),
+                                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ingress == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -539,7 +637,6 @@ static esp_err_t enqueue_body_buffer_with_admission(
     if (command_id != NULL) {
         strlcpy(ingress->command_id, command_id, sizeof(ingress->command_id));
     }
-    uint8_t local_id = local_id_from_json_body(body, body_len);
     if (local_id != 0U) {
         const char *short_id = short_device_id_for_local_id(local_id);
         if (short_id != NULL) {
@@ -595,6 +692,7 @@ static esp_err_t enqueue_body_buffer_with_admission(
 static esp_err_t enqueue_body_buffer(const char *body,
                                      size_t body_len,
                                      s3_runtime_msg_kind_t kind,
+                                     uint8_t local_id,
                                      const char *command_id,
                                      s3_scheduler_priority_t priority,
                                      int64_t received_at_us,
@@ -603,6 +701,7 @@ static esp_err_t enqueue_body_buffer(const char *body,
     return enqueue_body_buffer_with_admission(body,
                                               body_len,
                                               kind,
+                                              local_id,
                                               command_id,
                                               priority,
                                               received_at_us,
@@ -613,6 +712,7 @@ static esp_err_t enqueue_body_buffer(const char *body,
 
 static esp_err_t enqueue_sensor_body_buffer(const char *body,
                                             size_t body_len,
+                                            uint8_t local_id,
                                             s3_scheduler_priority_t priority,
                                             int64_t received_at_us,
                                             const char *peer_ip,
@@ -623,6 +723,7 @@ static esp_err_t enqueue_sensor_body_buffer(const char *body,
     return enqueue_body_buffer_with_admission(body,
                                               body_len,
                                               S3_RUNTIME_MSG_SENSOR,
+                                              local_id,
                                               NULL,
                                               priority,
                                               received_at_us,
@@ -660,8 +761,10 @@ static esp_err_t enqueue_local_or_error(httpd_req_t *req,
 {
     const bool sensor_ingress = kind == S3_RUNTIME_MSG_SENSOR;
     const bool telemetry_debug = !sensor_ingress;
+    log_request_memory_phase(req, "before_accept");
     const int64_t started_us = local_http_telemetry_begin(
         req != NULL ? req->uri : "telemetry", telemetry_debug);
+    log_request_memory_phase(req, "after_accept");
     const int64_t received_at_us = esp_timer_get_time();
     char peer_ip[16] = {0};
     read_peer_ip(req, peer_ip, sizeof(peer_ip));
@@ -673,6 +776,8 @@ static esp_err_t enqueue_local_or_error(httpd_req_t *req,
                                    &body,
                                    &body_len,
                                    sensor_ingress ? &body_metrics : NULL);
+    log_request_memory_phase(req, "after_recv");
+    log_sensor_memory_trace(req, "after_recv", body, body_len);
     if (ret != ESP_OK) {
         heap_caps_free(body);
         if (sensor_ingress) {
@@ -686,18 +791,23 @@ static esp_err_t enqueue_local_or_error(httpd_req_t *req,
         const char *http_status = sensor_ingress && ret == ESP_ERR_TIMEOUT ?
                                       "408 Request Timeout" : "400 Bad Request";
         const char *local_error = ret == ESP_ERR_TIMEOUT ? ESP111_PROTOCOL_ERROR_TIMEOUT : error_code;
+        log_sensor_memory_trace(req, "before_response", NULL, 0U);
         esp_err_t send_ret = send_error(req, http_status, local_error, esp_err_to_name(ret));
+        log_sensor_memory_trace(req, "after_response", NULL, 0U);
         local_http_telemetry_finish(req->uri, started_us, ret, telemetry_debug);
         return send_ret;
     }
 
     uint8_t local_id = 0;
     ret = validate_local_body(body, body_len, &local_id);
+    log_request_memory_phase(req, "after_parse");
+    log_sensor_memory_trace(req, "after_parse", body, body_len);
     const char *failure_stage = ret == ESP_OK ? "accepted" : "validation_failure";
     if (ret == ESP_OK) {
         ret = sensor_ingress ?
                   enqueue_sensor_body_buffer(body,
                                              body_len,
+                                             local_id,
                                              priority,
                                              received_at_us,
                                              peer_ip,
@@ -705,6 +815,7 @@ static esp_err_t enqueue_local_or_error(httpd_req_t *req,
                   enqueue_body_buffer(body,
                                       body_len,
                                       kind,
+                                      local_id,
                                       NULL,
                                       priority,
                                       received_at_us,
@@ -722,6 +833,8 @@ static esp_err_t enqueue_local_or_error(httpd_req_t *req,
             }
         }
     }
+    log_request_memory_phase(req, "after_enqueue");
+    log_sensor_memory_trace(req, "after_enqueue", body, body_len);
     heap_caps_free(body);
 
     if (ret != ESP_OK) {
@@ -738,7 +851,9 @@ static esp_err_t enqueue_local_or_error(httpd_req_t *req,
                                failure_stage,
                                ret);
         }
+        log_sensor_memory_trace(req, "before_response", NULL, 0U);
         esp_err_t send_ret = send_error(req, http_status, local_error, esp_err_to_name(ret));
+        log_sensor_memory_trace(req, "after_response", NULL, 0U);
         local_http_telemetry_finish(req->uri, started_us, ret, telemetry_debug);
         return send_ret;
     }
@@ -750,25 +865,12 @@ static esp_err_t enqueue_local_or_error(httpd_req_t *req,
                            "accepted",
                            ESP_OK);
     }
+    log_sensor_memory_trace(req, "before_response", NULL, 0U);
     esp_err_t send_ret = send_local_ok(req, local_id, status);
+    log_request_memory_phase(req, "response_sent");
+    log_sensor_memory_trace(req, "after_response", NULL, 0U);
     local_http_telemetry_finish(req->uri, started_us, send_ret, telemetry_debug);
     return send_ret;
-}
-
-static uint8_t local_id_from_json_body(const char *body, size_t body_len)
-{
-    uint8_t local_id = 0;
-    cJSON *root = body != NULL ? cJSON_ParseWithLength(body, body_len) : NULL;
-    if (root != NULL) {
-        cJSON *id = local_id_item_from_json(root);
-        if (local_id_number_is_allowed(id, &local_id)) {
-            /* accepted */
-        } else if (cJSON_IsString(id) && id->valuestring != NULL) {
-            local_id = protocol_adapter_device_id_to_local_id(id->valuestring);
-        }
-        cJSON_Delete(root);
-    }
-    return local_id;
 }
 
 static esp_err_t validate_command_ack_local_id(const char *body,
@@ -919,13 +1021,22 @@ static esp_err_t commands_pending_handler(httpd_req_t *req)
                           "id is not allowed");
     }
 
-    char body[2048];
-    esp_err_t ret = command_router_build_pending_json(device_id, body, sizeof(body));
-    return ret == ESP_OK ? send_json(req, "200 OK", body)
-                         : send_error(req,
-                                      "400 Bad Request",
-                                      ESP111_PROTOCOL_ERROR_COMMAND_POLL_FAILED,
-                                      esp_err_to_name(ret));
+    char *body = heap_caps_calloc(1U, 2048U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (body == NULL) {
+        return send_error(req,
+                          "503 Service Unavailable",
+                          ESP111_PROTOCOL_ERROR_COMMAND_POLL_FAILED,
+                          "no_memory");
+    }
+    esp_err_t ret = command_router_build_pending_json(device_id, body, 2048U);
+    const esp_err_t response_ret = ret == ESP_OK
+        ? send_json(req, "200 OK", body)
+        : send_error(req,
+                     "400 Bad Request",
+                     ESP111_PROTOCOL_ERROR_COMMAND_POLL_FAILED,
+                     esp_err_to_name(ret));
+    heap_caps_free(body);
+    return response_ret;
 }
 
 static esp_err_t command_ack_handler(httpd_req_t *req)
@@ -965,12 +1076,25 @@ static esp_err_t command_ack_handler(httpd_req_t *req)
                           esp_err_to_name(ret));
     }
 
+    ret = voice_proxy_handle_command_ack(command_id, body, body_len);
+    if (ret != ESP_ERR_NOT_FOUND) {
+        heap_caps_free(body);
+        if (ret != ESP_OK) {
+            return send_error(req,
+                              ret == ESP_ERR_NOT_ALLOWED ? "409 Conflict" : "400 Bad Request",
+                              ESP111_PROTOCOL_ERROR_INVALID_ACK,
+                              esp_err_to_name(ret));
+        }
+        return send_json(req, "200 OK", "{\"status\":\"ok\"}");
+    }
+
     uint8_t local_id = 0U;
     ret = validate_command_ack_local_id(body, body_len, command_id, &local_id);
     if (ret == ESP_OK) {
         ret = enqueue_body_buffer(body,
                                   body_len,
                                   S3_RUNTIME_MSG_EVENT,
+                                  local_id,
                                   command_id,
                                   S3_SCHEDULER_PRIORITY_HIGH,
                                   received_at_us,
@@ -1076,9 +1200,11 @@ esp_err_t local_http_server_start_with_reason(const char *reason)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = gateway_config_get()->local_http_port;
     config.max_open_sockets = 4;
+    s_httpd_max_open_sockets = config.max_open_sockets;
     config.max_uri_handlers = 14;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8192;
+    config.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
 
     httpd_handle_t server = NULL;
     esp_err_t ret = httpd_start(&server, &config);
@@ -1106,6 +1232,7 @@ esp_err_t local_http_server_start_with_reason(const char *reason)
         {.uri = ESP111_PROTOCOL_ROUTE_SENSOR, .method = HTTP_POST, .handler = status_or_sensor_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_RADAR_RESULT, .method = HTTP_POST, .handler = radar_local_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_RADAR_DEBUG, .method = HTTP_GET, .handler = radar_debug_handler},
+        {.uri = ESP111_PROTOCOL_ROUTE_RADAR_HOME_SNAPSHOT, .method = HTTP_GET, .handler = radar_home_snapshot_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_DEVICE_STREAM, .method = HTTP_POST, .handler = device_stream_handler},
         {.uri = ESP111_PROTOCOL_ROUTE_VOICE_TURN, .method = HTTP_POST, .handler = voice_proxy_handle_turn},
         {.uri = ESP111_PROTOCOL_ROUTE_WAKE_PROMPT_AUDIO, .method = HTTP_GET, .handler = wake_prompt_cache_gateway_handle_http},
@@ -1129,10 +1256,10 @@ esp_err_t local_http_server_start_with_reason(const char *reason)
     s_server = server;
     s_server_routes_registered = true;
     log_server_state_locked(LOCAL_HTTP_SERVER_STATE_RUNNING, reason, ESP_OK);
-    ESP_LOGI(TAG, "local HTTP server started port=%u base=%s handle=%p",
+    ESP_LOGI(TAG, "local HTTP server started port=%u base=%s handle=%p max_open_sockets=%u",
              (unsigned int)gateway_config_get()->local_http_port,
              ESP111_PROTOCOL_LOCAL_BASE,
-             (void *)s_server);
+             (void *)s_server, (unsigned int)config.max_open_sockets);
     xSemaphoreGive(lock);
     return ESP_OK;
 }

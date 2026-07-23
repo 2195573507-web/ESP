@@ -23,4 +23,9 @@ static inline BaseType_t xSemaphoreGive(SemaphoreHandle_t lock)
     return pdTRUE;
 }
 
+static inline void vSemaphoreDelete(SemaphoreHandle_t lock)
+{
+    (void)lock;
+}
+
 #endif /* FREERTOS_SEMPHR_H */

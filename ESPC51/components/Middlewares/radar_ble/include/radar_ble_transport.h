@@ -36,6 +36,7 @@ int radar_ble_send_control_command(void);
 
 int radar_ble_transport_start(radar_ble_notify_cb_t callback, void *ctx);
 void radar_ble_transport_stop(void);
+bool radar_ble_transport_is_stopped(void);
 void radar_ble_transport_set_data_ready(bool ready);
 void radar_ble_transport_get_status(radar_ble_transport_status_t *out);
 const char *radar_ble_state_name(radar_ble_state_t state);

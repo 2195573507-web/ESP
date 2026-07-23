@@ -67,6 +67,8 @@ const char *gateway_link_state_name(gateway_link_state_t state);
 
 /** @brief 只有 LINK_READY 才允许普通业务和新的 server voice turn。 */
 bool gateway_link_is_ready(void);
+/** @brief Local S3 is usable for UDP WakeNet even when the cloud-facing voice path is degraded. */
+bool gateway_link_is_local_ready(void);
 
 /** @brief 状态非 READY 时即为 reconnect mode。 */
 bool gateway_link_in_reconnect_mode(void);

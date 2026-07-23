@@ -33,6 +33,12 @@ const char *offline_policy_code_for_result(esp_err_t ret, int http_status)
     if (ret == ESP_OK && http_status >= 200 && http_status < 300) {
         return "";
     }
+    /* A caller may synthesize a 5xx response when its Server-health gate
+     * rejects a request before opening an HTTP socket. Preserve that explicit
+     * upstream attribution instead of collapsing it into a local-link error. */
+    if (http_status >= 500) {
+        return ESP111_PROTOCOL_ERROR_SERVER_UNAVAILABLE;
+    }
     if (ret == ESP_ERR_INVALID_STATE) {
         return ESP111_PROTOCOL_ERROR_GATEWAY_OFFLINE;
     }
@@ -42,7 +48,7 @@ const char *offline_policy_code_for_result(esp_err_t ret, int http_status)
     if (http_status == 409 || http_status == 429) {
         return ESP111_PROTOCOL_ERROR_VOICE_BUSY;
     }
-    if (http_status >= 500 || http_status == 0) {
+    if (http_status == 0) {
         return ESP111_PROTOCOL_ERROR_SERVER_UNAVAILABLE;
     }
     if (http_status >= 400) {

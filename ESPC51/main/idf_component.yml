@@ -1,5 +1,4 @@
 ## IDF Component Manager Manifest File
 dependencies:
-  espressif/esp-sr: "^2.1.0"
   idf:
     version: '>=4.1.0'

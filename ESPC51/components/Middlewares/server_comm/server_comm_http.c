@@ -63,6 +63,7 @@ struct server_comm_raw_stream {
 };
 
 static void server_comm_reset_response(server_comm_http_response_t *response);
+static void server_comm_stream_reset_transport(server_comm_raw_stream_t *stream);
 static bool server_comm_request_is_reconnect_for_current_task(void);
 static bool server_comm_endpoint_is_wake_prompt(const char *endpoint);
 static bool server_comm_endpoint_is_voice_turn(const char *endpoint);
@@ -291,6 +292,22 @@ static void server_comm_stream_apply_timing(server_comm_raw_stream_t *stream,
     server_comm_reset_response(&stream->response_headers);
     stream->event_ctx.body_ctx = NULL;
     stream->event_ctx.response = &stream->response_headers;
+}
+
+/* A failed header fetch leaves esp_http_client in a transport-specific error
+ * state (notably after a peer reset). Close that handle before the caller's
+ * normal stream cleanup so no stale socket/transport state can leak into a
+ * later operation. The stream object itself remains owned by its caller. */
+static void server_comm_stream_reset_transport(server_comm_raw_stream_t *stream)
+{
+    if (stream == NULL || stream->client == NULL) {
+        return;
+    }
+    (void)esp_http_client_close(stream->client);
+    stream->headers_fetched = false;
+    stream->response_bytes = 0U;
+    stream->first_response_byte_ms = 0;
+    server_comm_reset_response(&stream->response_headers);
 }
 
 static esp_err_t server_comm_classify_header_open_error(esp_err_t ret, bool detailed)
@@ -1206,6 +1223,7 @@ esp_err_t server_comm_http_fetch_headers(server_comm_raw_stream_t *stream,
     }
     int64_t header_ret = esp_http_client_fetch_headers(stream->client);
     if (header_ret < 0) {
+        server_comm_stream_reset_transport(stream);
         esp_err_t fetch_ret =
             server_comm_classify_fetch_header_error(header_ret, stream->detailed_errors);
         if (!gateway_link_in_reconnect_mode()) {

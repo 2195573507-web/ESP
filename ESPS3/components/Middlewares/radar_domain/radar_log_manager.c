@@ -130,7 +130,9 @@ static void format_occupied_rooms(const RadarHomeState *home,
     const int prefix_written = snprintf(out, out_size, "[");
     if (prefix_written < 0 || (size_t)prefix_written >= out_size) return;
     used = (size_t)prefix_written;
-    for (uint8_t i = 0U; i < home->occupied_room_count; ++i) {
+    const size_t room_count = home->occupied_room_count > RADAR_SOURCE_COUNT
+        ? RADAR_SOURCE_COUNT : home->occupied_room_count;
+    for (size_t i = 0U; i < room_count; ++i) {
         const RadarRoomState *room = &home->occupied_rooms[i];
         const int written = snprintf(out + used, out_size - used, "%s%s:%s",
                                      i == 0U ? "" : "|", room->source, room->room_id);
@@ -396,13 +398,15 @@ esp_err_t radar_log_manager_start(void)
     while (xSemaphoreTake(s_exit, 0) == pdTRUE) {
     }
     s_stop_requested = false;
+    /* This task drains already-copied radar snapshots and emits logs. It does
+     * not run in the UART/cache-off path, so its 6 KiB stack can live in PSRAM. */
     const BaseType_t created = xTaskCreateWithCaps(log_task,
                                                    "radar_log",
                                                    RADAR_CONFIG_LOG_TASK_STACK,
                                                    NULL,
                                                    RADAR_CONFIG_LOG_TASK_PRIORITY,
                                                    &s_task,
-                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                   APP_TASK_STACK_CAPS_PSRAM);
     if (created != pdPASS) {
         s_task = NULL;
         return ESP_ERR_NO_MEM;

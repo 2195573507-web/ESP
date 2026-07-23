@@ -28,4 +28,9 @@ static inline BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType
     return pdFALSE;
 }
 
+static inline void vQueueDelete(QueueHandle_t queue)
+{
+    (void)queue;
+}
+
 #endif /* FREERTOS_QUEUE_H */

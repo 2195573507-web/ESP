@@ -23,7 +23,18 @@ extern "C" {
 #define SERVER_CLIENT_SMALL_BODY_BYTES 2048U
 
 typedef esp_err_t (*server_client_data_cb_t)(const uint8_t *data, size_t len, void *user_ctx);
-typedef void (*server_client_voice_meta_cb_t)(int64_t content_length, void *user_ctx);
+typedef struct {
+    int64_t content_length;
+    int http_status;
+    bool chunked;
+    const char *content_type;
+    const char *audio_format;
+    const char *audio_sample_rate;
+    const char *audio_channels;
+} server_client_voice_response_meta_t;
+
+typedef esp_err_t (*server_client_voice_meta_cb_t)(const server_client_voice_response_meta_t *meta,
+                                                   void *user_ctx);
 typedef bool (*server_client_cancel_cb_t)(void *user_ctx);
 
 /** @brief POST 完整 ingest JSON 到 Server；sensor_aggregator 调用，失败由 offline_policy 记录。 */
@@ -92,6 +103,32 @@ esp_err_t server_client_post_weather_refresh_json(const char *json_body,
                                                   int *http_status);
 /** @brief 轻量探测 ESP-server 是否可达；network_worker 在打开 LINK_STABLE 前调用。 */
 esp_err_t server_client_probe_available(int *http_status);
+
+/**
+ * @brief HTTP memory admission classes for S3 external requests.
+ *
+ * BEST_EFFORT covers probe/overview, weather, snapshot, and BME replay.
+ * TELEMETRY covers device ingest/logs/alarms. CORE covers command and voice.
+ * Local SoftAP sensor receive does not use these gates.
+ */
+typedef enum {
+    SERVER_CLIENT_HTTP_CLASS_CORE = 0,
+    SERVER_CLIENT_HTTP_CLASS_TELEMETRY,
+    SERVER_CLIENT_HTTP_CLASS_BEST_EFFORT,
+} server_client_http_class_t;
+
+/**
+ * @brief Gate external HTTP/TLS when internal or DMA heap is under pressure.
+ *
+ * @return ESP_OK when a new connection may start.
+ * @return ESP_ERR_HTTP_EAGAIN when pressure or unified backoff requires deferral.
+ */
+esp_err_t server_client_http_mem_admission(server_client_http_class_t http_class,
+                                           const char *endpoint);
+
+/** @brief True when best-effort external HTTP should stay deferred. */
+bool server_client_http_best_effort_should_defer(void);
+uint32_t server_client_http_mem_backoff_remaining_ms(server_client_http_class_t http_class);
 /**
  * @brief STA epoch 失效或切换时取消旧 epoch 的活跃 HTTP 请求。
  *
@@ -145,7 +182,7 @@ esp_err_t server_client_ack_command(const char *command_id,
  * @param user_ctx 回调上下文。
  * @param http_status 输出 Server HTTP status，可为空。
  * @param response_content_length 输出 Server 响应 Content-Length；chunked/未知时为 -1，可为空。
- * @param on_meta 收到 Server 响应头后调用；voice_proxy 用于在首个 PCM chunk 前记录 expected_bytes。
+ * @param on_meta 收到 Server 响应头后调用；voice_proxy 用于验证并透传 PCM 元数据。
  * @param meta_ctx on_meta 上下文。
  * @return ESP_OK 表示 Server 返回 2xx；STA 未连接、HTTP 失败或非 2xx 返回错误码。
  * 失败处理：voice_proxy 将错误映射为本地 JSON 错误，offline_policy 记录降级状态。

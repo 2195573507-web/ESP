@@ -9,6 +9,7 @@
  */
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "esp_err.h"
 #include "esp_http_server.h"
@@ -30,6 +31,15 @@ bool voice_proxy_is_busy(void);
  * 失败处理：本函数内部尽量向 C5 写 JSON 错误；Server 路径失败由 offline_policy 记录。
  */
 esp_err_t voice_proxy_handle_turn(httpd_req_t *req);
+/**
+ * @brief 消费匹配 local voice command capture 的 ACK；不会转发给 Server。
+ *
+ * 若 command_id 不属于当前 pending capture，返回 ESP_ERR_NOT_FOUND，让本地 HTTP
+ * handler 保持既有远程 command ACK 路径。
+ */
+esp_err_t voice_proxy_handle_command_ack(const char *command_id,
+                                         const char *body,
+                                         size_t body_len);
 
 #ifdef __cplusplus
 }

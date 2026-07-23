@@ -22,14 +22,20 @@
 #include "freertos/idf_additions.h"
 #define ENV_ALARM_STORAGE_ALLOC(count, size) \
     heap_caps_calloc((count), (size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define ENV_ALARM_STORAGE_FREE(pointer) heap_caps_free((pointer))
+#define ENV_ALARM_BODY_ALLOC(size) heap_caps_malloc((size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define ENV_ALARM_BODY_FREE(pointer) heap_caps_free((pointer))
 #define ENV_ALARM_COMPLETION_QUEUE_CREATE(depth, item_size) \
     xQueueCreateWithCaps((depth), (item_size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define ENV_ALARM_REPORTER_TASK_CREATE(task, name, stack, arg, priority, handle) \
     xTaskCreateWithCaps((task), (name), (stack), (arg), (priority), (handle), \
-                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #else
 #include <stdlib.h>
 #define ENV_ALARM_STORAGE_ALLOC(count, size) calloc((count), (size))
+#define ENV_ALARM_STORAGE_FREE(pointer) free((pointer))
+#define ENV_ALARM_BODY_ALLOC(size) malloc((size))
+#define ENV_ALARM_BODY_FREE(pointer) free((pointer))
 #define ENV_ALARM_COMPLETION_QUEUE_CREATE(depth, item_size) xQueueCreate((depth), (item_size))
 #define ENV_ALARM_REPORTER_TASK_CREATE(task, name, stack, arg, priority, handle) \
     xTaskCreate((task), (name), (stack), (arg), (priority), (handle))
@@ -39,7 +45,8 @@
 #define ENV_ALARM_REPORTER_POLL_MS 500U
 #define ENV_ALARM_REPORTER_STATS_INTERVAL_MS 60000U
 #define ENV_ALARM_REPORTER_JSON_BYTES 1024U
-#define ENV_ALARM_REPORTER_TASK_STACK 3072U
+#define ENV_ALARM_REPORTER_TASK_STACK 5120U
+#define ENV_ALARM_REPORTER_STACK_LOG_INTERVAL_MS 30000U
 #define ENV_ALARM_REPORTER_TASK_PRIORITY (tskIDLE_PRIORITY + 1U)
 
 typedef struct {
@@ -71,6 +78,12 @@ typedef struct {
     environment_alarm_dead_letter_t dead_letters[8];
     alarm_event_t drain_events[ALARM_ENGINE_MAX_EVENTS_PER_UPDATE];
     char json_buffer[ENV_ALARM_REPORTER_JSON_BYTES];
+    char alarm_id[24];
+    char event_seq[24];
+    char local_ingest_seq[24];
+    char dedup_key[112];
+    char title[96];
+    alarm_event_t submit_event;
 } environment_alarm_reporter_storage_t;
 
 static environment_alarm_reporter_storage_t *s_storage;
@@ -78,11 +91,42 @@ static environment_alarm_reporter_storage_t *s_storage;
 #define s_dead_letters (s_storage->dead_letters)
 #define s_drain_events (s_storage->drain_events)
 #define s_json_buffer (s_storage->json_buffer)
+#define s_fmt_alarm_id (s_storage->alarm_id)
+#define s_fmt_event_seq (s_storage->event_seq)
+#define s_fmt_local_ingest_seq (s_storage->local_ingest_seq)
+#define s_fmt_dedup_key (s_storage->dedup_key)
+#define s_fmt_title (s_storage->title)
+#define s_submit_event (s_storage->submit_event)
 static size_t s_head;
 static size_t s_count;
 static size_t s_dead_letter_cursor;
 static environment_alarm_reporter_stats_t s_stats;
 static int64_t s_last_stats_log_ms;
+#ifdef ESP_PLATFORM
+static int64_t s_last_stack_log_ms;
+#endif
+
+static void environment_alarm_reporter_rollback_init(void)
+{
+    s_initialized = false;
+    s_task = NULL;
+    if (s_completion_queue != NULL) {
+        vQueueDelete(s_completion_queue);
+        s_completion_queue = NULL;
+    }
+    if (s_lock != NULL) {
+        vSemaphoreDelete(s_lock);
+        s_lock = NULL;
+    }
+    if (s_storage != NULL) {
+        ENV_ALARM_STORAGE_FREE(s_storage);
+        s_storage = NULL;
+    }
+    s_head = 0U;
+    s_count = 0U;
+    s_dead_letter_cursor = 0U;
+    memset(&s_stats, 0, sizeof(s_stats));
+}
 
 static uint64_t now_ms(void)
 {
@@ -291,27 +335,25 @@ static bool build_payload(const alarm_event_t *event)
     if (event == NULL || device_name(event->device_id)[0] == '\0') {
         return false;
     }
+    if (s_storage == NULL) {
+        return false;
+    }
     const char *device = device_name(event->device_id);
     const char *room = event->room_id[0] != '\0' ? event->room_id : default_room(event->device_id);
     const char *state = state_name(event->status);
-    char alarm_id[24];
-    char event_seq[24];
-    char local_ingest_seq[24];
-    char dedup_key[112];
-    char title[96];
-    (void)snprintf(alarm_id, sizeof(alarm_id), "%016" PRIx64, event->alarm_id);
-    (void)snprintf(event_seq, sizeof(event_seq), "%" PRIu64, event->event_seq);
-    (void)snprintf(local_ingest_seq, sizeof(local_ingest_seq), "%" PRIu64, event->local_ingest_seq);
-    (void)snprintf(dedup_key,
-                   sizeof(dedup_key),
+    (void)snprintf(s_fmt_alarm_id, sizeof(s_storage->alarm_id), "%016" PRIx64, event->alarm_id);
+    (void)snprintf(s_fmt_event_seq, sizeof(s_storage->event_seq), "%" PRIu64, event->event_seq);
+    (void)snprintf(s_fmt_local_ingest_seq, sizeof(s_storage->local_ingest_seq), "%" PRIu64, event->local_ingest_seq);
+    (void)snprintf(s_fmt_dedup_key,
+                   sizeof(s_storage->dedup_key),
                    "env:%s:%s:%s:%016" PRIx64 ":%016" PRIx64,
                    device,
                    rule_name(event->alarm_type),
                    state,
                    event->alarm_id,
                    event->event_seq);
-    (void)snprintf(title,
-                   sizeof(title),
+    (void)snprintf(s_fmt_title,
+                   sizeof(s_storage->title),
                    "Environment %s %s",
                    rule_name(event->alarm_type),
                    state);
@@ -325,14 +367,14 @@ static bool build_payload(const alarm_event_t *event)
     bool ok = true;
     ok = ok && cJSON_AddStringToObject(root, "device_id", device) != NULL;
     ok = ok && cJSON_AddStringToObject(root, "level", level_name(event->alarm_level)) != NULL;
-    ok = ok && cJSON_AddStringToObject(root, "title", title) != NULL;
-    ok = ok && cJSON_AddStringToObject(root, "message", event->description[0] != '\0' ? event->description : title) != NULL;
+    ok = ok && cJSON_AddStringToObject(root, "title", s_fmt_title) != NULL;
+    ok = ok && cJSON_AddStringToObject(root, "message", event->description[0] != '\0' ? event->description : s_fmt_title) != NULL;
     ok = ok && cJSON_AddBoolToObject(root, "acknowledged", false) != NULL;
     ok = ok && cJSON_AddStringToObject(root, "room_id", room) != NULL;
     ok = ok && cJSON_AddStringToObject(root, "room_name", room) != NULL;
     ok = ok && cJSON_AddStringToObject(root, "source", "s3_environment_alarm") != NULL;
-    ok = ok && cJSON_AddStringToObject(metadata, "alarm_id", alarm_id) != NULL;
-    ok = ok && cJSON_AddStringToObject(metadata, "dedup_key", dedup_key) != NULL;
+    ok = ok && cJSON_AddStringToObject(metadata, "alarm_id", s_fmt_alarm_id) != NULL;
+    ok = ok && cJSON_AddStringToObject(metadata, "dedup_key", s_fmt_dedup_key) != NULL;
     ok = ok && cJSON_AddStringToObject(metadata, "rule_id", rule_name(event->alarm_type)) != NULL;
     ok = ok && cJSON_AddStringToObject(metadata, "alarm_type", rule_name(event->alarm_type)) != NULL;
     ok = ok && cJSON_AddStringToObject(metadata, "severity", level_name(event->alarm_level)) != NULL;
@@ -342,9 +384,9 @@ static bool build_payload(const alarm_event_t *event)
     ok = ok && cJSON_AddStringToObject(metadata, "unit", event->unit[0] != '\0' ? event->unit : "unknown") != NULL;
     ok = ok && cJSON_AddStringToObject(metadata, "source", event->source[0] != '\0' ? event->source : "c5_bme690") != NULL;
     ok = ok && cJSON_AddStringToObject(metadata, "sensor_state", sensor_state_name(event->sensor_state)) != NULL;
-    ok = ok && cJSON_AddStringToObject(metadata, "event_seq", event_seq) != NULL;
+    ok = ok && cJSON_AddStringToObject(metadata, "event_seq", s_fmt_event_seq) != NULL;
     ok = ok && cJSON_AddNumberToObject(metadata, "remote_seq", event->remote_seq) != NULL;
-    ok = ok && cJSON_AddStringToObject(metadata, "local_ingest_seq", local_ingest_seq) != NULL;
+    ok = ok && cJSON_AddStringToObject(metadata, "local_ingest_seq", s_fmt_local_ingest_seq) != NULL;
     ok = ok && cJSON_AddNumberToObject(metadata, "monotonic_timestamp_ms", (double)event->event_monotonic_ms) != NULL;
     ok = ok && cJSON_AddNumberToObject(metadata, "observed_value", event->observed_value) != NULL;
     ok = ok && cJSON_AddNumberToObject(metadata, "trigger_threshold", event->trigger_threshold) != NULL;
@@ -397,47 +439,60 @@ static void complete_local_submission_failure(uint64_t event_seq, esp_err_t resu
 static void submit_head_if_due(void)
 {
     if (!network_worker_is_server_ready() ||
-        network_worker_get_link_state() != NETWORK_WORKER_LINK_STABLE || s_lock == NULL) {
+        network_worker_get_link_state() != NETWORK_WORKER_LINK_STABLE || s_lock == NULL ||
+        s_storage == NULL) {
         return;
     }
-    environment_alarm_pending_t pending = {0};
+    uint64_t event_seq = 0U;
+    uint8_t retry_count = 0U;
+    alarm_type_t alarm_type = ALARM_TYPE_COUNT;
+    alarm_device_id_t device_id = ALARM_DEVICE_INVALID;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (s_count == 0U || pending_at(0U)->in_flight ||
         pending_at(0U)->next_attempt_ms > now_ms()) {
         xSemaphoreGive(s_lock);
         return;
     }
-    pending = *pending_at(0U);
+    s_submit_event = pending_at(0U)->event;
+    event_seq = s_submit_event.event_seq;
+    retry_count = pending_at(0U)->retry_count;
+    alarm_type = s_submit_event.alarm_type;
+    device_id = s_submit_event.device_id;
     pending_at(0U)->in_flight = true;
     xSemaphoreGive(s_lock);
 
-    if (!build_payload(&pending.event)) {
-        complete_local_submission_failure(pending.event.event_seq, ESP_ERR_INVALID_SIZE);
+    if (!build_payload(&s_submit_event)) {
+        complete_local_submission_failure(event_seq, ESP_ERR_INVALID_SIZE);
         return;
     }
     const size_t json_length = strlen(s_json_buffer);
-    char *json_body = cJSON_malloc(json_length + 1U);
+    char *json_body = ENV_ALARM_BODY_ALLOC(json_length + 1U);
     if (json_body == NULL) {
-        complete_local_submission_failure(pending.event.event_seq, ESP_ERR_NO_MEM);
+        complete_local_submission_failure(event_seq, ESP_ERR_NO_MEM);
         return;
     }
     memcpy(json_body, s_json_buffer, json_length + 1U);
     const esp_err_t ret = network_worker_submit_environment_alarm_json(json_body,
-                                                                         pending.event.event_seq,
+                                                                         event_seq,
                                                                          reporter_network_complete,
                                                                          NULL,
                                                                          "environment_alarm");
     if (ret != ESP_OK) {
-        cJSON_free(json_body);
-        complete_local_submission_failure(pending.event.event_seq, ret);
+        ENV_ALARM_BODY_FREE(json_body);
+        complete_local_submission_failure(event_seq, ret);
         return;
     }
     ESP_LOGI(TAG,
              "ENV_ALARM_REPORT event_seq=%" PRIu64 " rule=%s device=%s attempt=%u result=submitted queue_action=retain",
-             pending.event.event_seq,
-             rule_name(pending.event.alarm_type),
-             device_name(pending.event.device_id),
-             (unsigned int)pending.retry_count + 1U);
+             event_seq,
+             rule_name(alarm_type),
+             device_name(device_id),
+             (unsigned int)retry_count + 1U);
+    /* Host log stubs discard variadic arguments. Keep the delivery metadata
+     * explicitly referenced so the same reporter source is warning-clean. */
+    (void)alarm_type;
+    (void)device_id;
+    (void)retry_count;
 }
 
 static void log_stats_if_due(void)
@@ -470,6 +525,7 @@ static void environment_alarm_reporter_task(void *arg)
                              "environment_alarm_reporter",
                              ENV_ALARM_REPORTER_TASK_STACK,
                              "entry");
+    s_last_stack_log_ms = 0;
 #endif
     for (;;) {
         process_completions();
@@ -477,6 +533,12 @@ static void environment_alarm_reporter_task(void *arg)
         (void)environment_alarm_reporter_drain_engine();
         submit_head_if_due();
         log_stats_if_due();
+#ifdef ESP_PLATFORM
+        app_stack_monitor_log_periodic(TAG,
+                                       "environment_alarm_reporter",
+                                       &s_last_stack_log_ms,
+                                       ENV_ALARM_REPORTER_STACK_LOG_INTERVAL_MS);
+#endif
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ENV_ALARM_REPORTER_POLL_MS));
     }
 }
@@ -495,6 +557,7 @@ esp_err_t environment_alarm_reporter_init(void)
     if (s_lock == NULL) {
         s_lock = xSemaphoreCreateMutex();
         if (s_lock == NULL) {
+            environment_alarm_reporter_rollback_init();
             return ESP_ERR_NO_MEM;
         }
     }
@@ -502,6 +565,7 @@ esp_err_t environment_alarm_reporter_init(void)
         s_completion_queue = ENV_ALARM_COMPLETION_QUEUE_CREATE(ENV_ALARM_REPORTER_COMPLETION_DEPTH,
                                                                 sizeof(environment_alarm_completion_t));
         if (s_completion_queue == NULL) {
+            environment_alarm_reporter_rollback_init();
             return ESP_ERR_NO_MEM;
         }
     }
@@ -523,11 +587,7 @@ esp_err_t environment_alarm_reporter_init(void)
                                                              ENV_ALARM_REPORTER_TASK_PRIORITY,
                                                              &s_task);
         if (created != pdPASS) {
-            s_task = NULL;
-            xSemaphoreTake(s_lock, portMAX_DELAY);
-            s_initialized = false;
-            s_stats.ready = false;
-            xSemaphoreGive(s_lock);
+            environment_alarm_reporter_rollback_init();
             return ESP_ERR_NO_MEM;
         }
 #ifdef ESP_PLATFORM

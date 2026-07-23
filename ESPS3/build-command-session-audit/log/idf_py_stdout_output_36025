@@ -1,0 +1,9 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python -DESP_PLATFORM=1 -DCCACHE_ENABLE=0 /Users/zhiqin/ESP 部分开发 1/ESPS3
+-- IDF_TARGET is not set, guessed 'esp32s3' from sdkconfig '/Users/zhiqin/ESP 部分开发 1/ESPS3/sdkconfig'
+-- Found Git: /usr/bin/git (found version "2.50.1 (Apple Git-155)")
+-- Minimal build - OFF
+-- The C compiler identification is unknown
+-- The CXX compiler identification is unknown
+-- The ASM compiler identification is unknown
+-- Found assembler: xtensa-esp32s3-elf-gcc
+-- Configuring incomplete, errors occurred!

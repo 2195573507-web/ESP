@@ -23,7 +23,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 #include "freertos/task.h"
-#include "radar_resource_adapter.h"
 #include "system_service.h"
 #include "terminal_config.h"
 
@@ -67,11 +66,14 @@ static c5_scheduled_task_t s_scheduler_timers[] = {
     {C5_TASK_TYPE_SYSTEM_HEARTBEAT, C5_EVENT_HEARTBEAT, 0},
     {C5_TASK_TYPE_SYSTEM_STATUS, C5_EVENT_STATUS, 0},
     {C5_TASK_TYPE_SYSTEM_COMMAND_POLL, C5_EVENT_COMMAND, 0},
+    {C5_TASK_TYPE_RADAR_HOME_SNAPSHOT, C5_EVENT_RADAR_HOME_SNAPSHOT, 0},
 };
 static portMUX_TYPE s_backpressure_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_dispatcher_task;
 static StackType_t *s_dispatcher_stack;
 static StaticTask_t s_dispatcher_storage;
+#define C5_SCHEDULER_TASK_STACK_WORDS \
+    ((C5_SCHEDULER_TASK_STACK + sizeof(StackType_t) - 1U) / sizeof(StackType_t))
 static uint64_t s_last_diagnostic_log_ms;
 
 /* 只使用 esp_timer uptime；C5 不依赖 Server 时间来驱动本地调度。 */
@@ -120,6 +122,7 @@ static c5_task_priority_t c5_task_priority(c5_task_type_t task_type)
     case C5_TASK_TYPE_SYSTEM_HEARTBEAT:
     case C5_TASK_TYPE_SYSTEM_STATUS:
     case C5_TASK_TYPE_SYSTEM_COMMAND_POLL:
+    case C5_TASK_TYPE_RADAR_HOME_SNAPSHOT:
     case C5_TASK_TYPE_BME_SENSOR:
     case C5_TASK_TYPE_NORMAL:
     default:
@@ -144,6 +147,8 @@ const char *c5_task_type_name(c5_task_type_t task_type)
         return "system_command_poll";
     case C5_TASK_TYPE_BME_SENSOR:
         return "bme_sensor";
+    case C5_TASK_TYPE_RADAR_HOME_SNAPSHOT:
+        return "radar_home_snapshot";
     default:
         return "unknown";
     }
@@ -204,7 +209,8 @@ bool c5_should_run(c5_task_type_t task_type)
     if (state.voice_active) {
         return false;
     }
-    if (state.gateway_state != LINK_READY) {
+    /* BME sampling is local and remains active offline; only its upload is gated below. */
+    if (task_type != C5_TASK_TYPE_BME_SENSOR && state.gateway_state != LINK_READY) {
         return false;
     }
     if (state.cpu_idle_estimate < C5_BACKPRESSURE_CRITICAL_CPU_IDLE) {
@@ -225,16 +231,7 @@ static uint32_t c5_base_interval_ms(c5_task_type_t task_type)
     switch (task_type) {
     case C5_TASK_TYPE_BME_SENSOR: {
         uint32_t period_ms = terminal_config_get_upload_period_ms();
-        const uint32_t base_period_ms = period_ms > 0U ? period_ms :
-                                                        BME_SENSOR_READ_UPLOAD_PERIOD_MS;
-#if CONFIG_C5_BME_ADAPTIVE_REPORT
-        const uint32_t adaptive_period_ms =
-            radar_resource_adapter_bme_event_period_ms(c5_scheduler_now_ms());
-        /* Sampling keeps its established cadence; only post-voice recovery needs an earlier tick. */
-        return adaptive_period_ms < base_period_ms ? adaptive_period_ms : base_period_ms;
-#else
-        return base_period_ms;
-#endif
+        return period_ms > 0U ? period_ms : BME_SENSOR_READ_UPLOAD_PERIOD_MS;
     }
     case C5_TASK_TYPE_SYSTEM_HEARTBEAT:
         return SYSTEM_SERVICE_HEARTBEAT_INTERVAL_MS;
@@ -242,6 +239,8 @@ static uint32_t c5_base_interval_ms(c5_task_type_t task_type)
         return SYSTEM_SERVICE_STATUS_INTERVAL_MS;
     case C5_TASK_TYPE_SYSTEM_COMMAND_POLL:
         return SYSTEM_SERVICE_COMMAND_POLL_INTERVAL_MS;
+    case C5_TASK_TYPE_RADAR_HOME_SNAPSHOT:
+        return 1000U;
     case C5_TASK_TYPE_VOICE_HIGH:
         return C5_SCHEDULER_MIN_SLEEP_MS;
     case C5_TASK_TYPE_LOW:
@@ -437,7 +436,7 @@ esp_err_t c5_scheduler_start(void)
     }
     s_dispatcher_task = xTaskCreateStatic(c5_event_dispatcher_task,
                                           "c5_event_dispatcher",
-                                          C5_SCHEDULER_TASK_STACK,
+                                          C5_SCHEDULER_TASK_STACK_WORDS,
                                           NULL,
                                           C5_SCHEDULER_TASK_PRIORITY,
                                           s_dispatcher_stack,
@@ -454,6 +453,11 @@ esp_err_t c5_scheduler_start(void)
              (unsigned int)C5_SCHEDULER_TASK_STACK);
     c5_mem_log("task_create_after_c5_dispatcher");
     return ESP_OK;
+}
+
+bool c5_scheduler_is_dispatcher_ready(void)
+{
+    return s_dispatcher_task != NULL;
 }
 
 esp_err_t c5_scheduler_start_deferred_workers(void)

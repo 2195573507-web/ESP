@@ -31,6 +31,8 @@ extern volatile bool g_net_ready;
  * 失败处理：gateway_orchestrator 使用 ESP_ERROR_CHECK 处理关键启动失败。
  */
 esp_err_t gateway_wifi_start(void);
+/** @brief Stops and releases only WiFi/netif/event objects owned by this module; repeated calls are safe. */
+void gateway_wifi_stop(void);
 /** @brief worker 线程内启动一次非阻塞 STA 扫描；完成事件会由 WiFi callback 转交 worker。 */
 esp_err_t gateway_wifi_start_sta_scan(void);
 /** @brief worker 在线程上下文读取扫描结果、记录已知 AP，并建立 RSSI 排序候选列表。 */

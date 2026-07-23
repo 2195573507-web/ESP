@@ -11,6 +11,7 @@
 
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -103,6 +104,22 @@ static bme690_calib_t s_calib;       /* 当前 BME690 的校准参数缓存 */
 static i2c_obj_t *s_iic = NULL;      /* BSP/IIC 总线对象指针 */
 static bool s_inited = false;        /* BME690 初始化完成标志 */
 static uint8_t s_chip_id = 0;        /* 缓存 chip id，便于每次 read 返回 */
+
+static void bme690_stage_log(const char *stage, esp_err_t ret, const void *handle)
+{
+    ESP_LOGI(TAG,
+             "BME690_STAGE stage=%s ret=%s handle=%p task=%s stack_hwm=%u internal_free=%u internal_largest=%u",
+             stage, esp_err_to_name(ret), handle, pcTaskGetName(NULL),
+             (unsigned int)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
+static void bme690_heap_integrity_check(const char *stage)
+{
+    ESP_LOGI(TAG, "BME690_HEAP stage=%s intact=%d", stage,
+             heap_caps_check_integrity_all(true) ? 1 : 0);
+}
 
 /* bme690_delay_ms：毫秒级阻塞延时。
  * ESP-IDF v5 推荐在任务上下文使用 vTaskDelay()，这里封装一下便于后续移植替换。
@@ -968,19 +985,24 @@ esp_err_t bme690_init(void)
         return ESP_OK;
     }
 
+    bme690_heap_integrity_check("before_init");
     ESP_LOGD(TAG, "开始初始化 BME690,I2C port: %d", BME690_IIC_PORT);
     ESP_LOGD(TAG, "BME690 当前使用的 I2C 地址: 0x%02X", BME690_I2C_ADDR);
 
+    bme690_stage_log("device_create_begin", ESP_OK, NULL);
     i2c_obj_t iic_obj = iic_init(BME690_IIC_PORT);
+    bme690_stage_log("device_create_end", iic_obj.init_flag, iic_obj.bus_handle);
     if (iic_obj.init_flag != ESP_OK)
     {
         ESP_LOGE(TAG, "BME690 初始化失败,I2C 初始化 ret: %d", iic_obj.init_flag);
         return iic_obj.init_flag;
     }
     s_iic = &iic_master[BME690_IIC_PORT];
+    bme690_heap_integrity_check("after_device_create");
 
     memset(&s_calib, 0, sizeof(s_calib));
 
+    bme690_stage_log("chip_id_read_begin", ESP_OK, s_iic);
     esp_err_t ret = bme690_soft_reset();
     if (ret != ESP_OK)
     {
@@ -988,11 +1010,13 @@ esp_err_t bme690_init(void)
     }
 
     ret = bme690_read_chip_id();
+    bme690_stage_log("chip_id_read_end", ret, s_iic);
     if (ret != ESP_OK)
     {
         return ret;
     }
 
+    bme690_stage_log("config_begin", ESP_OK, s_iic);
     ret = bme690_read_calibration();
     if (ret != ESP_OK)
     {
@@ -1000,12 +1024,20 @@ esp_err_t bme690_init(void)
     }
 
     ret = bme690_config_sensor();
+    bme690_stage_log("config_end", ret, s_iic);
     if (ret != ESP_OK)
     {
         return ret;
     }
 
+    bme690_heap_integrity_check("after_sensor_config");
+    bme690_stage_log("measurement_start_begin", ESP_OK, s_iic);
+    bme690_stage_log("measurement_start_end", ESP_OK, s_iic);
+    bme690_stage_log("queue_create_end_not_applicable", ESP_OK, NULL);
+    bme690_stage_log("timer_create_end_not_applicable", ESP_OK, NULL);
+    bme690_stage_log("task_create_end_not_applicable", ESP_OK, NULL);
     s_inited = true;
+    bme690_stage_log("init_complete", ESP_OK, s_iic);
     ESP_LOGI(TAG, "BME690 初始化成功");
 
     return ESP_OK;

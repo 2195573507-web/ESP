@@ -45,6 +45,10 @@ typedef struct {
     bool bme_valid;
     float temperature_c;
     float humidity_percent;
+    float pressure_hpa;
+    uint32_t gas_resistance_ohm;
+    bool gas_valid;
+    bool air_quality_valid;
     uint16_t iaq;
     lcd_radar_source_snapshot_t radar_sources[LCD_SYSTEM_SNAPSHOT_RADAR_SOURCES];
     bool room_occupied;
@@ -74,6 +78,12 @@ esp_err_t lcd_service_stop(void);
 bool lcd_service_is_started(void);
 esp_err_t lcd_service_post_snapshot(const lcd_system_snapshot_t *snapshot);
 esp_err_t lcd_service_post_command(const lcd_command_t *command);
+
+/*
+ * Latches the outcome of the application startup sequence.  The UI task owns
+ * the eventual Boot-to-Home transition; callers never acquire the LVGL lock.
+ */
+esp_err_t lcd_service_mark_boot_complete(void);
 
 /* Called by the UI only. It posts a fixed event; it never calls voice directly. */
 esp_err_t lcd_service_request_wake_event(void);

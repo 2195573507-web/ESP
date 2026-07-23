@@ -7,11 +7,15 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/task.h"
+
+#define APP_TASK_STACK_CAPS_INTERNAL (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#define APP_TASK_STACK_CAPS_PSRAM (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 #ifndef APP_STACK_LOW_WATER_WARNING_BYTES
 #define APP_STACK_LOW_WATER_WARNING_BYTES 1536U
@@ -110,11 +114,12 @@ static inline void app_stack_monitor_log_task_created(const char *tag,
     }
 
     ESP_LOGI(app_stack_monitor_safe_text(tag),
-             "TASK_CREATE task=%s tcb=%p stack=%p stack_bytes=%u memory=internal",
+             "TASK_CREATE task=%s tcb=%p stack=%p stack_bytes=%u memory=%s",
              app_stack_monitor_safe_text(task_name),
              (void *)task,
              (void *)pxTaskGetStackStart(task),
-             (unsigned int)stack_bytes);
+             (unsigned int)stack_bytes,
+             esp_ptr_external_ram(pxTaskGetStackStart(task)) ? "psram" : "internal");
 }
 
 static inline UBaseType_t app_stack_monitor_log_periodic(const char *tag,
@@ -181,6 +186,59 @@ static inline void app_heap_monitor_log_periodic(const char *tag,
     *last_log_ms = timestamp_ms;
 
     app_heap_monitor_log(tag);
+}
+
+static inline void app_s3_mem_log(const char *tag, const char *stage)
+{
+    const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const uint32_t dma_caps = MALLOC_CAP_DMA;
+    ESP_LOGI(app_stack_monitor_safe_text(tag),
+             "S3_MEM stage=%s internal_free=%u internal_min=%u internal_largest=%u dma_free=%u dma_largest=%u",
+             app_stack_monitor_safe_text(stage),
+             (unsigned int)heap_caps_get_free_size(internal_caps),
+             (unsigned int)heap_caps_get_minimum_free_size(internal_caps),
+             (unsigned int)heap_caps_get_largest_free_block(internal_caps),
+             (unsigned int)heap_caps_get_free_size(dma_caps),
+             (unsigned int)heap_caps_get_largest_free_block(dma_caps));
+}
+
+static inline void app_s3_mem_log_periodic(const char *tag,
+                                           const char *stage,
+                                           int64_t *last_log_ms,
+                                           uint32_t interval_ms)
+{
+    if (last_log_ms == NULL) {
+        app_s3_mem_log(tag, stage);
+        return;
+    }
+    const int64_t timestamp_ms = app_stack_monitor_now_ms();
+    if (*last_log_ms != 0 && timestamp_ms - *last_log_ms < (int64_t)interval_ms) {
+        return;
+    }
+    *last_log_ms = timestamp_ms;
+    app_s3_mem_log(tag, stage);
+}
+
+/* Startup milestone probes are synchronous so the first failed result keeps a
+ * narrow allocation boundary. */
+static inline bool app_heap_integrity_check(const char *tag, const char *stage)
+{
+    const bool intact = heap_caps_check_integrity_all(true);
+    /* Startup checks run before asynchronous log consumers are established. */
+    ESP_EARLY_LOGI(app_stack_monitor_safe_text(tag),
+                   "HEAP_INTEGRITY stage=%s intact=%u",
+                   app_stack_monitor_safe_text(stage),
+                   intact ? 1U : 0U);
+    ESP_LOGI(app_stack_monitor_safe_text(tag),
+             "HEAP_INTEGRITY stage=%s intact=%u",
+             app_stack_monitor_safe_text(stage),
+             intact ? 1U : 0U);
+    if (!intact) {
+        ESP_LOGE(app_stack_monitor_safe_text(tag),
+                 "HEAP_INTEGRITY_FIRST_FAILURE stage=%s",
+                 app_stack_monitor_safe_text(stage));
+    }
+    return intact;
 }
 
 static inline bool app_task_wdt_add_current(const char *tag, const char *task_name)

@@ -5,25 +5,25 @@
  * 本文件属于 C5 终端（ESPC51/ESPC52 共用），只负责 ESP-IDF app_main 入口、
  * 日志等级初始化和启动任务创建；不直接初始化 WiFi、BME690、语音、命令轮询或
  * 与 S3/Server 的协议细节。启动任务进入 app_orchestrator_start() 后，才按
- * C5 app_main -> app_orchestrator_start -> WiFi -> register -> BME -> voice -> command
- * 的顺序交给各业务模块。
+ * C5 app_main -> app_orchestrator_start -> LCD -> local sensors -> local runtime
+ * -> WiFi/Gateway -> register/heartbeat/command -> network voice 的顺序交给各业务模块。
  */
 
 #include "app_debug_config.h"
 #include "app_main_config.h"
 #include "app_orchestrator.h"
 #include "app_stack_monitor.h"
-#include "c5_memory.h"
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 static const char *TAG = "APP_ENTRY";
+
 static TaskHandle_t s_app_startup_task;
-static StackType_t *s_app_startup_stack;
-static StaticTask_t s_app_startup_storage;
 
 static void app_startup_task(void *arg)
 {
@@ -32,16 +32,17 @@ static void app_startup_task(void *arg)
     app_stack_monitor_log(TAG, "app_startup_task", "entry");
     /*
      * C5 启动主链路从这里交给 orchestrator：
-     * WiFi 连接 S3 SoftAP 后，system_service 完成 register/heartbeat/status/command，
-     * BME 后台服务开始读数上传，voice_chain 最后启动 Mic/VAD/voice turn。
+     * LCD 完成后先启动 BME/Radar 与 Mic/ADC/VAD，再创建 EventBus/Queue/Dispatcher；
+     * WiFi/Gateway/system service 与 PCM 网络语音留在后续阶段，断网时进入离线模式。
      */
+    app_stack_monitor_log_system_state(TAG, "before_app_orchestrator_start");
     app_orchestrator_start();
     app_stack_monitor_log(TAG, "app_startup_task", "orchestrator_returned");
 
     TaskHandle_t task = xTaskGetCurrentTaskHandle();
     s_app_startup_task = NULL;
     if (task != NULL) {
-        vTaskDelete(task);
+        vTaskDeleteWithCaps(task);
     }
 }
 
@@ -60,38 +61,29 @@ void app_main(void)
     app_debug_apply_log_levels();
     app_stack_monitor_log(TAG, "app_main", "entry");
 
-    c5_mem_log("task_create_before_app_startup");
-    s_app_startup_stack = (StackType_t *)c5_mem_alloc(APP_STARTUP_TASK_STACK,
-                                                       C5_MEM_PSRAM,
-                                                       "app_startup_stack");
-    if (s_app_startup_stack == NULL) {
-        ESP_LOGE(TAG, "allocate app_startup PSRAM stack failed");
-        c5_mem_log("task_create_after_app_startup_failed");
-        return;
-    }
-    s_app_startup_task = xTaskCreateStatic(app_startup_task,
-                                           "app_startup",
-                                           APP_STARTUP_TASK_STACK,
-                                           NULL,
-                                           APP_STARTUP_TASK_PRIORITY,
-                                           s_app_startup_stack,
-                                           &s_app_startup_storage);
+    ESP_LOGI(TAG,
+             "MEM_ALLOC_PLAN owner=app_startup_task caps=0x%08lx size=%u region=internal_control",
+             (unsigned long)(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)APP_STARTUP_TASK_STACK);
+    const BaseType_t created = xTaskCreateWithCaps(app_startup_task,
+                                                   "app_startup",
+                                                   APP_STARTUP_TASK_STACK,
+                                                   NULL,
+                                                   APP_STARTUP_TASK_PRIORITY,
+                                                   &s_app_startup_task,
+                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     app_stack_monitor_log(TAG, "app_main", "after_startup_task_create");
-    if (s_app_startup_task == NULL) {
-        c5_mem_free(s_app_startup_stack, "app_startup_stack");
-        s_app_startup_stack = NULL;
+    if (created != pdPASS || s_app_startup_task == NULL) {
         s_app_startup_task = NULL;
         ESP_LOGE(TAG,
-                 "create static app_startup task failed stack=%u priority=%u",
+                 "create app_startup task failed stack=%u priority=%u",
                  (unsigned int)APP_STARTUP_TASK_STACK,
                  (unsigned int)APP_STARTUP_TASK_PRIORITY);
         ESP_LOGE(TAG, "app_startup disabled ret=%s", esp_err_to_name(ESP_ERR_NO_MEM));
-        c5_mem_log("task_create_after_app_startup_failed");
         return;
     }
 
-    ESP_LOGI(TAG, "TASK_CREATE task=app_startup stack=%u source=psram_static",
+    ESP_LOGI(TAG, "TASK_CREATE task=app_startup stack=%u source=internal_dynamic_reclaimable",
              (unsigned int)APP_STARTUP_TASK_STACK);
-    c5_mem_log("task_create_after_app_startup");
     app_stack_monitor_log(TAG, "app_main", "return");
 }

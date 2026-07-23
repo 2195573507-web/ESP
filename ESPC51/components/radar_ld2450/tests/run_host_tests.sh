@@ -6,10 +6,8 @@ OUT="$ROOT/tests/radar_core_host_tests"
 
 cc -std=c11 -Wall -Wextra -Werror \
   -I"$ROOT/include" \
-  -I"$ROOT/../radar_domain/include" \
   "$ROOT/ld2450_parser.c" \
   "$ROOT/radar_state_codec.c" \
-  "$ROOT/../radar_domain/radar_filter.c" \
   "$ROOT/tests/test_radar_core.c" \
   -o "$OUT"
 

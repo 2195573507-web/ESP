@@ -39,6 +39,16 @@ static bme_sensor_service_context_t s_bme_service;
 static portMUX_TYPE s_bme_service_lock = portMUX_INITIALIZER_UNLOCKED;
 static bme_sensor_service_reading_t s_latest_reading;
 
+static void bme_sensor_service_boot_stage(const char *stage, esp_err_t ret)
+{
+    ESP_LOGI(TAG,
+             "C5_BOOT_STAGE stage=%s ret=%s task=%s stack_hwm=%u internal_free=%u internal_largest=%u",
+             stage, esp_err_to_name(ret), pcTaskGetName(NULL),
+             (unsigned int)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
 static void bme_sensor_service_publish_reading(const bme690_data_t *sensor_data,
                                                const bme_air_quality_result_t *air_quality)
 {
@@ -49,6 +59,10 @@ static void bme_sensor_service_publish_reading(const bme690_data_t *sensor_data,
     s_latest_reading.valid = true;
     s_latest_reading.temperature_c = sensor_data->temperature_c;
     s_latest_reading.humidity_percent = sensor_data->humidity_percent;
+    s_latest_reading.pressure_hpa = sensor_data->pressure_hpa;
+    s_latest_reading.gas_resistance_ohm = sensor_data->gas_resistance_ohm;
+    s_latest_reading.gas_valid = sensor_data->gas_valid;
+    s_latest_reading.air_quality_valid = true;
     s_latest_reading.air_quality_score = air_quality->air_quality_score < 0 ? 0U :
                                          air_quality->air_quality_score > UINT16_MAX ? UINT16_MAX :
                                          (uint16_t)air_quality->air_quality_score;
@@ -135,6 +149,11 @@ static esp_err_t bme_sensor_service_init_once(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    bme_sensor_service_boot_stage("before_bme690_init", ESP_OK);
+    if (!heap_caps_check_integrity_all(true)) {
+        bme_sensor_service_boot_stage("before_bme690_init_heap_corrupt", ESP_FAIL);
+        return ESP_FAIL;
+    }
     ESP_LOGD(TAG, "BME init start");
     esp_err_t ret = bme_server_client_init();
     if (ret != ESP_OK) {
@@ -143,12 +162,19 @@ static esp_err_t bme_sensor_service_init_once(void)
     }
 
     ret = bme690_init();
+    bme_sensor_service_boot_stage("after_bme690_init", ret);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "BME init fail: %s", esp_err_to_name(ret));
         return ret;
     }
 
+    bme_sensor_service_boot_stage("before_bme690_runtime_start", ESP_OK);
     bme_air_quality_init();
+    bme_sensor_service_boot_stage("after_bme690_runtime_start", ESP_OK);
+    if (!heap_caps_check_integrity_all(true)) {
+        bme_sensor_service_boot_stage("after_bme690_runtime_start_heap_corrupt", ESP_FAIL);
+        return ESP_FAIL;
+    }
 
     bme_sensor_service_mark_initialized(true);
     ESP_LOGI(TAG, "BME init success");

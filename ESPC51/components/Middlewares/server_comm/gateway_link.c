@@ -237,6 +237,12 @@ bool gateway_link_is_ready(void)
     return gateway_link_get_state() == LINK_READY;
 }
 
+bool gateway_link_is_local_ready(void)
+{
+    const gateway_link_state_t state = gateway_link_get_state();
+    return state == LINK_READY || state == LINK_DEGRADED;
+}
+
 bool gateway_link_in_reconnect_mode(void)
 {
     return !gateway_link_is_ready();

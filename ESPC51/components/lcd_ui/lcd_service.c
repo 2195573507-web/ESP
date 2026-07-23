@@ -19,7 +19,6 @@
 #define LCD_SERVICE_TICK_MS 100U
 #define LCD_SERVICE_SNAPSHOT_MS 1000U
 #define LCD_SERVICE_DEFAULT_TTL_MS 5000U
-#define LCD_SERVICE_QUEUE_INTERNAL_MIN 1024U
 
 typedef enum {
     LCD_SERVICE_UNINITIALIZED = 0,
@@ -37,11 +36,15 @@ typedef struct {
     lcd_command_t command;
     uint64_t command_expiry_ms;
     uint64_t last_full_refresh_ms;
+    bool boot_complete;
 } lcd_service_context_t;
 
 static const char *TAG = "lcd_service";
 static StaticSemaphore_t s_lock_storage;
 static SemaphoreHandle_t s_lock;
+static StaticQueue_t s_wake_queue_storage;
+static uint8_t s_wake_queue_buffer[sizeof(lcd_wake_event_t)];
+static QueueHandle_t s_wake_queue;
 static portMUX_TYPE s_data_lock = portMUX_INITIALIZER_UNLOCKED;
 static lcd_service_context_t *s_ctx;
 /* Prevent a new start from reusing driver state while a detached context unwinds. */
@@ -102,6 +105,7 @@ static void lcd_service_timer_cb(lv_timer_t *timer)
     lcd_system_snapshot_t snapshot;
     lcd_command_t command;
     bool command_visible;
+    bool boot_complete;
     portENTER_CRITICAL(&s_data_lock);
     if (ctx != s_ctx || ctx->state != LCD_SERVICE_PUBLISHED) {
         portEXIT_CRITICAL(&s_data_lock);
@@ -110,12 +114,13 @@ static void lcd_service_timer_cb(lv_timer_t *timer)
     snapshot = ctx->snapshot;
     command = ctx->command;
     command_visible = ctx->command_expiry_ms > now_ms;
+    boot_complete = ctx->boot_complete;
     portEXIT_CRITICAL(&s_data_lock);
     const bool full_refresh = now_ms - ctx->last_full_refresh_ms >= LCD_SERVICE_SNAPSHOT_MS;
     if (full_refresh) {
         ctx->last_full_refresh_ms = now_ms;
     }
-    lcd_ui_apply(&snapshot, &command, command_visible, full_refresh);
+    lcd_ui_apply(&snapshot, &command, command_visible, full_refresh, boot_complete);
 }
 
 static esp_err_t lcd_service_cleanup(lcd_service_context_t *ctx)
@@ -136,10 +141,10 @@ static esp_err_t lcd_service_cleanup(lcd_service_context_t *ctx)
         lvgl_port_unlock();
     }
     (void)lcd_driver_stop();
-    if (ctx->wake_queue != NULL) {
+    if (ctx->wake_queue != NULL && ctx->wake_queue != s_wake_queue) {
         vQueueDelete(ctx->wake_queue);
-        ctx->wake_queue = NULL;
     }
+    ctx->wake_queue = NULL;
     heap_caps_free(ctx);
     return ESP_OK;
 }
@@ -177,7 +182,9 @@ esp_err_t lcd_service_start(void)
         lcd_service_unlock();
         return ret;
     }
-    ret = lcd_driver_register_lvgl();
+    ret = lcd_driver_register_lvgl(lcd_ui_prepare_lvgl_pool,
+                                   lcd_ui_release_lvgl_pool,
+                                   NULL);
     if (ret != ESP_OK) {
         (void)lcd_driver_stop();
         lcd_service_unlock();
@@ -191,6 +198,10 @@ esp_err_t lcd_service_start(void)
         lcd_service_unlock();
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(TAG,
+             "MEM_ALLOC_PLAN owner=lcd_service_context caps=0x%08lx size=%u region=psram",
+             (unsigned long)psram_caps,
+             (unsigned int)LCD_SERVICE_CONTEXT_BYTES);
     lcd_service_context_t *ctx = lcd_fault_injection_should_fail(LCD_FAULT_SERVICE_CONTEXT) ? NULL : heap_caps_calloc(1, LCD_SERVICE_CONTEXT_BYTES, psram_caps);
     if (ctx == NULL) {
         (void)lcd_driver_stop();
@@ -198,14 +209,17 @@ esp_err_t lcd_service_start(void)
         return ESP_ERR_NO_MEM;
     }
     ctx->state = LCD_SERVICE_ALLOCATING;
-    const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
-    if (heap_caps_get_free_size(internal_caps) < LCD_SERVICE_QUEUE_INTERNAL_MIN ||
-        heap_caps_get_largest_free_block(internal_caps) < LCD_SERVICE_QUEUE_INTERNAL_MIN) {
-        const esp_err_t cleanup_ret = lcd_service_cleanup_after_start_failure(ctx);
-        lcd_service_unlock();
-        return cleanup_ret != ESP_OK ? cleanup_ret : ESP_ERR_NO_MEM;
+    const bool wake_queue_forced_failure = lcd_fault_injection_should_fail(LCD_FAULT_WAKE_QUEUE);
+    if (s_wake_queue == NULL && !wake_queue_forced_failure) {
+        s_wake_queue = xQueueCreateStatic(1U,
+                                          sizeof(lcd_wake_event_t),
+                                          s_wake_queue_buffer,
+                                          &s_wake_queue_storage);
     }
-    ctx->wake_queue = lcd_fault_injection_should_fail(LCD_FAULT_WAKE_QUEUE) ? NULL : xQueueCreate(1U, sizeof(lcd_wake_event_t));
+    if (s_wake_queue != NULL) {
+        (void)xQueueReset(s_wake_queue);
+    }
+    ctx->wake_queue = wake_queue_forced_failure ? NULL : s_wake_queue;
     if (ctx->wake_queue == NULL) {
         const esp_err_t cleanup_ret = lcd_service_cleanup_after_start_failure(ctx);
         lcd_service_unlock();
@@ -216,7 +230,7 @@ esp_err_t lcd_service_start(void)
         lcd_service_unlock();
         return cleanup_ret != ESP_OK ? cleanup_ret : ESP_ERR_TIMEOUT;
     }
-    ret = lcd_fault_injection_should_fail(LCD_FAULT_UI_ARENA) ? ESP_ERR_NO_MEM : lcd_ui_start(lcd_driver_get_display(), lcd_service_wake_request, NULL);
+    ret = lcd_ui_start(lcd_driver_get_display(), lcd_service_wake_request, NULL);
     lvgl_port_unlock();
     if (ret != ESP_OK) {
         const esp_err_t cleanup_ret = lcd_service_cleanup_after_start_failure(ctx);
@@ -342,6 +356,25 @@ esp_err_t lcd_service_post_command(const lcd_command_t *command)
     ctx->command_expiry_ms = lcd_service_now_ms() + bounded.ttl_ms;
     portEXIT_CRITICAL(&s_data_lock);
     lcd_service_unlock();
+    return ESP_OK;
+}
+
+esp_err_t lcd_service_mark_boot_complete(void)
+{
+    const esp_err_t lock_ret = lcd_service_lock();
+    if (lock_ret != ESP_OK) {
+        return lock_ret;
+    }
+    lcd_service_context_t *const ctx = s_ctx;
+    if (ctx == NULL || ctx->state != LCD_SERVICE_PUBLISHED) {
+        lcd_service_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    portENTER_CRITICAL(&s_data_lock);
+    ctx->boot_complete = true;
+    portEXIT_CRITICAL(&s_data_lock);
+    lcd_service_unlock();
+    ESP_LOGI(TAG, "LCD_BOOT_COMPLETE_LATCHED");
     return ESP_OK;
 }
 

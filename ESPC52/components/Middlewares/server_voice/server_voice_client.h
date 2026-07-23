@@ -54,8 +54,23 @@ typedef struct {
  */
 esp_err_t server_voice_client_init(const server_voice_client_config_t *config);
 
+/** Update the gateway reachability admission state for future voice turns. */
+void server_voice_client_set_network_available(bool available, const char *reason);
+
+/** Re-establish local voice-turn admission after NETWORK_READY. */
+esp_err_t server_voice_client_reconnect(void);
+
 /** @brief 本地唤醒确认后准备一轮 turn；当前做 ready 检查和日志，失败由 voice_chain 中止本轮。 */
 esp_err_t server_voice_client_prepare_async(void);
+
+/**
+ * Associate the next /local/v1/voice/turn request with the S3-issued command
+ * capture.  Both values are sent in request headers so S3 can reject stale or
+ * cross-session PCM without relying on the UDP WakeNet stream id.
+ */
+esp_err_t server_voice_client_set_command_capture_metadata(const char *command_id,
+                                                           uint32_t command_stream_id,
+                                                           uint32_t command_generation);
 
 /** @brief VAD 进入录音窗口后打开到 ESPS3 的 PCM POST；失败由 voice_chain 释放本轮资源。 */
 esp_err_t server_voice_client_start_turn(void);

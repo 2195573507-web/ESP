@@ -67,6 +67,7 @@
 #define LCD_BOARD_IO_QUEUE_DEPTH 4U
 #endif
 
-#define LCD_LEGACY_DMA_BYTES 9600U
 #define LCD_LVGL_DRAW_LINES 10U
 #define LCD_LVGL_DRAW_BYTES (LCD_BOARD_HRES * LCD_LVGL_DRAW_LINES * sizeof(uint16_t))
+/* Manufacturing fill and LVGL both submit one 10-line RGB565 stripe at a time. */
+#define LCD_LEGACY_DMA_BYTES LCD_LVGL_DRAW_BYTES

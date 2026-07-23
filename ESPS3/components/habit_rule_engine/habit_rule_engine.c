@@ -301,7 +301,7 @@ esp_err_t habit_rule_engine_start(habit_snapshot_provider_t provider, void *cont
                             NULL,
                             3U,
                             &s_runtime_task,
-                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+                            APP_TASK_STACK_CAPS_PSRAM) != pdPASS) {
         s_runtime_task = NULL;
         s_snapshot_provider = NULL;
         return ESP_ERR_NO_MEM;

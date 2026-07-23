@@ -16,12 +16,22 @@
 #include "freertos/portmacro.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "radar_home_snapshot_client.h"
 #include "system_service.h"
 
 static const char *TAG = "c5_workers";
 
+#define C5_WORKER_TASK_STACK_WORDS \
+    ((C5_WORKER_TASK_STACK + sizeof(StackType_t) - 1U) / sizeof(StackType_t))
+
 static QueueHandle_t s_bme_worker_queue;
 static QueueHandle_t s_system_worker_queue;
+static StaticQueue_t s_bme_worker_queue_storage;
+static StaticQueue_t s_system_worker_queue_storage;
+static uint8_t s_bme_worker_queue_buffer[C5_WORKER_QUEUE_LENGTH * sizeof(c5_event_t)]
+    __attribute__((aligned(portBYTE_ALIGNMENT)));
+static uint8_t s_system_worker_queue_buffer[C5_WORKER_QUEUE_LENGTH * sizeof(c5_event_t)]
+    __attribute__((aligned(portBYTE_ALIGNMENT)));
 static TaskHandle_t s_bme_worker_task;
 static TaskHandle_t s_system_worker_task;
 static StackType_t *s_bme_worker_stack;
@@ -136,7 +146,12 @@ static void bme_worker(void *arg)
             continue;
         }
 
+        ESP_LOGI(TAG, "BME_WORKER_STAGE stage=tick_begin stack_hwm=%u",
+                 (unsigned int)uxTaskGetStackHighWaterMark(NULL));
         esp_err_t ret = bme_sensor_service_tick();
+        ESP_LOGI(TAG, "BME_WORKER_STAGE stage=tick_end ret=%s stack_hwm=%u",
+                 esp_err_to_name(ret),
+                 (unsigned int)uxTaskGetStackHighWaterMark(NULL));
         c5_worker_log_ret("bme_worker", &event, ret);
         c5_worker_record_latency(&event);
         c5_worker_end(C5_WORKER_ACTIVE_BME);
@@ -167,6 +182,10 @@ static void system_worker(void *arg)
         case C5_EVENT_COMMAND:
             ret = system_service_tick_command_poll();
             break;
+        case C5_EVENT_RADAR_HOME_SNAPSHOT:
+            radar_home_snapshot_client_poll(c5_worker_now_ms());
+            ret = ESP_OK;
+            break;
         default:
             break;
         }
@@ -176,13 +195,16 @@ static void system_worker(void *arg)
     }
 }
 
-static esp_err_t create_queue(QueueHandle_t *queue)
+static esp_err_t create_queue(QueueHandle_t *queue,
+                              StaticQueue_t *storage,
+                              uint8_t *buffer)
 {
-    if (queue == NULL) {
+    if (queue == NULL || storage == NULL || buffer == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     if (*queue == NULL) {
-        *queue = xQueueCreate((UBaseType_t)C5_WORKER_QUEUE_LENGTH, sizeof(c5_event_t));
+        *queue = xQueueCreateStatic((UBaseType_t)C5_WORKER_QUEUE_LENGTH,
+                                    sizeof(c5_event_t), buffer, storage);
     }
     return *queue != NULL ? ESP_OK : ESP_ERR_NO_MEM;
 }
@@ -192,6 +214,7 @@ static esp_err_t create_task(TaskHandle_t *task,
                              StaticTask_t *storage,
                              TaskFunction_t entry,
                              const char *name,
+                             c5_mem_type_t stack_memory,
                              const char *memory_stage_before,
                              const char *memory_stage_after,
                              const char *memory_stage_failed)
@@ -207,7 +230,7 @@ static esp_err_t create_task(TaskHandle_t *task,
     c5_mem_log(memory_stage_before);
     if (*stack == NULL) {
         *stack = (StackType_t *)c5_mem_alloc(C5_WORKER_TASK_STACK,
-                                             C5_MEM_INTERNAL_CONTROL,
+                                             stack_memory,
                                              name);
     }
     if (*stack == NULL) {
@@ -217,7 +240,7 @@ static esp_err_t create_task(TaskHandle_t *task,
 
     *task = xTaskCreateStatic(entry,
                               name,
-                              C5_WORKER_TASK_STACK,
+                              C5_WORKER_TASK_STACK_WORDS,
                               NULL,
                               C5_WORKER_TASK_PRIORITY,
                               *stack,
@@ -228,8 +251,9 @@ static esp_err_t create_task(TaskHandle_t *task,
         c5_mem_log(memory_stage_failed);
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "TASK_CREATE task=%s stack=%u source=internal_static", name,
-             (unsigned int)C5_WORKER_TASK_STACK);
+    ESP_LOGI(TAG, "TASK_CREATE task=%s stack=%u source=%s_static", name,
+             (unsigned int)C5_WORKER_TASK_STACK,
+             stack_memory == C5_MEM_PSRAM ? "psram" : "internal");
     c5_mem_log(memory_stage_after);
     return ESP_OK;
 }
@@ -238,10 +262,14 @@ esp_err_t c5_runtime_workers_prepare(void)
 {
     esp_err_t ret = c5_event_bus_init();
     if (ret == ESP_OK) {
-        ret = create_queue(&s_bme_worker_queue);
+        ret = create_queue(&s_bme_worker_queue,
+                           &s_bme_worker_queue_storage,
+                           s_bme_worker_queue_buffer);
     }
     if (ret == ESP_OK) {
-        ret = create_queue(&s_system_worker_queue);
+        ret = create_queue(&s_system_worker_queue,
+                           &s_system_worker_queue_storage,
+                           s_system_worker_queue_buffer);
     }
     if (ret == ESP_OK) {
         ret = c5_event_bus_register_handler(C5_EVENT_BME_SAMPLE, c5_route_bme_event, NULL);
@@ -255,6 +283,11 @@ esp_err_t c5_runtime_workers_prepare(void)
     if (ret == ESP_OK) {
         ret = c5_event_bus_register_handler(C5_EVENT_COMMAND, c5_route_system_event, NULL);
     }
+    if (ret == ESP_OK) {
+        ret = c5_event_bus_register_handler(C5_EVENT_RADAR_HOME_SNAPSHOT,
+                                            c5_route_system_event,
+                                            NULL);
+    }
     return ret;
 }
 
@@ -267,6 +300,7 @@ esp_err_t c5_runtime_workers_start(void)
                           &s_bme_worker_storage,
                           bme_worker,
                           "bme_worker",
+                          C5_MEM_INTERNAL_CONTROL,
                           "task_create_before_bme_worker",
                           "task_create_after_bme_worker",
                           "task_create_after_bme_worker_failed");
@@ -277,6 +311,7 @@ esp_err_t c5_runtime_workers_start(void)
                           &s_system_worker_storage,
                           system_worker,
                           "system_worker",
+                          C5_MEM_PSRAM,
                           "task_create_before_system_worker",
                           "task_create_after_system_worker",
                           "task_create_after_system_worker_failed");

@@ -13,7 +13,10 @@
 #include <string.h>
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "app_time_sync.h"
 #include "nvs.h"
 #include "terminal_config.h"
@@ -34,6 +37,16 @@
 #define AQ_V3_HUMIDITY_REFERENCE 40.0f
 
 static const char *TAG = "bme_air_quality";
+
+static void bme_air_quality_nvs_stage(const char *stage, esp_err_t ret)
+{
+    ESP_LOGI(TAG,
+             "BME690_NVS_STAGE stage=%s ret=%s task=%s stack_hwm=%u internal_free=%u internal_largest=%u",
+             stage, esp_err_to_name(ret), pcTaskGetName(NULL),
+             (unsigned int)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
 
 typedef struct {
     uint32_t version;
@@ -302,7 +315,9 @@ static bool v3_persisted_baseline_is_valid(const bme_air_quality_v3_nvs_t *persi
 static void v3_erase_persisted_baseline(void)
 {
     nvs_handle_t nvs = 0;
+    bme_air_quality_nvs_stage("erase_open_begin", ESP_OK);
     esp_err_t ret = nvs_open(AQ_V3_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    bme_air_quality_nvs_stage("erase_open_end", ret);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "AQ_V3 baseline NVS erase open failed: %s", esp_err_to_name(ret));
         return;
@@ -310,7 +325,9 @@ static void v3_erase_persisted_baseline(void)
 
     ret = nvs_erase_key(nvs, AQ_V3_NVS_KEY);
     if (ret == ESP_OK) {
+        bme_air_quality_nvs_stage("erase_commit_begin", ret);
         ret = nvs_commit(nvs);
+        bme_air_quality_nvs_stage("erase_commit_end", ret);
     }
     if (ret != ESP_OK && ret != ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGW(TAG, "AQ_V3 baseline NVS erase failed: %s", esp_err_to_name(ret));
@@ -345,7 +362,9 @@ static void v3_persist_baseline(void)
     };
 
     nvs_handle_t nvs = 0;
+    bme_air_quality_nvs_stage("restore_open_begin", ESP_OK);
     esp_err_t ret = nvs_open(AQ_V3_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    bme_air_quality_nvs_stage("restore_open_end", ret);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "AQ_V3 baseline NVS open failed: %s", esp_err_to_name(ret));
         return;
@@ -380,7 +399,9 @@ static void v3_restore_baseline(void)
 
     bme_air_quality_v3_nvs_t persisted = {0};
     size_t persisted_size = sizeof(persisted);
+    bme_air_quality_nvs_stage("restore_get_begin", ESP_OK);
     ret = nvs_get_blob(nvs, AQ_V3_NVS_KEY, &persisted, &persisted_size);
+    bme_air_quality_nvs_stage("restore_get_end", ret);
     nvs_close(nvs);
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGI(TAG, "AQ_V3 baseline not found; starting normal learning");

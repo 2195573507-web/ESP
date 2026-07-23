@@ -24,6 +24,7 @@
 #include "device_protocol_metadata.h"
 #include "esp111_protocol_common.h"
 #include "screen_service.h"
+#include "voice_chain.h"
 #include "server_comm_config.h"
 #include "server_comm_http.h"
 #include "terminal_config.h"
@@ -56,6 +57,9 @@ typedef struct {
     int code;
     int seq;
     int ttl_ms;
+    int command_generation;
+    int wake_stream_id;
+    int command_timeout_ms;
 } system_server_command_t;
 
 typedef struct {
@@ -495,6 +499,20 @@ static esp_err_t system_server_parse_first_command(const char *json,
                                      command->text,
                                      sizeof(command->text));
         (void)system_json_get_int(scratch->payload, "ttl_ms", &command->ttl_ms);
+        (void)system_json_get_int(scratch->payload,
+                                  "command_generation",
+                                  &command->command_generation);
+        if (!system_json_get_int(scratch->payload,
+                                 "wake_stream_id",
+                                 &command->wake_stream_id)) {
+            /* S3 used stream_id before the command-session field was named. */
+            (void)system_json_get_int(scratch->payload,
+                                      "stream_id",
+                                      &command->wake_stream_id);
+        }
+        (void)system_json_get_int(scratch->payload,
+                                  "command_timeout_ms",
+                                  &command->command_timeout_ms);
     }
     (void)system_json_get_int(scratch->object, "seq", &command->seq);
     (void)system_json_get_int(scratch->object, "ttl_ms", &command->ttl_ms);
@@ -505,6 +523,9 @@ static esp_err_t system_server_parse_first_command(const char *json,
         break;
     case ESP111_PROTOCOL_LOCAL_COMMAND_SHOW_TEXT:
         strlcpy(command->name, "lcd.show_text", sizeof(command->name));
+        break;
+    case ESP111_PROTOCOL_LOCAL_COMMAND_START_COMMAND_CAPTURE:
+        strlcpy(command->name, "voice.start_command_capture", sizeof(command->name));
         break;
     default:
         snprintf(command->name,
@@ -600,12 +621,14 @@ static esp_err_t system_server_client_build_health_json(system_server_client_scr
                ESP_ERR_INVALID_SIZE;
 }
 
-static esp_err_t system_server_client_post_ack(system_server_client_scratch_t *scratch,
-                                               const char *command_id,
-                                               int ack_seq,
-                                               bool completed,
-                                               const char *error_code,
-                                               const char *error_message)
+static esp_err_t system_server_client_post_ack_with_voice(system_server_client_scratch_t *scratch,
+                                                          const char *command_id,
+                                                          int ack_seq,
+                                                          bool completed,
+                                                          const char *error_code,
+                                                          const char *error_message,
+                                                          uint32_t command_generation,
+                                                          const char *state)
 {
     if (scratch == NULL || command_id == NULL || command_id[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
@@ -642,7 +665,34 @@ static esp_err_t system_server_client_post_ack(system_server_client_scratch_t *s
 
     device_protocol_metadata_t metadata = {0};
     device_protocol_prepare_metadata(&metadata, ESP111_PROTOCOL_MSG_COMMAND_ACK);
-    int json_len = snprintf(scratch->json_body,
+    int json_len;
+    if (state != NULL) {
+        json_len = snprintf(scratch->json_body,
+                            sizeof(scratch->json_body),
+                            "{\"" ESP111_PROTOCOL_LOCAL_JSON_PROTOCOL_VERSION "\":%u,"
+                            "\"" ESP111_PROTOCOL_LOCAL_JSON_ID "\":%u,"
+                            "\"" ESP111_PROTOCOL_LOCAL_JSON_TYPE "\":%u,"
+                            "\"" ESP111_PROTOCOL_LOCAL_JSON_COMMAND_ID "\":\"%s\","
+                            "\"command_id\":\"%s\",\"generation\":%lu,\"stream_id\":0,"
+                            "\"state\":\"%s\","
+                            "\"" ESP111_PROTOCOL_LOCAL_JSON_OK "\":%u,"
+                            "\"" ESP111_PROTOCOL_LOCAL_JSON_ERROR "\":%u,"
+                            "\"" ESP111_PROTOCOL_LOCAL_JSON_UPTIME_MS "\":%s,"
+                            "\"" ESP111_PROTOCOL_LOCAL_JSON_SEQ "\":%s}",
+                            ESP111_PROTOCOL_LOCAL_SCHEMA_VERSION,
+                            (unsigned int)terminal_config_get_local_id(),
+                            ESP111_PROTOCOL_LOCAL_PACKET_CMD_ACK,
+                            command_id,
+                            command_id,
+                            (unsigned long)command_generation,
+                            state,
+                            completed ? 1U : 0U,
+                            completed ? ESP111_PROTOCOL_LOCAL_ERROR_NONE :
+                                        system_server_client_error_to_local_code(error_code),
+                            metadata.esp_uptime_ms,
+                            metadata.request_seq);
+    } else {
+        json_len = snprintf(scratch->json_body,
                             sizeof(scratch->json_body),
                             "{\"" ESP111_PROTOCOL_LOCAL_JSON_PROTOCOL_VERSION "\":%u,"
                             "\"" ESP111_PROTOCOL_LOCAL_JSON_ID "\":%u,"
@@ -661,6 +711,7 @@ static esp_err_t system_server_client_post_ack(system_server_client_scratch_t *s
                                         system_server_client_error_to_local_code(error_code),
                             metadata.esp_uptime_ms,
                             metadata.request_seq);
+    }
     if (json_len < 0 || json_len >= (int)sizeof(scratch->json_body)) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -688,6 +739,38 @@ static esp_err_t system_server_client_post_ack(system_server_client_scratch_t *s
     return ret;
 }
 
+static esp_err_t system_server_client_post_ack(system_server_client_scratch_t *scratch,
+                                               const char *command_id,
+                                               int ack_seq,
+                                               bool completed,
+                                               const char *error_code,
+                                               const char *error_message)
+{
+    return system_server_client_post_ack_with_voice(scratch, command_id, ack_seq, completed,
+                                                    error_code, error_message, 0U, NULL);
+}
+
+static esp_err_t system_server_client_post_voice_control_ack(
+    system_server_client_scratch_t *scratch,
+    const system_server_command_t *command,
+    bool completed,
+    const char *error_code,
+    const char *error_message)
+{
+    if (command == NULL || command->command_generation <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    server_comm_http_set_voice_control_request_active(true,
+                                                       command->command_id,
+                                                       (uint32_t)command->command_generation);
+    const esp_err_t ret = system_server_client_post_ack_with_voice(
+        scratch, command->command_id, command->seq, completed, error_code, error_message,
+        (uint32_t)command->command_generation, completed ? "ACK_SENT" : "RECOVERY");
+    server_comm_http_set_voice_control_request_active(false, NULL, 0U);
+    return ret;
+}
+
 static esp_err_t system_server_client_execute_command(system_server_client_scratch_t *scratch,
                                                       const system_server_command_t *command)
 {
@@ -703,6 +786,80 @@ static esp_err_t system_server_client_execute_command(system_server_client_scrat
                                              true,
                                              NULL,
                                              NULL);
+    }
+
+    if (strcmp(command->name, "voice.start_command_capture") == 0) {
+        if (command->command_generation <= 0 || command->wake_stream_id <= 0 ||
+            command->command_timeout_ms <= 0) {
+            /* An invalid command has no current voice generation to admit. */
+            return system_server_client_post_ack(scratch,
+                                                 command->command_id,
+                                                 command->seq,
+                                                 false,
+                                                 ESP111_PROTOCOL_ERROR_INVALID_COMMAND_PAYLOAD,
+                                                 "command_generation, wake_stream_id, and command_timeout_ms are required");
+        }
+
+        const uint32_t command_timeout_ms =
+            (uint32_t)system_server_client_normalize_ttl_ms(command->command_timeout_ms);
+        esp_err_t ret = voice_chain_create_command_session(
+            command->command_id,
+            (uint32_t)command->command_generation,
+            (uint32_t)command->wake_stream_id,
+            command_timeout_ms);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "COMMAND_SESSION_CREATE rejected id=%s generation=%d wake_stream_id=%d timeout_ms=%d ret=%s",
+                     command->command_id,
+                     command->command_generation,
+                     command->wake_stream_id,
+                     command->command_timeout_ms,
+                     esp_err_to_name(ret));
+            return system_server_client_post_voice_control_ack(scratch,
+                                                                command,
+                                                                false,
+                                                                ESP111_PROTOCOL_ERROR_COMMAND_FAILED,
+                                                                esp_err_to_name(ret));
+        }
+
+        /* The ACK endpoint is a protocol gate: capture may not be queued until
+         * this request succeeds and S3 has persisted the ACKED transition. */
+        ret = system_server_client_post_voice_control_ack(scratch,
+                                                           command,
+                                                           true,
+                                                           NULL,
+                                                           NULL);
+        if (ret != ESP_OK) {
+            voice_chain_fail_command_session(command->command_id,
+                                             (uint32_t)command->command_generation,
+                                             "command_ack_failed");
+            return ret;
+        }
+
+        ret = voice_chain_request_command_capture(command->command_id,
+                                                  (uint32_t)command->command_generation,
+                                                  (uint32_t)command->wake_stream_id,
+                                                  command_timeout_ms);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "COMMAND_CAPTURE_START rejected after ack id=%s generation=%d wake_stream_id=%d ret=%s",
+                     command->command_id,
+                     command->command_generation,
+                     command->wake_stream_id,
+                     esp_err_to_name(ret));
+            voice_chain_fail_command_session(command->command_id,
+                                             (uint32_t)command->command_generation,
+                                             "capture_start_enqueue_failed");
+            return ret;
+        }
+
+        ESP_LOGI(TAG,
+                 "COMMAND_CAPTURE_START id=%s generation=%d wake_stream_id=%d timeout_ms=%lu",
+                 command->command_id,
+                 command->command_generation,
+                 command->wake_stream_id,
+                 (unsigned long)command_timeout_ms);
+        return ESP_OK;
     }
 
     if (strcmp(command->name, "display.show_text") == 0 ||

@@ -42,13 +42,28 @@ static bool s_uart_healthy;
 static bool s_config_active;
 static bool s_has_latest_frame;
 static bool s_uart_stop_applied;
+static volatile bool s_recovery_in_progress;
+static esp_err_t s_last_recovery_failure = ESP_OK;
 static uint32_t s_snapshot_updates;
+static int64_t s_last_memory_log_ms;
 static uint64_t s_last_rx_byte_ms;
 static uint8_t s_pending_rx_bytes[RADAR_CONFIG_UART_RX_RING_BYTES];
 static uint8_t s_parser_feed_bytes[RADAR_CONFIG_UART_RX_RING_BYTES];
 static size_t s_pending_rx_length;
 static uint32_t s_pending_rx_drops;
 static uint32_t s_processed_rx_bytes;
+
+typedef enum {
+    RADAR_UART_LIFECYCLE_DISABLED = 0,
+    RADAR_UART_LIFECYCLE_DRIVER_ALLOCATED,
+    RADAR_UART_LIFECYCLE_WAITING_FOR_DEVICE,
+    RADAR_UART_LIFECYCLE_ONLINE,
+    RADAR_UART_LIFECYCLE_DEVICE_TIMEOUT,
+    RADAR_UART_LIFECYCLE_DRIVER_FAULT,
+    RADAR_UART_LIFECYCLE_MEMORY_DEFERRED,
+} radar_uart_lifecycle_state_t;
+
+static radar_uart_lifecycle_state_t s_uart_lifecycle = RADAR_UART_LIFECYCLE_DISABLED;
 
 #if defined(CONFIG_RADAR_RAW_DEBUG) && CONFIG_RADAR_RAW_DEBUG
 #define RADAR_ENABLE_RAW_HEX_LOG 1
@@ -64,18 +79,65 @@ static uint32_t s_processed_rx_bytes;
 
 static void handle_frame(const radar_frame_t *frame, void *ctx);
 
+static const char *uart_lifecycle_name(radar_uart_lifecycle_state_t state)
+{
+    static const char *const names[] = {
+        "DISABLED", "DRIVER_ALLOCATED", "WAITING_FOR_DEVICE", "ONLINE",
+        "DEVICE_TIMEOUT", "DRIVER_FAULT", "MEMORY_DEFERRED",
+    };
+    return state < (sizeof(names) / sizeof(names[0])) ? names[state] : "UNKNOWN";
+}
+
+static void set_uart_lifecycle(radar_uart_lifecycle_state_t state, const char *reason)
+{
+    if (s_uart_lifecycle == state) {
+        return;
+    }
+    s_uart_lifecycle = state;
+    ESP_LOGI(TAG, "RADAR_UART_LIFECYCLE state=%s reason=%s",
+             uart_lifecycle_name(state), reason != NULL ? reason : "-");
+}
+
+/* A memory-deferred driver can remain in exponential backoff for a long time.
+ * Keep the state transition visible without repeating the same failure on every
+ * retry, which would otherwise hide useful S3 memory diagnostics. */
+static void log_recovery_failure(esp_err_t ret, const char *stage)
+{
+    if (ret == ESP_OK || ret == s_last_recovery_failure) {
+        return;
+    }
+    s_last_recovery_failure = ret;
+    app_s3_mem_log(TAG, "uart_recovery_failed");
+    ESP_LOGW(TAG,
+             "RADAR_SOURCE_STATE event=uart_recovery_init_failed stage=%s ret=%d backoff=1" RADAR_S3_LOG_IDENTITY_FORMAT,
+             stage != NULL ? stage : "unknown",
+             (int)ret,
+             RADAR_S3_LOG_IDENTITY_ARGS);
+}
+
 static bool uart_driver_admitted(const char *stage)
 {
-    const size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const size_t largest_bytes =
+    const size_t required_bytes = ld2450_uart_internal_requirement_bytes();
+    const size_t reserve_bytes = RADAR_CONFIG_UART_INTERNAL_RESERVE_BYTES;
+    const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_largest =
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const bool admitted = free_bytes >= RADAR_CONFIG_UART_INTERNAL_MIN_FREE_BYTES &&
-                          largest_bytes >= RADAR_CONFIG_UART_INTERNAL_MIN_LARGEST_BYTES;
+    const size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    const size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    const size_t required_with_reserve = required_bytes + reserve_bytes;
+    const bool admitted = internal_free >= required_with_reserve &&
+                          internal_largest >= required_with_reserve &&
+                          dma_free >= required_with_reserve &&
+                          dma_largest >= required_with_reserve;
     ESP_LOGI(TAG,
-             "RADAR_MEMORY_ADMISSION stage=%s internal_free=%u internal_largest=%u admitted=%u",
+             "RADAR_MEMORY_ADMISSION stage=%s required=%u reserve=%u internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u admitted=%u",
              stage != NULL ? stage : "uart_driver",
-             (unsigned int)free_bytes,
-             (unsigned int)largest_bytes,
+             (unsigned int)required_bytes,
+             (unsigned int)reserve_bytes,
+             (unsigned int)internal_free,
+             (unsigned int)internal_largest,
+             (unsigned int)dma_free,
+             (unsigned int)dma_largest,
              admitted ? 1U : 0U);
     return admitted;
 }
@@ -125,6 +187,9 @@ static void log_raw_rx_hex(const uint8_t *data, size_t data_len, uint64_t timest
             }
             written += (size_t)count;
         }
+        /* snprintf leaves no room for a terminator only on truncation, which
+         * is handled above.  Keep the %s argument explicitly bounded. */
+        hex_line[written] = '\0';
         ESP_LOGI(TAG,
                  "RADAR_RX_FRAME event=raw_hex_data bytes=%s" RADAR_S3_LOG_IDENTITY_FORMAT,
                  hex_line,
@@ -174,6 +239,14 @@ static void enqueue_rx_bytes(const uint8_t *data, size_t data_len)
         return;
     }
     const size_t capacity = sizeof(s_pending_rx_bytes);
+    if (s_pending_rx_length > capacity) {
+        ESP_LOGE(TAG,
+                 "RADAR_MEMORY_CORRUPTION stage=rx_pending_length value=%u capacity=%u action=reset",
+                 (unsigned int)s_pending_rx_length,
+                 (unsigned int)capacity);
+        s_pending_rx_length = 0U;
+        sat_inc_u32(&s_pending_rx_drops);
+    }
     const size_t available = capacity - s_pending_rx_length;
     const size_t copied = data_len < available ? data_len : available;
     if (copied > 0U) {
@@ -192,7 +265,14 @@ size_t radar_service_process_pending(uint64_t processed_at_ms)
         xSemaphoreTake(s_rx_buffer_lock, portMAX_DELAY) != pdTRUE) {
         return 0U;
     }
-    const size_t length = s_pending_rx_length;
+    const size_t length = s_pending_rx_length > sizeof(s_parser_feed_bytes)
+        ? sizeof(s_parser_feed_bytes) : s_pending_rx_length;
+    if (s_pending_rx_length > sizeof(s_parser_feed_bytes)) {
+        ESP_LOGE(TAG,
+                 "RADAR_MEMORY_CORRUPTION stage=rx_pending_copy value=%u capacity=%u action=clamp",
+                 (unsigned int)s_pending_rx_length,
+                 (unsigned int)sizeof(s_parser_feed_bytes));
+    }
     if (length > 0U) {
         memcpy(s_parser_feed_bytes, s_pending_rx_bytes, length);
         s_pending_rx_length = 0U;
@@ -239,6 +319,9 @@ static void handle_frame(const radar_frame_t *frame, void *ctx)
     if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
         radar_uart_recovery_note_valid_frame(&s_recovery, frame->received_at_ms);
         s_uart_healthy = s_recovery.state == RADAR_UART_RECOVERY_VALID;
+        if (s_uart_healthy) {
+            set_uart_lifecycle(RADAR_UART_LIFECYCLE_ONLINE, "valid_frames");
+        }
         s_latest_frame = *frame;
         s_has_latest_frame = true;
         sat_inc_u32(&s_snapshot_updates);
@@ -252,11 +335,14 @@ static void apply_recovery_transition(uint64_t timestamp_ms)
         return;
     }
     const bool stop_rx = radar_uart_recovery_should_stop_rx(&s_recovery);
-    if (stop_rx && !s_uart_stop_applied) {
+    if (stop_rx && !s_uart_stop_applied && !s_recovery_in_progress) {
+        set_uart_lifecycle(RADAR_UART_LIFECYCLE_DRIVER_FAULT, "driver_error_threshold");
         s_uart_healthy = false;
         radar_presence_note_uart_error(&s_presence, timestamp_ms);
         s_uart_stop_applied = true;
+        s_recovery_in_progress = true;
         xSemaphoreGive(s_lock);
+        app_s3_mem_log(TAG, "uart_recovery_begin");
         ld2450_parser_diagnostics_t diagnostics;
         parser_get_diagnostics(&diagnostics);
         if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
@@ -290,7 +376,21 @@ static void apply_recovery_transition(uint64_t timestamp_ms)
                 radar_uart_recovery_note_init_result(&s_recovery, false, timestamp_ms);
                 s_uart_healthy = false;
                 s_uart_stop_applied = true;
+                s_recovery_in_progress = false;
                 xSemaphoreGive(s_lock);
+            } else {
+                /* The RX task owns recovery, so a failed state update must not
+                 * leave the claim set and permanently suppress later retries. */
+                s_recovery_in_progress = false;
+            }
+            log_recovery_failure(ret, "driver_deinit");
+        } else {
+            if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+                s_recovery_in_progress = false;
+                xSemaphoreGive(s_lock);
+            } else {
+                s_recovery_in_progress = false;
+                ESP_LOGE(TAG, "RADAR_SOURCE_STATE event=uart_recovery_claim_release_failed");
             }
         }
         return;
@@ -303,12 +403,17 @@ static void retry_uart_if_due(uint64_t timestamp_ms)
     if (s_lock == NULL || xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) {
         return;
     }
-    const bool due = radar_uart_recovery_retry_due(&s_recovery, timestamp_ms);
+    const bool due = !s_recovery_in_progress &&
+                     radar_uart_recovery_retry_due(&s_recovery, timestamp_ms);
+    if (due) {
+        s_recovery_in_progress = true;
+    }
     xSemaphoreGive(s_lock);
     if (!due) {
         return;
     }
 
+    app_s3_mem_log(TAG, "uart_recovery_begin");
     /* Retry a failed delete before reconfiguring so init cannot accept a stale driver. */
     esp_err_t ret = ld2450_uart_deinit();
     if (ret == ESP_OK) {
@@ -320,17 +425,21 @@ static void retry_uart_if_due(uint64_t timestamp_ms)
         radar_uart_recovery_note_init_result(&s_recovery, ret == ESP_OK, timestamp_ms);
         s_uart_healthy = false;
         s_uart_stop_applied = ret != ESP_OK;
+        s_recovery_in_progress = false;
         xSemaphoreGive(s_lock);
+    } else {
+        s_recovery_in_progress = false;
+        ESP_LOGE(TAG, "RADAR_SOURCE_STATE event=uart_recovery_claim_release_failed");
     }
     if (ret == ESP_OK) {
+        s_last_recovery_failure = ESP_OK;
+        set_uart_lifecycle(RADAR_UART_LIFECYCLE_DRIVER_ALLOCATED, "driver_reinstalled");
         ESP_LOGI(TAG,
                  "RADAR_SOURCE_STATE event=uart_recovery_reinitialized awaiting_valid_frames=1" RADAR_S3_LOG_IDENTITY_FORMAT,
                  RADAR_S3_LOG_IDENTITY_ARGS);
     } else {
-        ESP_LOGW(TAG,
-                 "RADAR_SOURCE_STATE event=uart_recovery_init_failed ret=%d backoff=1" RADAR_S3_LOG_IDENTITY_FORMAT,
-                 (int)ret,
-                 RADAR_S3_LOG_IDENTITY_ARGS);
+        set_uart_lifecycle(RADAR_UART_LIFECYCLE_MEMORY_DEFERRED, "driver_reinstall_deferred");
+        log_recovery_failure(ret, "driver_reinstall");
     }
 }
 
@@ -368,6 +477,10 @@ static void radar_rx_task(void *arg)
         }
 
         const uint64_t timestamp_ms = now_ms();
+        app_s3_mem_log_periodic(TAG,
+                                "periodic",
+                                &s_last_memory_log_ms,
+                                RADAR_CONFIG_UART_MEMORY_LOG_MS);
         if (s_lock != NULL && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
             const bool backoff = radar_uart_recovery_should_stop_rx(&s_recovery);
             const uint32_t delay_ms = radar_uart_recovery_delay_ms(&s_recovery, timestamp_ms);
@@ -415,20 +528,26 @@ static void radar_rx_task(void *arg)
             enqueue_rx_bytes(read_buffer, (size_t)read_len);
         } else if (read_len == 0) {
             parser_note_timeout(timestamp_ms);
-            if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
-                radar_uart_recovery_note_timeout(&s_recovery, timestamp_ms);
-                xSemaphoreGive(s_lock);
-            }
+            /* An unplugged or silent radar is not a UART driver fault.  Keep
+             * the installed DMA driver and wait for the device to resume. */
+            set_uart_lifecycle(RADAR_UART_LIFECYCLE_DEVICE_TIMEOUT, "no_rx_bytes");
         } else {
             if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
                 radar_uart_recovery_note_error(&s_recovery, timestamp_ms);
                 xSemaphoreGive(s_lock);
             }
+            set_uart_lifecycle(RADAR_UART_LIFECYCLE_DRIVER_FAULT, "uart_read_error");
         }
         apply_recovery_transition(timestamp_ms);
     }
 
-    (void)ld2450_uart_deinit();
+    const esp_err_t deinit_ret = ld2450_uart_deinit();
+    if (deinit_ret != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "RADAR_SOURCE_STATE event=uart_rx_exit_deinit_failed ret=%d" RADAR_S3_LOG_IDENTITY_FORMAT,
+                 (int)deinit_ret,
+                 RADAR_S3_LOG_IDENTITY_ARGS);
+    }
     if (s_lock != NULL && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
         s_uart_healthy = false;
         s_uart_stop_applied = true;
@@ -474,7 +593,10 @@ esp_err_t radar_service_init(const radar_presence_config_t *config)
     ld2450_parser_init(&s_parser);
     radar_presence_init(&s_presence, config, now_ms());
     radar_uart_recovery_init(&s_recovery, NULL, now_ms());
+    s_recovery_in_progress = false;
+    s_last_memory_log_ms = 0;
     s_initialized = true;
+    app_s3_mem_log(TAG, "radar_service_ready");
     return ESP_OK;
 }
 
@@ -488,16 +610,32 @@ esp_err_t radar_service_start(void)
         return ESP_OK;
     }
 
+    if (!ld2450_uart_is_enabled()) {
+        set_uart_lifecycle(RADAR_UART_LIFECYCLE_DISABLED, "radar_disabled");
+        ESP_LOGI(TAG,
+                 "RADAR_SOURCE_STATE event=uart_disabled_idle no_rx_task=1" RADAR_S3_LOG_IDENTITY_FORMAT,
+                 RADAR_S3_LOG_IDENTITY_ARGS);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
     while (xSemaphoreTake(s_rx_exit, 0) == pdTRUE) {
     }
     s_stop_requested = false;
 
     ret = uart_init_with_admission("uart_initial_driver");
+    set_uart_lifecycle(ret == ESP_OK ? RADAR_UART_LIFECYCLE_DRIVER_ALLOCATED :
+                                      RADAR_UART_LIFECYCLE_MEMORY_DEFERRED,
+                       ret == ESP_OK ? "startup" : "startup_admission");
     if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
         radar_uart_recovery_note_init_result(&s_recovery, ret == ESP_OK, now_ms());
         s_uart_healthy = false;
         s_uart_stop_applied = ret != ESP_OK;
         xSemaphoreGive(s_lock);
+    }
+    if (ret == ESP_OK) {
+        s_last_recovery_failure = ESP_OK;
+    } else {
+        log_recovery_failure(ret, "initial_driver");
     }
 
     BaseType_t created = xTaskCreateWithCaps(radar_rx_task,
@@ -510,8 +648,14 @@ esp_err_t radar_service_start(void)
     if (created != pdPASS) {
         s_rx_task = NULL;
         s_stop_requested = false;
-        (void)ld2450_uart_deinit();
-        return ESP_ERR_NO_MEM;
+        const esp_err_t deinit_ret = ld2450_uart_deinit();
+        if (deinit_ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "RADAR_SOURCE_STATE event=uart_start_task_cleanup_failed ret=%d" RADAR_S3_LOG_IDENTITY_FORMAT,
+                     (int)deinit_ret,
+                     RADAR_S3_LOG_IDENTITY_ARGS);
+        }
+        return deinit_ret == ESP_OK ? ESP_ERR_NO_MEM : deinit_ret;
     }
     app_stack_monitor_log_task_created(TAG,
                                        "radar_rx",
@@ -527,7 +671,7 @@ esp_err_t radar_service_start(void)
              (int)ret,
              RADAR_CONFIG_UART_RX_RING_BYTES,
              RADAR_S3_LOG_IDENTITY_ARGS);
-    return ret == ESP_OK ? ESP_OK : ESP_ERR_INVALID_STATE;
+    return ret;
 }
 
 esp_err_t radar_service_stop(void)

@@ -12,7 +12,14 @@
 static const char *TAG = "radar_ble_runtime";
 static TaskHandle_t s_task;
 static bool s_started;
+static bool s_stop_pending;
 static radar_ble_state_t s_last_state;
+
+static TickType_t radar_ble_runtime_ms_to_ticks(uint32_t timeout_ms)
+{
+    const TickType_t ticks = pdMS_TO_TICKS(timeout_ms);
+    return ticks == 0U ? 1U : ticks;
+}
 
 static uint64_t now_ms(void)
 {
@@ -51,8 +58,20 @@ static void process_task(void *arg)
         if (!link_online) {
             radar_ble_transport_set_data_ready(false);
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(radar_ble_runtime_ms_to_ticks(20U));
     }
+}
+
+static void radar_ble_runtime_release_domain(void)
+{
+    if (s_task != NULL) {
+        vTaskDeleteWithCaps(s_task);
+        s_task = NULL;
+    }
+    s_started = false;
+    s_stop_pending = false;
+    s_last_state = RADAR_BLE_STATE_DISABLED;
+    radar_domain_stop();
 }
 
 esp_err_t radar_ble_runtime_start(void)
@@ -60,17 +79,27 @@ esp_err_t radar_ble_runtime_start(void)
     if (s_started) {
         return ESP_OK;
     }
+    if (s_stop_pending) {
+        if (!radar_ble_transport_is_stopped()) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        radar_ble_runtime_release_domain();
+    }
     const esp_err_t ret = radar_domain_start();
     if (ret != ESP_OK) {
         return ret;
     }
+    /* BLE callbacks execute in the NimBLE context; this periodic state task is not ISR/DMA. */
+    ESP_LOGI(TAG,
+             "MEM_ALLOC_PLAN owner=radar_ble_rx_stack caps=0x%08lx size=%u region=psram",
+             (unsigned long)(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             2048U);
     if (xTaskCreateWithCaps(process_task, "radar_ble_rx", 2048, NULL, 2, &s_task,
-                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         s_task = NULL;
         radar_domain_stop();
         return ESP_ERR_NO_MEM;
     }
-    s_started = true;
     s_last_state = RADAR_BLE_STATE_DISABLED;
     const int transport_ret = radar_ble_transport_start(notify_cb, NULL);
     if (transport_ret != 0) {
@@ -81,20 +110,25 @@ esp_err_t radar_ble_runtime_start(void)
                  RADAR_BLE_BINDING_ROOM_ID,
                  (unsigned int)RADAR_BLE_BINDING_LOCAL_ID,
                  transport_ret);
+        vTaskDeleteWithCaps(s_task);
+        s_task = NULL;
+        radar_domain_stop();
+        s_last_state = RADAR_BLE_STATE_DISABLED;
+        return transport_ret == ESP_OK ? ESP_FAIL : (esp_err_t)transport_ret;
     }
+    s_started = true;
     return ESP_OK;
 }
 
 void radar_ble_runtime_stop(void)
 {
     radar_ble_transport_stop();
-    if (s_task != NULL) {
-        vTaskDelete(s_task);
-        s_task = NULL;
+    if (!radar_ble_transport_is_stopped()) {
+        s_stop_pending = true;
+        ESP_LOGW(TAG, "RADAR_BLE_STOP deferred domain cleanup until NimBLE shutdown completes");
+        return;
     }
-    s_started = false;
-    s_last_state = RADAR_BLE_STATE_DISABLED;
-    radar_domain_stop();
+    radar_ble_runtime_release_domain();
 }
 
 void radar_ble_runtime_get_status(radar_ble_transport_status_t *out)

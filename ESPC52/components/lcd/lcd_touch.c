@@ -1,7 +1,9 @@
 #include "lcd_touch.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 #include "iic.h"
@@ -67,7 +69,7 @@ static void lcd_touch_task(void *arg)
     if (s_stop_waiter != NULL) {
         xTaskNotifyGive(s_stop_waiter);
     }
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 esp_err_t lcd_touch_start(void)
@@ -90,19 +92,25 @@ esp_err_t lcd_touch_start(void)
 
     s_stop_requested = false;
     if (lcd_fault_injection_should_fail(LCD_FAULT_TOUCH_TASK)) return ESP_ERR_NO_MEM;
-    const BaseType_t created = xTaskCreate(lcd_touch_task,
-                                           "lcd_touch",
-                                           LCD_TOUCH_TASK_STACK,
-                                           NULL,
-                                           1,
-                                           &s_task);
+    const uint32_t task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    ESP_LOGI(TAG,
+             "MEM_ALLOC_PLAN owner=lcd_touch_stack caps=0x%08lx size=%u region=psram",
+             (unsigned long)task_caps,
+             (unsigned int)LCD_TOUCH_TASK_STACK);
+    const BaseType_t created = xTaskCreateWithCaps(lcd_touch_task,
+                                                   "lcd_touch",
+                                                   LCD_TOUCH_TASK_STACK,
+                                                   NULL,
+                                                   1,
+                                                   &s_task,
+                                                   task_caps);
     if (created != pdPASS || s_task == NULL) {
         s_task = NULL;
         ESP_LOGE(TAG, "LCD_TOUCH task create failed");
         return ESP_ERR_NO_MEM;
     }
     s_available = true;
-    ESP_LOGI(TAG, "LCD_TOUCH_READY chip=0x%02X", chip_id);
+    ESP_LOGI(TAG, "LCD_TOUCH_READY chip=0x%02X stack=psram", chip_id);
     return ESP_OK;
 }
 

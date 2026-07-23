@@ -198,6 +198,15 @@ static void replay_worker_task(void *arg)
         replay_cancel_ctx_t cancel_ctx = {
             .device_id = record.device_id,
         };
+        if (server_client_http_best_effort_should_defer()) {
+            ESP_LOGI(TAG,
+                     "HTTP_REQUEST_DEFER endpoint=device_ingest class=best_effort reason=mem_pressure stage=bme_replay seq=%lu",
+                     (unsigned long)record.sequence);
+            (void)bme_cache_manager_mark_in_flight(record.sequence, false);
+            bme_cache_manager_release_record(&record);
+            vTaskDelay(pdMS_TO_TICKS(NETWORK_REPLAY_WORKER_FAILURE_DELAY_MS));
+            continue;
+        }
         ret = server_client_post_ingest_json_cancellable_for_device(
             record.device_id,
             record.server_json,
@@ -264,7 +273,7 @@ esp_err_t network_replay_worker_init(void)
                                              NULL,
                                              NETWORK_REPLAY_WORKER_TASK_PRIORITY,
                                              &s_replay_task,
-                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                             APP_TASK_STACK_CAPS_PSRAM);
     if (created != pdPASS) {
         s_replay_task = NULL;
         return ESP_ERR_NO_MEM;

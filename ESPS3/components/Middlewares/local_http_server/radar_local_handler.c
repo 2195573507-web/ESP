@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "radar_ingest.h"
 #include "radar_gateway_ingest.h"
+#include "radar_home_snapshot.h"
 #include "radar_local_adapter.h"
 #include "radar_person_continuity.h"
 #include "radar_registry.h"
@@ -74,9 +75,63 @@ static const char *debug_recovery_state_name(radar_uart_recovery_state_t state)
     case RADAR_UART_RECOVERY_VALID: return "RUNNING";
     case RADAR_UART_RECOVERY_WAITING_VALID: return "WAITING_VALID";
     case RADAR_UART_RECOVERY_BACKOFF: return "BACKOFF";
-    case RADAR_UART_RECOVERY_OFFLINE:
-    default: return "FAILED";
+    case RADAR_UART_RECOVERY_OFFLINE: return "DISABLED_OR_OFFLINE";
+    default: return "UNKNOWN";
     }
+}
+
+static const RadarRoomState *home_source_state(const RadarHomeState *home,
+                                                radar_source_id_t source)
+{
+    if (home == NULL) return NULL;
+    const uint8_t room_count = home->occupied_room_count > RADAR_SOURCE_COUNT
+        ? RADAR_SOURCE_COUNT : home->occupied_room_count;
+    for (uint8_t index = 0U; index < room_count; ++index) {
+        if (home->occupied_rooms[index].source_id == source) {
+            return &home->occupied_rooms[index];
+        }
+    }
+    return NULL;
+}
+
+static const char *home_motion_name(radar_motion_state_t state)
+{
+    switch (state) {
+    case RADAR_MOTION_MOVING: return "moving";
+    case RADAR_MOTION_STILL_CANDIDATE: return "still_candidate";
+    case RADAR_MOTION_NONE: return "none";
+    case RADAR_MOTION_UNKNOWN:
+    default: return "unknown";
+    }
+}
+
+static const char *inactive_source_motion_name(radar_presence_state_t state)
+{
+    switch (state) {
+    case RADAR_STATE_MOTION: return "moving";
+    case RADAR_STATE_VACANT_INFERRED:
+    case RADAR_STATE_HOLD:
+    case RADAR_STATE_PRESENT: return "none";
+    case RADAR_STATE_UNKNOWN:
+    default: return "unknown";
+    }
+}
+
+static bool append_json_string(char *out, size_t out_size, size_t *used, const char *value)
+{
+    if (!append_text(out, out_size, used, "\"")) return false;
+    const unsigned char *cursor = (const unsigned char *)(value != NULL ? value : "");
+    while (*cursor != '\0') {
+        if (*cursor == '\"' || *cursor == '\\') {
+            if (!append_text(out, out_size, used, "\\%c", *cursor)) return false;
+        } else if (*cursor < 0x20U) {
+            if (!append_text(out, out_size, used, "\\u%04x", (unsigned int)*cursor)) return false;
+        } else if (!append_text(out, out_size, used, "%c", *cursor)) {
+            return false;
+        }
+        ++cursor;
+    }
+    return append_text(out, out_size, used, "\"");
 }
 
 esp_err_t radar_local_handler(httpd_req_t *req)
@@ -94,7 +149,7 @@ esp_err_t radar_local_handler(httpd_req_t *req)
     }
 
     const size_t capacity = (size_t)req->content_len + 1U;
-    char *body = heap_caps_malloc(capacity, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    char *body = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (body == NULL) {
         return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"no_memory\"}");
     }
@@ -133,13 +188,87 @@ esp_err_t radar_local_handler(httpd_req_t *req)
     }
 }
 
+esp_err_t radar_home_snapshot_handler(httpd_req_t *req)
+{
+    if (req == NULL) return ESP_ERR_INVALID_ARG;
+
+    enum { RADAR_HOME_SNAPSHOT_BODY_BYTES = 1536U };
+    char *body = heap_caps_calloc(1U, RADAR_HOME_SNAPSHOT_BODY_BYTES,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (body == NULL) {
+        return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"home_snapshot_memory\"}");
+    }
+
+    radar_home_snapshot_t snapshot = {0};
+    radar_registry_entry_t sources[RADAR_SOURCE_COUNT] = {0};
+    const bool has_snapshot = radar_home_snapshot_get(&snapshot);
+    const size_t source_count = radar_registry_snapshot(sources, RADAR_SOURCE_COUNT);
+    if (!has_snapshot || source_count == 0U) {
+        heap_caps_free(body);
+        return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"home_snapshot_unavailable\"}");
+    }
+
+    RadarHomeState home = {0};
+    radar_registry_get_home_state(&home);
+    size_t used = 0U;
+    if (!append_text(body, RADAR_HOME_SNAPSHOT_BODY_BYTES, &used, "{\"ok\":1,\"sources\":[")) {
+        goto home_snapshot_memory;
+    }
+
+    for (size_t index = 0U; index < source_count; ++index) {
+        const radar_registry_entry_t *source = &sources[index];
+        const RadarRoomState *source_state = home_source_state(&home, source->source);
+        if (!append_text(body, RADAR_HOME_SNAPSHOT_BODY_BYTES, &used,
+                         "%s{\"source_id\":%u,\"source\":",
+                         index == 0U ? "" : ",", (unsigned int)source->source) ||
+            !append_json_string(body, RADAR_HOME_SNAPSHOT_BODY_BYTES, &used,
+                                radar_registry_source_name(source->source)) ||
+            !append_text(body, RADAR_HOME_SNAPSHOT_BODY_BYTES, &used, ",\"room\":") ||
+            !append_json_string(body, RADAR_HOME_SNAPSHOT_BODY_BYTES, &used, source->room_id) ||
+            !append_text(body, RADAR_HOME_SNAPSHOT_BODY_BYTES, &used,
+                         ",\"online\":%s,\"occupied\":%s,\"motion\":\"%s\",\"person_count\":%u}",
+                         source->source_online ? "true" : "false",
+                         source_state != NULL ? "true" : "false",
+                         source_state != NULL ? home_motion_name(source_state->motion) :
+                                                inactive_source_motion_name(source->snapshot.state),
+                         (unsigned int)(source_state != NULL ? source_state->person_count : 0U))) {
+            goto home_snapshot_memory;
+        }
+    }
+
+    if (!append_text(body, RADAR_HOME_SNAPSHOT_BODY_BYTES, &used,
+                     "],\"home\":{\"known\":%s,\"occupied\":%s,\"person_count\":%u,\"room_count\":%u}}",
+                     snapshot.occupancy_known ? "true" : "false",
+                     snapshot.occupied ? "true" : "false",
+                     (unsigned int)snapshot.person_count,
+                     (unsigned int)snapshot.room_count)) {
+        goto home_snapshot_memory;
+    }
+
+    {
+        const esp_err_t ret = respond(req, "200 OK", body);
+        heap_caps_free(body);
+        return ret;
+    }
+
+home_snapshot_memory:
+    heap_caps_free(body);
+    return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"home_snapshot_memory\"}");
+}
+
 esp_err_t radar_debug_handler(httpd_req_t *req)
 {
     if (req == NULL) return ESP_ERR_INVALID_ARG;
-    char body[4096];
-    size_t used = 0U;
-    if (!append_text(body, sizeof(body), &used, "{\"sources\":[")) {
+    enum { RADAR_DEBUG_BODY_BYTES = 4096U };
+    char *body = heap_caps_calloc(1U,
+                                  RADAR_DEBUG_BODY_BYTES,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (body == NULL) {
         return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
+    }
+    size_t used = 0U;
+    if (!append_text(body, RADAR_DEBUG_BODY_BYTES, &used, "{\"sources\":[")) {
+        goto debug_memory;
     }
 
     radar_readonly_snapshot_t local_snapshot = {0};
@@ -159,7 +288,7 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
         const char *sensor_state = online ? "online" : "offline";
         const char *occupancy = has_entry
             ? debug_presence_occupancy_name(entry.snapshot.state) : "unknown";
-        const char *recovery_state = online ? "RUNNING" : "FAILED";
+        const char *recovery_state = online ? "RUNNING" : "NOT_CONNECTED";
         uint32_t targets = has_entry ? entry.snapshot.current_target_count : 0U;
         uint32_t tracks = 0U;
         uint32_t raw_targets = 0U;
@@ -207,7 +336,10 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
             radar_gateway_output_t output = {0};
             if (radar_gateway_ingest_get_output(local_id, &output)) {
                 online = output.radar_online;
-                sensor_state = online ? "online" : "offline";
+                sensor_state = online ? "online" :
+                    (output.radar_stale ? "stale" : "offline");
+                recovery_state = online ? "RUNNING" :
+                    (output.radar_stale ? "STALE" : "NOT_CONNECTED");
                 occupancy = debug_occupancy_name(output.occupancy);
                 targets = output.target_count;
                 raw_targets = output.count_summary.raw_target_count;
@@ -223,7 +355,7 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
             }
         }
 
-        if (!append_text(body, sizeof(body), &used,
+        if (!append_text(body, RADAR_DEBUG_BODY_BYTES, &used,
                          "%s{\"source_id\":%u,\"source\":\"%s\",\"device_id\":\"%s\",\"room\":\"%s\",\"online\":%s,"
                          "\"transport\":\"%s\",\"sequence\":%lu,\"sensor_state\":\"%s\",\"occupancy\":\"%s\",\"targets\":[",
                          source == RADAR_SOURCE_S3_LOCAL ? "" : ",",
@@ -236,19 +368,21 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
                          (unsigned long)(context != NULL ? context->sequence : 0U),
                          sensor_state,
                          occupancy)) {
-            return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
+            goto debug_memory;
         }
 
         bool first_source_target = true;
         if (source == RADAR_SOURCE_S3_LOCAL && has_local_snapshot) {
-            for (uint8_t index = 0U; index < local_snapshot.track_count; ++index) {
+            const uint8_t track_count = local_snapshot.track_count > RADAR_TRACKER_MAX_TRACKS
+                ? RADAR_TRACKER_MAX_TRACKS : local_snapshot.track_count;
+            for (uint8_t index = 0U; index < track_count; ++index) {
                 const radar_readonly_track_t *track = &local_snapshot.tracks[index];
-                if (!append_text(body, sizeof(body), &used,
+                if (!append_text(body, RADAR_DEBUG_BODY_BYTES, &used,
                                  "%s{\"source_id\":%u,\"source\":\"%s\",\"device_id\":\"%s\",\"room\":\"%s\",\"id\":%lu,\"x_mm\":%ld,\"y_mm\":%ld,\"visible\":%s}",
                                  first_source_target ? "" : ",", (unsigned int)source, source_name, device_id, room_id,
                                  (unsigned long)track->track_id, (long)track->filtered_x_mm,
                                  (long)track->filtered_y_mm, track->visible ? "true" : "false")) {
-                    return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
+                    goto debug_memory;
                 }
                 first_source_target = false;
             }
@@ -256,21 +390,23 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
             const uint8_t local_id = source == RADAR_SOURCE_C51 ? 1U : 2U;
             radar_gateway_output_t output = {0};
             if (radar_gateway_ingest_get_output(local_id, &output)) {
-                for (uint8_t index = 0U; index < output.target_count; ++index) {
+                const uint8_t target_count = output.target_count > LD2450_MAX_TARGETS
+                    ? LD2450_MAX_TARGETS : output.target_count;
+                for (uint8_t index = 0U; index < target_count; ++index) {
                     const radar_gateway_target_output_t *target = &output.targets[index];
-                    if (!append_text(body, sizeof(body), &used,
+                    if (!append_text(body, RADAR_DEBUG_BODY_BYTES, &used,
                                      "%s{\"source_id\":%u,\"source\":\"%s\",\"device_id\":\"%s\",\"room\":\"%s\",\"id\":%lu,\"x_mm\":%ld,\"y_mm\":%ld,\"visible\":%s}",
                                      first_source_target ? "" : ",", (unsigned int)source, source_name, device_id, room_id,
                                      (unsigned long)target->track_id, (long)target->x_mm,
                                      (long)target->y_mm, target->visible ? "true" : "false")) {
-                        return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
+                        goto debug_memory;
                     }
                     first_source_target = false;
                 }
             }
         }
 
-        if (!append_text(body, sizeof(body), &used,
+        if (!append_text(body, RADAR_DEBUG_BODY_BYTES, &used,
                          "],\"target_count\":%lu,\"tracks\":%lu,\"raw_target_count\":%lu,\"accepted_target_count\":%lu,"
                          "\"visible_track_count\":%lu,\"confirmed_active_track_count\":%lu,"
                          "\"history_target_count\":%lu,\"visible_person_count\":%lu,"
@@ -295,18 +431,24 @@ esp_err_t radar_debug_handler(httpd_req_t *req)
                          (unsigned long)resync,
                          recovery_state,
                          (unsigned long long)last_update)) {
-            return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
+            goto debug_memory;
         }
     }
 
     radar_ingest_history_stats_t history = {0};
     const bool has_history = radar_ingest_history_get_stats(&history);
-    if (!append_text(body, sizeof(body), &used,
+    if (!append_text(body, RADAR_DEBUG_BODY_BYTES, &used,
                      "],\"source_count\":%u,\"history_count\":%u,\"history_capacity\":%u}",
                      (unsigned int)RADAR_SOURCE_COUNT,
                      has_history ? (unsigned int)history.count : 0U,
                      has_history ? (unsigned int)history.capacity : 0U)) {
-        return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
+        goto debug_memory;
     }
-    return respond(req, "200 OK", body);
+    const esp_err_t response_ret = respond(req, "200 OK", body);
+    heap_caps_free(body);
+    return response_ret;
+
+debug_memory:
+    heap_caps_free(body);
+    return respond(req, "503 Service Unavailable", "{\"ok\":0,\"error\":\"debug_memory\"}");
 }

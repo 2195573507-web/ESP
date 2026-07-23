@@ -3,11 +3,13 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "esp_log.h"
 #include "esp_timer.h"
 #include "radar_ble_binding_config.h"
 
 #if RADAR_BLE_BINDING_ENABLED
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_gatt.h"
@@ -18,7 +20,9 @@
 #include "nimble/nimble_npl.h"
 #endif
 
+#if RADAR_BLE_BINDING_ENABLED
 static const char *TAG = "radar_ble_transport";
+#endif
 #define RADAR_BLE_IDENTITY_FORMAT \
     " source_id=%u source=%s device_id=%s room=%s sequence=%lu"
 #define RADAR_BLE_IDENTITY_ARGS(sequence_value) \
@@ -34,6 +38,40 @@ static const char *TAG = "radar_ble_transport";
 static radar_ble_transport_status_t s_status;
 static radar_ble_notify_cb_t s_notify_cb;
 static void *s_notify_ctx;
+typedef enum {
+    RADAR_BLE_LIFECYCLE_UNINITIALIZED = 0,
+    RADAR_BLE_LIFECYCLE_INITIALIZING,
+    RADAR_BLE_LIFECYCLE_RUNNING,
+    RADAR_BLE_LIFECYCLE_STOPPING,
+    RADAR_BLE_LIFECYCLE_STOPPED,
+    RADAR_BLE_LIFECYCLE_FAILED,
+} radar_ble_lifecycle_t;
+static volatile radar_ble_lifecycle_t s_lifecycle = RADAR_BLE_LIFECYCLE_UNINITIALIZED;
+static volatile bool s_accept_callbacks;
+static volatile uint32_t s_gap_callback_inflight;
+static bool s_nimble_port_initialized;
+#if RADAR_BLE_BINDING_ENABLED
+static TaskHandle_t s_nimble_stop_task;
+static TaskHandle_t s_nimble_stop_waiter;
+#define RADAR_BLE_STOP_WAIT_MS 2500U
+
+static TickType_t radar_ble_ms_to_ticks(uint32_t timeout_ms)
+{
+    const TickType_t ticks = pdMS_TO_TICKS(timeout_ms);
+    return ticks == 0U ? 1U : ticks;
+}
+#endif
+
+static void radar_ble_finish_stop(void)
+{
+    s_notify_cb = NULL;
+    s_notify_ctx = NULL;
+    s_status.state = RADAR_BLE_STATE_DISABLED;
+    s_status.connected = false;
+    s_status.notify_subscribed = false;
+    s_status.data_ready = false;
+    s_lifecycle = RADAR_BLE_LIFECYCLE_STOPPED;
+}
 #ifndef RADAR_DEBUG_RAW_FRAME
 #define RADAR_DEBUG_RAW_FRAME 0
 #endif
@@ -132,9 +170,10 @@ static bool peer_matches(const ble_addr_t *addr)
 
 static void schedule_retry(void)
 {
+    if (!s_accept_callbacks) return;
     if (s_backoff_ms == 0U) s_backoff_ms = 1000U;
-    else if (s_backoff_ms < 30000U) s_backoff_ms *= 2U;
-    if (s_backoff_ms > 30000U) s_backoff_ms = 30000U;
+    else if (s_backoff_ms < 60000U) s_backoff_ms *= 2U;
+    if (s_backoff_ms > 60000U) s_backoff_ms = 60000U;
     s_status.state = RADAR_BLE_STATE_BACKOFF;
     s_status.backoff_ms = s_backoff_ms;
     ESP_LOGI(TAG, "RADAR_RECONNECT local_id=%u retry_ms=%lu count=%lu" RADAR_BLE_IDENTITY_FORMAT,
@@ -156,6 +195,7 @@ static void backoff_event(struct ble_npl_event *event)
 
 static void start_scan(void)
 {
+    if (!s_accept_callbacks) return;
     struct ble_gap_disc_params params = {0};
     params.itvl = 0x0010;
     params.window = 0x0010;
@@ -371,17 +411,19 @@ static int survey_svc_cb(uint16_t conn, const struct ble_gatt_error *error,
     return 0;
 }
 
-static int gap_event(struct ble_gap_event *event, void *arg)
+static int gap_event_impl(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
+    if (!s_accept_callbacks || event == NULL) return 0;
     switch (event->type) {
     case BLE_GAP_EVENT_DISC: {
         char address[18] = {0};
         const uint64_t timestamp = now_ms();
         if (s_last_device_log_ms == 0U || timestamp - s_last_device_log_ms >= 1000U) {
             format_address(&event->disc.addr, address);
-            RADAR_BLE_LOGI0("RADAR_DEVICE_FOUND mac=%s addr_type=%u rssi=%d", address,
-                     (unsigned int)event->disc.addr.type, (int)event->disc.rssi);
+            ESP_LOGD(TAG, "RADAR_DEVICE_FOUND mac=%s addr_type=%u rssi=%d" RADAR_BLE_IDENTITY_FORMAT,
+                     address, (unsigned int)event->disc.addr.type, (int)event->disc.rssi,
+                     RADAR_BLE_IDENTITY_ARGS(0U));
             s_last_device_log_ms = timestamp;
         }
         if (!peer_matches(&event->disc.addr)) return 0;
@@ -469,13 +511,26 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     }
 }
 
+static int gap_event(struct ble_gap_event *event, void *arg)
+{
+    (void)__atomic_fetch_add(&s_gap_callback_inflight, 1U, __ATOMIC_ACQ_REL);
+    const int rc = gap_event_impl(event, arg);
+    (void)__atomic_fetch_sub(&s_gap_callback_inflight, 1U, __ATOMIC_ACQ_REL);
+    return rc;
+}
+
 static void on_sync(void)
 {
+    if (!s_accept_callbacks) return;
     if (ble_hs_id_infer_auto(0, &s_own_addr_type) != 0) {
         schedule_retry();
         return;
     }
-    ble_npl_callout_init(&s_backoff_callout, nimble_port_get_dflt_eventq(), backoff_event, NULL);
+    if (ble_npl_callout_init(&s_backoff_callout, nimble_port_get_dflt_eventq(), backoff_event, NULL) != 0) {
+        s_lifecycle = RADAR_BLE_LIFECYCLE_FAILED;
+        s_status.state = RADAR_BLE_STATE_UNAVAILABLE;
+        return;
+    }
     s_callout_initialized = true;
     start_scan();
 }
@@ -485,15 +540,52 @@ static void host_task(void *param)
     (void)param;
     nimble_port_run();
     nimble_port_freertos_deinit();
+    s_accept_callbacks = false;
+}
+
+static void nimble_stop_task(void *param)
+{
+    (void)param;
+    const int stop_ret = nimble_port_stop();
+    if (stop_ret != 0) {
+        ESP_LOGW(TAG, "RADAR_BLE_STOP nimble_port_stop failed ret=%d", stop_ret);
+        s_lifecycle = RADAR_BLE_LIFECYCLE_FAILED;
+    } else {
+        if (s_callout_initialized) {
+            ble_npl_callout_deinit(&s_backoff_callout);
+            s_callout_initialized = false;
+        }
+        if (nimble_port_deinit() != ESP_OK) {
+            ESP_LOGW(TAG, "RADAR_BLE_STOP nimble_port_deinit failed");
+            s_lifecycle = RADAR_BLE_LIFECYCLE_FAILED;
+        } else {
+            s_nimble_port_initialized = false;
+            radar_ble_finish_stop();
+        }
+    }
+
+    const TaskHandle_t waiter = s_nimble_stop_waiter;
+    s_nimble_stop_waiter = NULL;
+    s_nimble_stop_task = NULL;
+    if (waiter != NULL) {
+        xTaskNotifyGive(waiter);
+    }
+    vTaskDelete(NULL);
 }
 #endif
 
 int radar_ble_set_control_command(const uint8_t *data, size_t length)
 {
+#if RADAR_BLE_BINDING_ENABLED
     if (length > sizeof(s_control_command) || (data == NULL && length > 0U)) return -1;
     if (length > 0U) memcpy(s_control_command, data, length);
     s_control_command_length = length;
     return 0;
+#else
+    (void)data;
+    (void)length;
+    return -1;
+#endif
 }
 
 int radar_ble_send_control_command(void)
@@ -532,16 +624,34 @@ int radar_ble_send_control_command(void)
 
 int radar_ble_transport_start(radar_ble_notify_cb_t callback, void *ctx)
 {
+    if (s_lifecycle == RADAR_BLE_LIFECYCLE_RUNNING ||
+        s_lifecycle == RADAR_BLE_LIFECYCLE_INITIALIZING) {
+        return 0;
+    }
+    if (s_lifecycle == RADAR_BLE_LIFECYCLE_STOPPING) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_lifecycle == RADAR_BLE_LIFECYCLE_FAILED && s_nimble_port_initialized) {
+        radar_ble_transport_stop();
+        if (s_lifecycle != RADAR_BLE_LIFECYCLE_STOPPED) {
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    s_lifecycle = RADAR_BLE_LIFECYCLE_INITIALIZING;
+    s_accept_callbacks = false;
+    s_gap_callback_inflight = 0U;
     memset(&s_status, 0, sizeof(s_status));
     s_notify_cb = callback;
     s_notify_ctx = ctx;
 #if !RADAR_BLE_BINDING_ENABLED
     s_status.state = RADAR_BLE_STATE_DISABLED;
+    s_lifecycle = RADAR_BLE_LIFECYCLE_RUNNING;
     return 0;
 #else
     if (!binding_mac_is_nonzero() || RADAR_BLE_BINDING_ADDRESS_TYPE == RADAR_BLE_ADDR_TYPE_UNSPECIFIED) {
         s_status.state = RADAR_BLE_STATE_UNAVAILABLE;
         ++s_status.unavailable_count;
+        s_lifecycle = RADAR_BLE_LIFECYCLE_FAILED;
         return -1;
     }
     s_status.configured = true;
@@ -557,8 +667,15 @@ int radar_ble_transport_start(radar_ble_notify_cb_t callback, void *ctx)
              (unsigned int)RADAR_BLE_BINDING_LOCAL_ID);
     ble_hs_cfg.sync_cb = on_sync;
     const int rc = nimble_port_init();
-    if (rc != ESP_OK) return rc;
+    if (rc != ESP_OK) {
+        s_lifecycle = RADAR_BLE_LIFECYCLE_FAILED;
+        s_status.state = RADAR_BLE_STATE_UNAVAILABLE;
+        return rc;
+    }
+    s_nimble_port_initialized = true;
+    s_accept_callbacks = true;
     nimble_port_freertos_init(host_task);
+    s_lifecycle = RADAR_BLE_LIFECYCLE_RUNNING;
     return 0;
 #endif
 }
@@ -580,12 +697,66 @@ int radar_ble_transport_write(const uint8_t *data, size_t length)
 
 void radar_ble_transport_stop(void)
 {
-    s_notify_cb = NULL;
-    s_notify_ctx = NULL;
-    s_status.state = RADAR_BLE_STATE_DISABLED;
-    s_status.connected = false;
-    s_status.notify_subscribed = false;
-    s_status.data_ready = false;
+    radar_ble_lifecycle_t expected = s_lifecycle;
+    if (expected == RADAR_BLE_LIFECYCLE_UNINITIALIZED ||
+        expected == RADAR_BLE_LIFECYCLE_STOPPED) {
+        radar_ble_finish_stop();
+        return;
+    }
+    if (expected == RADAR_BLE_LIFECYCLE_STOPPING ||
+        !__atomic_compare_exchange_n(&s_lifecycle,
+                                     &expected,
+                                     RADAR_BLE_LIFECYCLE_STOPPING,
+                                     false,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    s_accept_callbacks = false;
+#if RADAR_BLE_BINDING_ENABLED
+    if (s_nimble_port_initialized) {
+        if (s_callout_initialized) {
+            ble_npl_callout_stop(&s_backoff_callout);
+        }
+        (void)ble_gap_disc_cancel();
+        if (s_status.connected) {
+            (void)ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        const TickType_t deadline = xTaskGetTickCount() + radar_ble_ms_to_ticks(RADAR_BLE_STOP_WAIT_MS);
+        while (__atomic_load_n(&s_gap_callback_inflight, __ATOMIC_ACQUIRE) != 0U &&
+               (TickType_t)(deadline - xTaskGetTickCount()) > 0U) {
+            vTaskDelay(radar_ble_ms_to_ticks(1U));
+        }
+        if (__atomic_load_n(&s_gap_callback_inflight, __ATOMIC_ACQUIRE) != 0U) {
+            ESP_LOGW(TAG, "RADAR_BLE_STOP callback deadline exceeded; retaining callback storage");
+        }
+        s_nimble_stop_waiter = xTaskGetCurrentTaskHandle();
+        if (xTaskCreate(nimble_stop_task, "radar_ble_stop", 2048, NULL, 3,
+                        &s_nimble_stop_task) != pdPASS) {
+            s_nimble_stop_task = NULL;
+            s_nimble_stop_waiter = NULL;
+            s_lifecycle = RADAR_BLE_LIFECYCLE_FAILED;
+            ESP_LOGE(TAG, "RADAR_BLE_STOP stop-task allocation failed; retaining NimBLE resources");
+            return;
+        }
+        if (ulTaskNotifyTake(pdTRUE, radar_ble_ms_to_ticks(RADAR_BLE_STOP_WAIT_MS)) == 0U) {
+            s_nimble_stop_waiter = NULL;
+            ESP_LOGW(TAG, "RADAR_BLE_STOP deadline exceeded; cleanup continues asynchronously");
+            return;
+        }
+    }
+    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    s_survey_count = 0U;
+    s_survey_index = 0U;
+#endif
+    if (!s_nimble_port_initialized) {
+        radar_ble_finish_stop();
+    }
+}
+
+bool radar_ble_transport_is_stopped(void)
+{
+    return s_lifecycle == RADAR_BLE_LIFECYCLE_STOPPED && !s_nimble_port_initialized;
 }
 
 void radar_ble_transport_set_data_ready(bool ready)

@@ -856,7 +856,7 @@ esp_err_t device_stream_gateway_start(void)
                                                  NULL,
                                                  DEVICE_STREAM_UDP_TASK_PRIORITY,
                                                  &s_udp_task,
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                 APP_TASK_STACK_CAPS_PSRAM);
         if (created != pdPASS) {
             s_udp_task = NULL;
             return ESP_ERR_NO_MEM;

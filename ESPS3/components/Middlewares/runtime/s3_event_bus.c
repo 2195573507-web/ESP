@@ -56,6 +56,8 @@ static s3_event_bus_release_fn_t s_release_fn;
 static uint32_t s_drop_count;
 static uint32_t s_background_drop_count;
 static uint32_t s_coalesce_count;
+static uint32_t s_drop_by_event_type[S3_EVENT_BUS_EVENT_TYPE_COUNT];
+static uint32_t s_coalesce_by_state_key[S3_EVENT_BUS_STATE_COUNT];
 
 const char *s3_event_bus_level_name(s3_event_bus_level_t level)
 {
@@ -123,6 +125,12 @@ static void snapshot_stats_locked(s3_event_bus_stats_t *out_stats)
     out_stats->drop_count = s_drop_count;
     out_stats->background_drop_count = s_background_drop_count;
     out_stats->coalesce_count = s_coalesce_count;
+    memcpy(out_stats->drop_by_event_type,
+           s_drop_by_event_type,
+           sizeof(out_stats->drop_by_event_type));
+    memcpy(out_stats->coalesce_by_state_key,
+           s_coalesce_by_state_key,
+           sizeof(out_stats->coalesce_by_state_key));
 }
 
 static void release_event(s3_scheduler_event_t *event)
@@ -161,6 +169,8 @@ static void reset_locked(void)
     s_drop_count = 0U;
     s_background_drop_count = 0U;
     s_coalesce_count = 0U;
+    memset(s_drop_by_event_type, 0, sizeof(s_drop_by_event_type));
+    memset(s_coalesce_by_state_key, 0, sizeof(s_coalesce_by_state_key));
 }
 
 esp_err_t s3_event_bus_init(s3_event_bus_release_fn_t release_fn)
@@ -310,6 +320,9 @@ static esp_err_t push_owned_with_timeout(s3_scheduler_event_t *event,
             /* STATE 只保留最新值，旧事件已经过期，立即释放旧 owned event。 */
             release_event(s_state_slots[state_key]);
             ++s_coalesce_count;
+            if ((size_t)state_key < S3_EVENT_BUS_STATE_COUNT) {
+                ++s_coalesce_by_state_key[state_key];
+            }
         } else {
             signal_needed = true;
         }
@@ -328,6 +341,9 @@ static esp_err_t push_owned_with_timeout(s3_scheduler_event_t *event,
             /* BACKGROUND 是唯一允许在 bus 内直接丢弃的层级。 */
             ++s_drop_count;
             ++s_background_drop_count;
+            if ((size_t)type < S3_EVENT_BUS_EVENT_TYPE_COUNT) {
+                ++s_drop_by_event_type[type];
+            }
             ESP_LOGD(TAG,
                      "background drop type=%d drop_count=%lu depth=%u",
                      (int)type,
@@ -452,7 +468,7 @@ void s3_event_bus_log_stats(const char *reason)
 {
     s3_event_bus_stats_t stats = s3_event_bus_get_stats();
     ESP_LOGI(TAG,
-             "queue_depth=%u critical=%u realtime=%u state=%u background=%u drop_count=%lu background_drop_count=%lu coalesce_count=%lu reason=%s",
+             "queue_depth=%u critical=%u realtime=%u state=%u background=%u drop_count=%lu background_drop_count=%lu coalesce_count=%lu drop_by_type=[none:%lu ingress:%lu stream_frame:%lu stream_send:%lu network:%lu voice:%lu command:%lu stats:%lu] coalesce_state=[bme51:%lu bme52:%lu status51:%lu status52:%lu] reason=%s",
              (unsigned int)stats.queue_depth,
              (unsigned int)stats.critical_depth,
              (unsigned int)stats.realtime_depth,
@@ -461,5 +477,17 @@ void s3_event_bus_log_stats(const char *reason)
              (unsigned long)stats.drop_count,
              (unsigned long)stats.background_drop_count,
              (unsigned long)stats.coalesce_count,
+             (unsigned long)stats.drop_by_event_type[S3_SCHEDULER_EVENT_NONE],
+             (unsigned long)stats.drop_by_event_type[S3_SCHEDULER_EVENT_INGRESS],
+             (unsigned long)stats.drop_by_event_type[S3_SCHEDULER_EVENT_STREAM_FRAME],
+             (unsigned long)stats.drop_by_event_type[S3_SCHEDULER_EVENT_STREAM_SEND],
+             (unsigned long)stats.drop_by_event_type[S3_SCHEDULER_EVENT_NETWORK_STATE],
+             (unsigned long)stats.drop_by_event_type[S3_SCHEDULER_EVENT_VOICE_STATE],
+             (unsigned long)stats.drop_by_event_type[S3_SCHEDULER_EVENT_COMMAND_PULL],
+             (unsigned long)stats.drop_by_event_type[S3_SCHEDULER_EVENT_BACKGROUND_STATS],
+             (unsigned long)stats.coalesce_by_state_key[S3_EVENT_BUS_STATE_BME_LATEST_C51],
+             (unsigned long)stats.coalesce_by_state_key[S3_EVENT_BUS_STATE_BME_LATEST_C52],
+             (unsigned long)stats.coalesce_by_state_key[S3_EVENT_BUS_STATE_DEVICE_STATUS_C51],
+             (unsigned long)stats.coalesce_by_state_key[S3_EVENT_BUS_STATE_DEVICE_STATUS_C52],
              reason != NULL ? reason : "periodic");
 }

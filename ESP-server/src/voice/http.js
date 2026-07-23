@@ -153,6 +153,8 @@ function writeVoiceTurnHeaders(res) {
         .set({
             "Content-Type": VOICE_TURN_CONTENT_TYPE,
             "X-Audio-Format": VOICE_TURN_AUDIO_FORMAT,
+            "X-Audio-Sample-Rate": String(VOICE_TURN_SAMPLE_RATE),
+            "X-Audio-Channels": "1",
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff"
         });

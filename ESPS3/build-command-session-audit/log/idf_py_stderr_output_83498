@@ -1,0 +1,16 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/Users/zhiqin/.espressif/tools/python_env/idf5.5_py3.14_env/bin/python -DESP_PLATFORM=1 -DCCACHE_ENABLE=0 /Users/zhiqin/ESP 部分开发 1/ESPS3
+CMake Error at /opt/homebrew/share/cmake/Modules/CMakeDetermineCCompiler.cmake:228 (configure_file):
+  No such file or directory
+Call Stack (most recent call first):
+  /Users/zhiqin/.espressif/v5.5.4/esp-idf/tools/cmake/project.cmake:601 (__project)
+  CMakeLists.txt:10 (project)
+
+
+CMake Error at /Users/zhiqin/.espressif/v5.5.4/esp-idf/tools/cmake/third_party/GetGitRevisionDescription.cmake:80 (configure_file):
+  No such file or directory
+Call Stack (most recent call first):
+  /Users/zhiqin/.espressif/v5.5.4/esp-idf/tools/cmake/third_party/GetGitRevisionDescription.cmake:93 (get_git_head_revision)
+  /Users/zhiqin/.espressif/v5.5.4/esp-idf/tools/cmake/project.cmake:731 (git_describe)
+  CMakeLists.txt:10 (project)
+
+

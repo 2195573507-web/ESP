@@ -6,9 +6,14 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 #include "hal/adc_types.h"
 #include "soc/soc_caps.h"
 #include "app_debug_config.h"
+
+/* ESP-IDF has no generic ESP_ERR_NOT_READY.  Keep the temporary startup
+ * condition distinct from an invalid lifecycle or an ADC hardware failure. */
+#define MIC_ADC_ERR_NOT_READY ESP_ERR_NOT_FINISHED
 
 /* 硬件连接：OPA_OUT -> ESP32-C5 GPIO6 / ADC1_CH5。 */
 #define MIC_ADC_GPIO_NUM             6                         // Mic 输入 GPIO。
@@ -29,6 +34,8 @@
 #define MIC_ADC_READ_TIMEOUT_MS       1000 // ADC 读取超时。
 #define MIC_ADC_ERROR_RETRY_DELAY_MS  100  // 异常后短暂退避。
 #define MIC_ADC_TEST_TASK_STACK_SIZE  12288 // mic_adc_test 任务栈；ESP-IDF FreeRTOS 单位为字节。
+#define MIC_ADC_TEST_TASK_STACK_WORDS \
+    ((MIC_ADC_TEST_TASK_STACK_SIZE + sizeof(StackType_t) - 1U) / sizeof(StackType_t))
 #define MIC_ADC_TASK_PRIORITY         4    // ADC 任务优先级。
 #define MIC_ADC_ENABLE_LOOP_DEBUG_LOG APP_DEBUG_MIC_ADC_LOOP_LOG   // 循环普通日志总开关，错误日志不受影响。
 #define MIC_ADC_ENABLE_STACK_DEBUG_LOG APP_DEBUG_MIC_ADC_STACK_LOG  // 任务栈水位诊断开关，server voice 稳定后默认关闭。
@@ -40,6 +47,7 @@
 #define MIC_ADC_VOICE_POST_ROLL_MS       APP_VOICE_POST_ROLL_MS // VOICE_END 后继续发送的尾部 PCM 时长。
 #define MIC_ADC_VOICE_POST_ROLL_SAMPLES  ((MIC_ADC_SAMPLE_FREQ_HZ * MIC_ADC_VOICE_POST_ROLL_MS) / 1000) // 尾部补偿样本数。
 #define MIC_ADC_VOICE_LIVE_CHUNK_SAMPLES 160  // 实时发送块，160 samples = 10 ms PCM。
+#define MIC_ADC_COMMAND_PRE_ROLL_SAMPLES  320  // 命令流保留 20 ms，随后无条件开始 PCM TX。
 #define MIC_ADC_VOICE_RETRY_DELAY_MS      2000 // voice turn 启动失败后等待 2 秒再允许下一次启动，避免断网时疯狂重连。
 #define MIC_ADC_VOICE_START_COOLDOWN_MS   APP_VOICE_VAD_START_COOLDOWN_MS // server voice done 后忽略短时间内的 VAD 起始抖动。
 
@@ -75,7 +83,8 @@
  * 5. 外层 VAD 触发 VOICE_END 后先发送 post-roll，再进入 FINISHING；
  *    finish/stop 完成本轮 session 后回到 IDLE，继续等待下一次说话。
  *
- * @return 成功返回 ESP_OK，失败返回 ESP-IDF 错误码。
+ * @return 成功返回 ESP_OK；WiFi 尚未稳定或前一轮收尾中返回
+ * MIC_ADC_ERR_NOT_READY；硬件或资源错误返回对应 ESP-IDF 错误码。
  */
 esp_err_t mic_adc_test_start(void);
 
@@ -85,6 +94,9 @@ typedef esp_err_t (*mic_adc_voice_append_pcm_cb_t)(const int16_t *pcm,
 typedef esp_err_t (*mic_adc_voice_finish_cb_t)(void *user_ctx);
 typedef bool (*mic_adc_voice_is_idle_cb_t)(void *user_ctx);
 typedef bool (*mic_adc_voice_is_ready_cb_t)(void *user_ctx);
+typedef esp_err_t (*mic_adc_voice_command_event_cb_t)(uint32_t command_generation,
+                                                       uint32_t score_or_reason,
+                                                       void *user_ctx);
 
 typedef struct {
     esp_err_t (*prepare_cb)(void *user_ctx);
@@ -92,6 +104,8 @@ typedef struct {
     mic_adc_voice_finish_cb_t finish_cb;
     mic_adc_voice_is_idle_cb_t is_idle_cb;
     mic_adc_voice_is_ready_cb_t is_ready_cb;
+    mic_adc_voice_command_event_cb_t command_speech_start_cb;
+    mic_adc_voice_command_event_cb_t command_speech_end_cb;
     void *user_ctx;
     const char *stream_name;
 } mic_adc_voice_stream_ops_t;
@@ -185,5 +199,23 @@ bool mic_adc_test_is_paused(void);
 
 /** @brief 返回当前 Mic/VAD 录音周期 generation，用于丢弃旧异步事件。 */
 uint32_t mic_adc_test_get_session_generation(void);
+
+/**
+ * Arm exactly one S3-confirmed command capture.  The returned stream id is
+ * distinct from the UDP WakeNet stream and accompanies the HTTP voice turn.
+ */
+esp_err_t mic_adc_test_arm_command_capture(uint32_t command_generation,
+                                           uint32_t command_timeout_ms,
+                                           uint32_t *out_stream_id);
+
+/** Cancel an armed command capture without affecting the WakeNet VAD path. */
+void mic_adc_test_disarm_command_capture(uint32_t command_generation, const char *reason);
+
+/** Request that the Mic-owner task flush and finalize a live command stream. */
+esp_err_t mic_adc_test_request_command_capture_finalize(uint32_t command_generation,
+                                                         const char *reason);
+
+/** @brief True while the next VAD segment is reserved for command PCM. */
+bool mic_adc_test_is_command_capture_armed(void);
 
 #endif // MIC_ADC_TEST_H

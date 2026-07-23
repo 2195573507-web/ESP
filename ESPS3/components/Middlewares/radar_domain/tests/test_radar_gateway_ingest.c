@@ -164,6 +164,26 @@ static void test_radar_source_context_boundaries(void)
     assert(c52->person_state->source_id == RADAR_SOURCE_C52);
 }
 
+static void test_remote_freshness_recovers_on_next_frame(void)
+{
+    radar_gateway_output_t output = {0};
+    const radar_gateway_sample_t first = sample(1U, 20U, 20U, 400);
+    assert(radar_gateway_ingest_admit(&first, 1U, 10000U, &output) ==
+           RADAR_GATEWAY_INGEST_ACCEPTED);
+    assert(output.radar_online && !output.radar_stale);
+
+    radar_gateway_ingest_poll(10000U + RADAR_GATEWAY_OFFLINE_TIMEOUT_MS + 1U);
+    assert(radar_gateway_ingest_get_output(1U, &output));
+    assert(!output.radar_online && output.radar_stale);
+    assert(output.updated_at_ms == 10000U);
+
+    const radar_gateway_sample_t recovered = sample(1U, 21U, 21U, 450);
+    assert(radar_gateway_ingest_admit(&recovered, 1U, 16000U, &output) ==
+           RADAR_GATEWAY_INGEST_ACCEPTED);
+    assert(output.radar_online && !output.radar_stale);
+    assert(output.updated_at_ms == 16000U);
+}
+
 int main(void)
 {
     assert(RADAR_SOURCE_S3_LOCAL == 0);
@@ -173,6 +193,7 @@ int main(void)
     test_schema_and_identity_boundary();
     test_sequence_and_source_isolation();
     test_radar_source_context_boundaries();
+    test_remote_freshness_recovers_on_next_frame();
     puts("S3 radar v2 ingest and source isolation tests: PASS");
     return 0;
 }
